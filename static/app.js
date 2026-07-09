@@ -1594,6 +1594,10 @@ function renderDashboard(data) {
 // 渲染 Chart.js Token 使用趨勢圖
 // =========================================================================
 function renderChart(sessions) {
+  if (typeof Chart === 'undefined') {
+    console.warn('Chart.js is not available; skipping daily chart rendering.');
+    return;
+  }
   const canvas = document.getElementById('tokenChart');
 
   // 只取前 15 個 Session 來畫，避免過於擁擠
@@ -2946,6 +2950,10 @@ function renderYearlyMetricValue(elementId, getter, formatter, agentBreakdown, a
 // 渲染單年每月 Token 與 Session 趨勢圖
 // =========================================================================
 function renderYearlyChart(monthlyBreakdown) {
+  if (typeof Chart === 'undefined') {
+    console.warn('Chart.js is not available; skipping yearly chart rendering.');
+    return;
+  }
   currentYearlyBreakdown = monthlyBreakdown;
   currentYearlyChartData = [...monthlyBreakdown];
   const canvas = document.getElementById('yearlyTokenChart');
@@ -3416,6 +3424,10 @@ function renderMonthlyDashboard(data) {
 // 渲染單月每日 Token 與 Session 趨勢圖
 // =========================================================================
 function renderMonthlyChart(dailyBreakdown) {
+  if (typeof Chart === 'undefined') {
+    console.warn('Chart.js is not available; skipping monthly chart rendering.');
+    return;
+  }
   currentMonthlyBreakdown = dailyBreakdown;
   currentMonthlyChartData = [...dailyBreakdown];
   const canvas = document.getElementById('monthlyTokenChart');

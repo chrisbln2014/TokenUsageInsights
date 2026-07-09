@@ -56,7 +56,7 @@ cwd=$(printf '%s' "$input" | jq -r '.cwd // .workspace.current_dir // empty')
 version=$(printf '%s' "$input" | jq -r '.version // empty')
 
 if [ -z "$payload_session_id" ]; then
-  payload_session_id="$(date +%Y%m%d-%H%M%S)-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid)"
+  payload_session_id="$(date +%Y%m%d-%H%M%S)-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$RANDOM-$RANDOM")"
 fi
 
 session_id="$payload_session_id"

@@ -40,6 +40,37 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\export-snapshot.ps1 `
 
 建議用 Windows Task Scheduler 每 15 到 60 分鐘跑一次。頻率越高，Drive API 與 Cloud Run 讀取壓力越高；個人看板通常 30 分鐘已足夠。
 
+## 自動上傳到 Google Drive
+
+如果不使用 Google Drive 桌面同步程式，可以改用 `gcloud` 的 Application Default Credentials 取得 `chris@berlin.com.tw` 的 OAuth token，再由腳本直接呼叫 Drive API。
+
+首次使用先登入 ADC，scope 使用 `drive.file`，讓腳本只管理它建立或開啟過的檔案：
+
+```powershell
+gcloud --account=chris@berlin.com.tw auth application-default login chris@berlin.com.tw `
+  --scopes=https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/cloud-platform `
+  --project=tokenusage-chris-20260709
+```
+
+上傳並分享給 Cloud Run service account：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
+  -GcloudAccount chris@berlin.com.tw `
+  -ProjectId tokenusage-chris-20260709 `
+  -ShareWithServiceAccount token-insights-run@tokenusage-chris-20260709.iam.gserviceaccount.com
+```
+
+腳本會把 Drive file ID 存在 `%LOCALAPPDATA%\TokenUsageInsights\drive-snapshot-file-id.txt`。之後排程重跑會更新同一個檔案，而不是每次建立新檔。
+
+若已經有現成 snapshot 檔案，可以略過匯出直接上傳：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
+  -SkipExport `
+  -SnapshotPath "C:\path\to\snapshot.json"
+```
+
 ## Google Drive 權限
 
 1. 建立或選用 Cloud Run service account，例如：

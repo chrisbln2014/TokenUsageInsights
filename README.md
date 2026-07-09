@@ -115,6 +115,43 @@ jq . ~/.gemini/antigravity-cli/settings.json
 model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
 ```
 
+### Windows 平台特定設定 (Windows Platform Setup)
+
+在 Windows 系統下，由於 `pwsh.exe` 等解譯行程冷啟動開銷（通常需要 1~3 秒）容易導致 CLI 狀態列執行超時而報錯（`exit status 1` 且 `stderr` 為空），建議使用專案提供的 Go 語言原生協調器。
+
+#### 1. 工作原理與架構
+Go 協調器執行檔 (`statusline-token.exe`) 會在前台極速執行（小於 1 毫秒），直接讀寫本地會話狀態（`statusline-state.json`）完成 Token 增量比對，並將數據寫入 `usage/usage-YYYY-MM-DD.jsonl` 中。之後，它會調用底層原生的 `hooks/statusline-go.exe` 來印出原生的狀態列，兼顧了數據收集與畫面顯示。
+
+#### 2. 設定步驟
+1. 在專案根目錄下，編譯執行檔（本機需安裝 Go）：
+   ```powershell
+   cd shell/antigravity
+   go build -ldflags "-s -w" -o statusline-token.exe statusline-token.go
+   ```
+2. 將編譯出的 `statusline-token.exe` 複製到您的 Antigravity 設定檔目錄：
+   ```powershell
+   Copy-Item -Force .\statusline-token.exe "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.exe"
+   ```
+3. 編輯 `~/.gemini/antigravity-cli/settings.json`：
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "C:\\Users\\<您的用戶名>\\.gemini\\antigravity-cli\\statusline-token.exe",
+       "padding": 1,
+       "enabled": true
+     }
+   }
+   ```
+   *(請將 `<您的用戶名>` 替換為實際 Windows 用戶名稱，例如 `1418`)*
+
+#### 3. 驗證
+在 PowerShell 中輸入以下指令進行模擬測試：
+```powershell
+echo '{}' | & "C:\Users\<您的用戶名>\.gemini\antigravity-cli\statusline-token.exe"
+```
+這將正常輸出原生的狀態列，且 `$lastexitcode` 應為 `0`。
+
 * * *
 
 ## GitHub Copilot CLI 設定

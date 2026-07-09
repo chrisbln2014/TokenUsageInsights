@@ -44,6 +44,16 @@ pub struct AssistantSnapshot {
     pub daily: HashMap<String, Value>,
     pub monthly: HashMap<String, Value>,
     pub yearly: HashMap<String, Value>,
+    #[serde(default)]
+    pub session_events: HashMap<String, SessionEventRef>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionEventRef {
+    pub drive_file_id: String,
+    pub file_name: Option<String>,
+    pub content_type: Option<String>,
+    pub uploaded_at: Option<String>,
 }
 
 impl DashboardSnapshot {
@@ -61,6 +71,14 @@ impl DashboardSnapshot {
 
     pub fn lookup_yearly(&self, assistant: &str, year: &str) -> Option<&Value> {
         self.lookup_assistant(assistant)?.yearly.get(year)
+    }
+
+    pub fn lookup_session_event(
+        &self,
+        assistant: &str,
+        session_id: &str,
+    ) -> Option<&SessionEventRef> {
+        self.lookup_assistant(assistant)?.session_events.get(session_id)
     }
 }
 
@@ -89,6 +107,20 @@ pub fn snapshot_mode_enabled() -> bool {
         .unwrap_or(false)
         || env_var_is_set("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH")
         || env_var_is_set("DRIVE_SNAPSHOT_FILE_ID")
+}
+
+fn is_safe_session_id(session_id: &str) -> bool {
+    if session_id.is_empty() || session_id.len() > 128 {
+        return false;
+    }
+
+    if session_id == "." || session_id == ".." {
+        return false;
+    }
+
+    session_id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
 }
 
 pub fn export_snapshot_path_from_args() -> Option<PathBuf> {
@@ -159,6 +191,7 @@ pub fn build_snapshot_from_conn(
                 daily,
                 monthly,
                 yearly,
+                session_events: HashMap::new(),
             },
         );
     }
@@ -583,7 +616,7 @@ async fn load_snapshot_from_env() -> Result<DashboardSnapshot, String> {
     }
 
     if let Ok(file_id) = std::env::var("DRIVE_SNAPSHOT_FILE_ID") {
-        let data = fetch_drive_snapshot(&file_id).await?;
+        let data = fetch_drive_file(&file_id).await?;
         return serde_json::from_str(&data).map_err(|e| format!("解析 Drive snapshot JSON 失敗: {e}"));
     }
 
@@ -622,7 +655,7 @@ async fn get_cached_snapshot() -> Result<Arc<DashboardSnapshot>, String> {
     Ok(snapshot)
 }
 
-async fn fetch_drive_snapshot(file_id: &str) -> Result<String, String> {
+async fn fetch_drive_file(file_id: &str) -> Result<String, String> {
     let token = google_access_token()?;
     let url = format!("https://www.googleapis.com/drive/v3/files/{file_id}?alt=media");
     run_curl(&[
@@ -633,7 +666,7 @@ async fn fetch_drive_snapshot(file_id: &str) -> Result<String, String> {
         &format!("Authorization: Bearer {token}"),
         &url,
     ])
-    .map_err(|e| format!("下載 Drive snapshot 失敗: {e}"))
+    .map_err(|e| format!("下載 Drive 檔案失敗 ({file_id}): {e}"))
 }
 
 fn google_access_token() -> Result<String, String> {
@@ -946,9 +979,48 @@ pub async fn trigger_manual_sync(AxumPath(assistant): AxumPath<String>) -> impl 
 }
 
 pub async fn get_session_details(
-    AxumPath((_assistant, _session_id)): AxumPath<(String, String)>,
+    AxumPath((assistant, session_id)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
-    not_found_response("Cloud Run snapshot mode 不包含本機 transcript timeline。")
+    let assistant = normalize_assistant_name(&assistant);
+    if !ASSISTANTS.contains(&assistant.as_str()) {
+        return unsupported_assistant_response();
+    }
+
+    if !is_safe_session_id(&session_id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "非法的 session_id 格式。" })),
+        )
+            .into_response();
+    }
+
+    match get_cached_snapshot().await {
+        Ok(snapshot) => {
+            let Some(event_ref) = snapshot.lookup_session_event(&assistant, &session_id) else {
+                return not_found_response(
+                    "Snapshot 中沒有此 Session 的事件檔，請重新上傳 Google Drive snapshot。",
+                );
+            };
+
+            if event_ref.drive_file_id.trim().is_empty() {
+                return not_found_response("Snapshot 中的 Session 事件檔 Drive file id 為空。");
+            }
+
+            let raw = match fetch_drive_file(&event_ref.drive_file_id).await {
+                Ok(raw) => raw,
+                Err(err) => return snapshot_error_response(err),
+            };
+
+            match serde_json::from_str::<Value>(&raw) {
+                Ok(value) => Json(value).into_response(),
+                Err(err) => snapshot_error_response(format!(
+                    "Session 事件檔 JSON 解析失敗 ({}): {err}",
+                    event_ref.drive_file_id
+                )),
+            }
+        }
+        Err(err) => snapshot_error_response(err),
+    }
 }
 
 pub async fn get_rate_limit(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
@@ -1054,6 +1126,51 @@ mod tests {
         assert_eq!(cursor.dates, vec!["2026-07-09"]);
         assert_eq!(cursor.months, vec!["2026-07"]);
         assert_eq!(cursor.years, vec!["2026"]);
+    }
+
+    #[test]
+    fn snapshot_deserializes_optional_session_events() {
+        let raw = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-09T00:00:00Z",
+            "source": "test",
+            "assistants": {
+                "codex": {
+                    "dates": ["2026-07-09"],
+                    "months": ["2026-07"],
+                    "years": ["2026"],
+                    "daily": {},
+                    "monthly": {},
+                    "yearly": {},
+                    "session_events": {
+                        "session-1": {
+                            "drive_file_id": "drive-file-123",
+                            "file_name": "token-usage-insights-session-codex-session-1.json",
+                            "content_type": "application/json",
+                            "uploaded_at": "2026-07-09T00:00:00Z"
+                        }
+                    }
+                },
+                "claude": {
+                    "dates": [],
+                    "months": [],
+                    "years": [],
+                    "daily": {},
+                    "monthly": {},
+                    "yearly": {}
+                }
+            }
+        }"#;
+
+        let snapshot: DashboardSnapshot = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            snapshot
+                .lookup_session_event("codex", "session-1")
+                .unwrap()
+                .drive_file_id,
+            "drive-file-123"
+        );
+        assert!(snapshot.lookup_session_event("claude", "session-1").is_none());
     }
 
     #[test]

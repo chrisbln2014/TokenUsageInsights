@@ -10,7 +10,9 @@ param(
     [string]$FileId = "",
     [string]$FileIdPath = "",
     [string]$DriveFolderId = "",
-    [string]$ShareWithServiceAccount = "token-insights-run@tokenusage-chris-20260709.iam.gserviceaccount.com"
+    [string]$ShareWithServiceAccount = "token-insights-drive@demoproject-dotnet.iam.gserviceaccount.com",
+    [string]$SessionEventIndexPath = "",
+    [switch]$SkipSessionEvents
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,6 +20,8 @@ $ErrorActionPreference = "Stop"
 $DriveScope = "https://www.googleapis.com/auth/drive.file"
 $CloudScope = "https://www.googleapis.com/auth/cloud-platform"
 $Assistants = @("antigravity", "copilot", "codex", "claude", "cursor")
+$script:AccessToken = $null
+$script:SessionEventIndex = @{}
 
 function Resolve-DefaultPath {
     param([string]$Leaf)
@@ -37,6 +41,14 @@ function Get-GcloudAccessToken {
     }
 
     return ($token | Select-Object -First 1).Trim()
+}
+
+function Ensure-AccessToken {
+    if ([string]::IsNullOrWhiteSpace($script:AccessToken)) {
+        $script:AccessToken = Get-GcloudAccessToken
+    }
+
+    return $script:AccessToken
 }
 
 function New-MultipartBody {
@@ -109,6 +121,49 @@ function Invoke-DriveUpload {
         -Body $fileBytes
 }
 
+function Invoke-DriveUploadContent {
+    param(
+        [string]$Token,
+        [string]$Content,
+        [string]$Name,
+        [string]$ContentType = "application/json; charset=utf-8",
+        [string]$ExistingFileId
+    )
+
+    $headers = @{
+        Authorization = "Bearer $Token"
+        "X-Goog-User-Project" = $ProjectId
+    }
+    $fileBytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+
+    if ([string]::IsNullOrWhiteSpace($ExistingFileId)) {
+        $metadata = [ordered]@{
+            name = $Name
+            mimeType = "application/json"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DriveFolderId)) {
+            $metadata.parents = @($DriveFolderId)
+        }
+
+        $metadataUri = "https://www.googleapis.com/drive/v3/files?fields=id,name,webViewLink,modifiedTime"
+        $created = Invoke-RestMethod -Method Post `
+            -Uri $metadataUri `
+            -Headers $headers `
+            -ContentType "application/json; charset=utf-8" `
+            -Body ($metadata | ConvertTo-Json -Depth 10 -Compress)
+
+        $ExistingFileId = $created.id
+    }
+
+    $escapedFileId = [System.Uri]::EscapeDataString($ExistingFileId)
+    $updateUri = "https://www.googleapis.com/upload/drive/v3/files/${escapedFileId}?uploadType=media&fields=id,name,webViewLink,modifiedTime"
+    return Invoke-RestMethod -Method Patch `
+        -Uri $updateUri `
+        -Headers $headers `
+        -ContentType $ContentType `
+        -Body $fileBytes
+}
+
 function Grant-DriveReader {
     param(
         [string]$Token,
@@ -124,20 +179,26 @@ function Grant-DriveReader {
         "Content-Type" = "application/json"
         "X-Goog-User-Project" = $ProjectId
     }
-    $permission = @{
-        type = "user"
-        role = "reader"
-        emailAddress = $ShareWithServiceAccount
-    } | ConvertTo-Json -Depth 5 -Compress
+    $readerEmails = $ShareWithServiceAccount -split "[,;]" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
     $escapedFileId = [System.Uri]::EscapeDataString($UploadedFileId)
     $uri = "https://www.googleapis.com/drive/v3/files/$escapedFileId/permissions?sendNotificationEmail=false&fields=id"
 
-    try {
-        Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $permission | Out-Null
-    } catch {
-        if ($_.Exception.Response.StatusCode.value__ -ne 409) {
-            throw
+    foreach ($readerEmail in $readerEmails) {
+        $permission = @{
+            type = "user"
+            role = "reader"
+            emailAddress = $readerEmail
+        } | ConvertTo-Json -Depth 5 -Compress
+
+        try {
+            Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $permission | Out-Null
+        } catch {
+            if ($_.Exception.Response.StatusCode.value__ -ne 409) {
+                throw
+            }
         }
     }
 }
@@ -256,6 +317,165 @@ function Clear-TranscriptPathJson {
     return [regex]::Replace($Json, '"transcript_path"\s*:\s*"(?:\\.|[^"\\])*"', '"transcript_path":""')
 }
 
+function Get-StringSha256 {
+    param([string]$Value)
+
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($Value)
+        $hash = $sha.ComputeHash($bytes)
+        return [System.BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Load-SessionEventIndex {
+    param([string]$Path)
+
+    $index = @{}
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $index
+    }
+
+    $json = Get-Content -LiteralPath $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        return $index
+    }
+
+    $parsed = $json | ConvertFrom-Json
+    foreach ($property in $parsed.PSObject.Properties) {
+        $index[$property.Name] = $property.Value
+    }
+    return $index
+}
+
+function Save-SessionEventIndex {
+    param(
+        [hashtable]$Index,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    $dir = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+
+    $ordered = [ordered]@{}
+    foreach ($key in ($Index.Keys | Sort-Object)) {
+        $ordered[$key] = $Index[$key]
+    }
+    $ordered | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $Path -Encoding utf8
+}
+
+function Upload-SessionEvent {
+    param(
+        [string]$Assistant,
+        [string]$SessionId
+    )
+
+    if ($SkipSessionEvents -or [string]::IsNullOrWhiteSpace($SessionId)) {
+        return $null
+    }
+
+    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId"
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return $null
+    }
+
+    $hash = Get-StringSha256 $raw
+    $key = "$Assistant/$SessionId"
+    $fileName = "token-usage-insights-session-$Assistant-$SessionId.json"
+    $existing = $script:SessionEventIndex[$key]
+    $existingFileId = $null
+    if ($null -ne $existing -and $existing.PSObject.Properties["file_id"]) {
+        $existingFileId = [string]$existing.file_id
+    }
+
+    $uploadedAt = (Get-Date).ToUniversalTime().ToString("o")
+    $fileId = $existingFileId
+    $shouldUpload = $true
+    if ($null -ne $existing -and
+        $existing.PSObject.Properties["sha256"] -and
+        $existing.sha256 -eq $hash -and
+        -not [string]::IsNullOrWhiteSpace($existingFileId)) {
+        $shouldUpload = $false
+        if ($existing.PSObject.Properties["uploaded_at"] -and
+            -not [string]::IsNullOrWhiteSpace([string]$existing.uploaded_at)) {
+            $uploadedAt = [string]$existing.uploaded_at
+        }
+    }
+
+    if ($shouldUpload) {
+        $uploaded = Invoke-DriveUploadContent `
+            -Token (Ensure-AccessToken) `
+            -Content $raw `
+            -Name $fileName `
+            -ExistingFileId $existingFileId
+        $fileId = $uploaded.id
+        Write-Host "Uploaded session event: $Assistant/$SessionId"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($fileId)) {
+        return $null
+    }
+
+    Grant-DriveReader -Token (Ensure-AccessToken) -UploadedFileId $fileId
+
+    $script:SessionEventIndex[$key] = [ordered]@{
+        assistant = $Assistant
+        session_id = $SessionId
+        file_id = $fileId
+        file_name = $fileName
+        sha256 = $hash
+        uploaded_at = $uploadedAt
+    }
+
+    return [ordered]@{
+        drive_file_id = $fileId
+        file_name = $fileName
+        content_type = "application/json"
+        uploaded_at = $uploadedAt
+    }
+}
+
+function Collect-SessionEventsFromApi {
+    param(
+        [string]$Assistant,
+        [object[]]$Dates
+    )
+
+    $sessionEvents = [ordered]@{}
+    foreach ($date in $Dates) {
+        $day = Invoke-TokenUsageApi "/api/$Assistant/usage/$date"
+        if ($null -eq $day) {
+            continue
+        }
+
+        foreach ($session in (Get-AsArray $day "sessions")) {
+            if ($null -eq $session -or -not $session.PSObject.Properties["session_id"]) {
+                continue
+            }
+
+            $sessionId = [string]$session.session_id
+            if ([string]::IsNullOrWhiteSpace($sessionId) -or $sessionEvents.Contains($sessionId)) {
+                continue
+            }
+
+            $eventRef = Upload-SessionEvent -Assistant $Assistant -SessionId $sessionId
+            if ($null -ne $eventRef) {
+                $sessionEvents[$sessionId] = $eventRef
+            }
+        }
+    }
+
+    return $sessionEvents
+}
+
 function Write-JsonMapFromApi {
     param(
         [System.IO.StreamWriter]$Writer,
@@ -314,6 +534,7 @@ function Export-SnapshotFromApi {
             $dates = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/dates") "dates"
             $months = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/months") "months"
             $years = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/years") "years"
+            $sessionEvents = Collect-SessionEventsFromApi -Assistant $assistant -Dates $dates
 
             if (-not $firstAssistant) {
                 $writer.Write(",")
@@ -334,6 +555,8 @@ function Export-SnapshotFromApi {
             $writer.Write((Convert-JsonArray $years))
             $writer.Write(',"yearly":')
             Write-JsonMapFromApi -Writer $writer -Assistant $assistant -Keys $years -PathTemplate "/api/{0}/yearly/{1}"
+            $writer.Write(',"session_events":')
+            $writer.Write((ConvertTo-Json -InputObject $sessionEvents -Depth 20 -Compress))
             $writer.Write("}")
         }
 
@@ -352,6 +575,12 @@ if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
 if ([string]::IsNullOrWhiteSpace($FileIdPath)) {
     $FileIdPath = Resolve-DefaultPath "drive-snapshot-file-id.txt"
 }
+
+if ([string]::IsNullOrWhiteSpace($SessionEventIndexPath)) {
+    $SessionEventIndexPath = Resolve-DefaultPath "drive-session-events-index.json"
+}
+
+$script:SessionEventIndex = Load-SessionEventIndex -Path $SessionEventIndexPath
 
 if ($ExportFromApi -and -not $SkipExport) {
     Export-SnapshotFromApi -OutputPath $SnapshotPath
@@ -375,6 +604,10 @@ if ($ExportFromApi -and -not $SkipExport) {
     }
 }
 
+if (-not $SkipSessionEvents) {
+    Save-SessionEventIndex -Index $script:SessionEventIndex -Path $SessionEventIndexPath
+}
+
 if (-not (Test-Path -LiteralPath $SnapshotPath)) {
     throw "找不到 snapshot 檔案：$SnapshotPath"
 }
@@ -383,7 +616,7 @@ if ([string]::IsNullOrWhiteSpace($FileId) -and (Test-Path -LiteralPath $FileIdPa
     $FileId = (Get-Content -LiteralPath $FileIdPath -Raw).Trim()
 }
 
-$accessToken = Get-GcloudAccessToken
+$accessToken = Ensure-AccessToken
 $uploaded = Invoke-DriveUpload -Token $accessToken -ContentPath $SnapshotPath -ExistingFileId $FileId
 Grant-DriveReader -Token $accessToken -UploadedFileId $uploaded.id
 
@@ -397,3 +630,6 @@ Write-Host "Drive snapshot uploaded."
 Write-Host "File ID: $($uploaded.id)"
 Write-Host "Web link: $($uploaded.webViewLink)"
 Write-Host "File ID saved to: $FileIdPath"
+if (-not $SkipSessionEvents) {
+    Write-Host "Session event index saved to: $SessionEventIndexPath"
+}

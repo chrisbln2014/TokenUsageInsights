@@ -47,7 +47,7 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\export-snapshot.ps1 `
 首次使用先登入 ADC，scope 使用 `drive.file`，讓腳本只管理它建立或開啟過的檔案：
 
 ```powershell
-gcloud --account=chris@berlin.com.tw auth application-default login chris@berlin.com.tw `
+gcloud --account=chris@berlin.com.tw auth application-default login `
   --scopes=https://www.googleapis.com/auth/drive.file,https://www.googleapis.com/auth/cloud-platform `
   --project=tokenusage-chris-20260709
 ```
@@ -63,6 +63,14 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
 
 腳本會把 Drive file ID 存在 `%LOCALAPPDATA%\TokenUsageInsights\drive-snapshot-file-id.txt`。之後排程重跑會更新同一個檔案，而不是每次建立新檔。
 
+若本機已安裝的 `token-usage-insights.exe` 還不是支援 `--export-snapshot` 的版本，腳本會自動改從正在執行的本機看板 API 匯出。預設 API 是 `http://localhost:3003`，也可以明確指定：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
+  -ExportFromApi `
+  -ApiUrl http://localhost:3003
+```
+
 若已經有現成 snapshot 檔案，可以略過匯出直接上傳：
 
 ```powershell
@@ -70,6 +78,14 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
   -SkipExport `
   -SnapshotPath "C:\path\to\snapshot.json"
 ```
+
+本機已設定的排程名稱：
+
+```text
+TokenUsageInsights Drive Snapshot Upload
+```
+
+目前排程每 30 分鐘執行一次，從 `http://localhost:3003` 匯出 snapshot 後上傳 Drive。因此本機看板服務需要在排程執行時可連線。
 
 ## Google Drive 權限
 

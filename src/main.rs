@@ -10,6 +10,7 @@ use tower_http::services::ServeDir;
 mod db;
 mod handlers;
 mod pricing;
+mod snapshot;
 mod timeline;
 
 use handlers::*;
@@ -59,6 +60,52 @@ fn build_cors_layer() -> CorsLayer {
 
 #[tokio::main]
 async fn main() {
+    if let Some(path) = snapshot::export_snapshot_path_from_args() {
+        init_and_sync_db_once();
+        match db::get_db_conn().and_then(|conn| snapshot::write_snapshot_file(&conn, &path)) {
+            Ok(()) => {
+                println!("✅ Snapshot 已匯出: {:?}", path);
+                return;
+            }
+            Err(e) => {
+                eprintln!("❌ Snapshot 匯出失敗: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let snapshot_mode = snapshot::snapshot_mode_enabled();
+    if snapshot_mode {
+        println!("☁️ 已啟用 Cloud Run snapshot 模式，將從 Google Drive 或 snapshot 檔案讀取資料。");
+    } else {
+        init_and_sync_db_once();
+        spawn_background_sync();
+    }
+
+    let static_dir = get_static_dir();
+    println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
+
+    let app = if snapshot_mode {
+        build_snapshot_router(&static_dir)
+    } else {
+        build_db_router(&static_dir)
+    }
+    .layer(build_cors_layer());
+
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3003); // 預設使用 3003 Port
+
+    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .unwrap();
+    println!("🚀 Token 戰情室 is running on: http://localhost:{}", port);
+
+    axum::serve(listener, app).await.unwrap();
+}
+
+fn init_and_sync_db_once() {
     // 初始化 SQLite 資料庫並進行第一次增量同步與遷移
     if let Ok(mut conn) = db::get_db_conn() {
         if let Err(e) = db::init_db(&conn) {
@@ -77,7 +124,9 @@ async fn main() {
     } else {
         eprintln!("❌ 無法連結到 SQLite 資料庫");
     }
+}
 
+fn spawn_background_sync() {
     // 啟動背景定期日誌同步任務 (每 5 秒執行一次)
     tokio::spawn(async {
         loop {
@@ -97,12 +146,11 @@ async fn main() {
             }
         }
     });
+}
 
-    let static_dir = get_static_dir();
-    println!("📂 正在服務靜態檔案，目錄來源: {:?}", static_dir);
-
+fn build_db_router(static_dir: &PathBuf) -> Router {
     // 建立 Axum 路由，支援帶助理前綴的 API 及 fallback 相容 API
-    let app = Router::new()
+    Router::new()
         // 帶 :assistant 變數的路由
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
@@ -122,21 +170,31 @@ async fn main() {
         .route("/api/:assistant/sync", get(trigger_manual_sync))
         .route("/api/:assistant/rate-limit", get(get_rate_limit))
         // 靜態檔案路由
-        .nest_service("/static", ServeDir::new(&static_dir))
-        .fallback_service(ServeDir::new(&static_dir))
-        .layer(build_cors_layer());
+        .nest_service("/static", ServeDir::new(static_dir))
+        .fallback_service(ServeDir::new(static_dir))
+}
 
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|p| p.parse::<u16>().ok())
-        .unwrap_or(3003); // 預設使用 3003 Port
-
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
-        .await
-        .unwrap();
-    println!("🚀 Token 戰情室 is running on: http://localhost:{}", port);
-
-    axum::serve(listener, app).await.unwrap();
+fn build_snapshot_router(static_dir: &PathBuf) -> Router {
+    Router::new()
+        .route("/api/:assistant/dates", get(snapshot::get_available_dates))
+        .route("/api/:assistant/setup-info", get(snapshot::get_setup_info))
+        .route("/api/:assistant/usage/:date", get(snapshot::get_usage_details))
+        .route(
+            "/api/:assistant/session/:session_id",
+            get(snapshot::get_session_details),
+        )
+        .route("/api/:assistant/months", get(snapshot::get_available_months))
+        .route(
+            "/api/:assistant/monthly/:year_month",
+            get(snapshot::get_monthly_details),
+        )
+        .route("/api/:assistant/years", get(snapshot::get_available_years))
+        .route("/api/:assistant/yearly/:year", get(snapshot::get_yearly_details))
+        .route("/api/:assistant/pricing", get(handlers::get_pricing))
+        .route("/api/:assistant/sync", get(snapshot::trigger_manual_sync))
+        .route("/api/:assistant/rate-limit", get(snapshot::get_rate_limit))
+        .nest_service("/static", ServeDir::new(static_dir))
+        .fallback_service(ServeDir::new(static_dir))
 }
 
 /// 獲取靜態檔案的基準路徑

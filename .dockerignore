@@ -1,0 +1,10 @@
+.git
+.github
+target
+screenshots
+*.log
+*.tmp
+static/*.bak-*
+static/**/*.bak-*
+**/*.db
+**/*.sqlite

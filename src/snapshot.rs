@@ -1,6 +1,6 @@
 use axum::{extract::Path as AxumPath, http::StatusCode, response::IntoResponse, Json};
 use rusqlite::Connection;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -35,8 +35,11 @@ pub struct DashboardSnapshot {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssistantSnapshot {
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub dates: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub months: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string_list")]
     pub years: Vec<String>,
     pub daily: HashMap<String, Value>,
     pub monthly: HashMap<String, Value>,
@@ -59,6 +62,18 @@ impl DashboardSnapshot {
     pub fn lookup_yearly(&self, assistant: &str, year: &str) -> Option<&Value> {
         self.lookup_assistant(assistant)?.yearly.get(year)
     }
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<Option<String>>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.trim().is_empty())
+        .collect())
 }
 
 struct CachedSnapshot {
@@ -632,10 +647,90 @@ fn google_access_token() -> Result<String, String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "https://www.googleapis.com/auth/drive.readonly".to_string());
-    let metadata_url = format!(
-        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes={}",
-        percent_encode(&scope)
+
+    let token_source = std::env::var("DRIVE_TOKEN_SOURCE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "iam".to_string());
+    if token_source.eq_ignore_ascii_case("metadata") {
+        return metadata_access_token(Some(&scope));
+    }
+
+    iam_scoped_access_token(&scope)
+}
+
+fn iam_scoped_access_token(scope: &str) -> Result<String, String> {
+    let bootstrap_token = metadata_access_token(None)?;
+    let service_account_email = cloud_run_service_account_email()?;
+    let request_body = serde_json::json!({
+        "scope": [scope],
+        "lifetime": "3600s"
+    })
+    .to_string();
+    let url = format!(
+        "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{}:generateAccessToken",
+        percent_encode(&service_account_email)
     );
+    let response = run_curl(&[
+        "-fsS",
+        "--max-time",
+        "20",
+        "-X",
+        "POST",
+        "-H",
+        &format!("Authorization: Bearer {bootstrap_token}"),
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        &request_body,
+        &url,
+    ])
+    .map_err(|e| {
+        format!(
+            "透過 IAM Credentials 取得 Drive scoped token 失敗 ({service_account_email}): {e}"
+        )
+    })?;
+    let payload: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
+    payload
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "IAM Credentials 回應沒有 accessToken".to_string())
+}
+
+fn cloud_run_service_account_email() -> Result<String, String> {
+    if let Ok(email) = std::env::var("DRIVE_SERVICE_ACCOUNT_EMAIL") {
+        if !email.trim().is_empty() {
+            return Ok(email);
+        }
+    }
+
+    let email = run_curl(&[
+        "-fsS",
+        "--max-time",
+        "20",
+        "-H",
+        "Metadata-Flavor: Google",
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+    ])
+    .map_err(|e| format!("從 Cloud Run metadata server 取得 service account email 失敗: {e}"))?;
+
+    let email = email.trim();
+    if email.is_empty() {
+        return Err("metadata server 回應的 service account email 為空".to_string());
+    }
+
+    Ok(email.to_string())
+}
+
+fn metadata_access_token(scope: Option<&str>) -> Result<String, String> {
+    let metadata_url = match scope {
+        Some(scope) => format!(
+            "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token?scopes={}",
+            percent_encode(scope)
+        ),
+        None => "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token".to_string(),
+    };
     let metadata = run_curl(&[
         "-fsS",
         "--max-time",
@@ -692,6 +787,7 @@ fn unsupported_assistant_response() -> axum::response::Response {
 }
 
 fn snapshot_error_response(err: String) -> axum::response::Response {
+    eprintln!("❌ Snapshot API error: {err}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({ "error": err })),
@@ -933,6 +1029,31 @@ mod tests {
             percent_encode("https://www.googleapis.com/auth/drive.readonly"),
             "https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.readonly"
         );
+    }
+
+    #[test]
+    fn snapshot_deserializes_assistant_lists_with_nulls() {
+        let raw = r#"{
+            "schema_version": 1,
+            "generated_at": "2026-07-09T00:00:00Z",
+            "source": "test",
+            "assistants": {
+                "cursor": {
+                    "dates": [null, "2026-07-09", ""],
+                    "months": [null, "2026-07"],
+                    "years": [null, "2026"],
+                    "daily": {},
+                    "monthly": {},
+                    "yearly": {}
+                }
+            }
+        }"#;
+
+        let snapshot: DashboardSnapshot = serde_json::from_str(raw).unwrap();
+        let cursor = snapshot.assistants.get("cursor").unwrap();
+        assert_eq!(cursor.dates, vec!["2026-07-09"]);
+        assert_eq!(cursor.months, vec!["2026-07"]);
+        assert_eq!(cursor.years, vec!["2026"]);
     }
 
     #[test]

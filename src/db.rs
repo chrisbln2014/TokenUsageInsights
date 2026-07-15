@@ -45,12 +45,29 @@ pub struct UsageEntry {
     pub delta_tokens: Option<TokenStats>,
     pub context: Option<ContextStats>,
     pub cost: Option<CostStats>,
+    #[serde(default)]
+    pub source_kind: Option<String>,
 
     // Codex-specific / Extended fields
     pub parent_session_id: Option<String>,
     pub agent_nickname: Option<String>,
     pub agent_role: Option<String>,
     pub reasoning_effort: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UsageDayExportRecord {
+    #[serde(flatten)]
+    pub entry: UsageEntry,
+    pub import_source_id: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct UsageDayImportSummary {
+    pub date: String,
+    pub total: usize,
+    pub imported: usize,
+    pub skipped_duplicates: usize,
 }
 
 // Claude Code helper structs
@@ -81,44 +98,93 @@ struct CodexTokenUsage {
     total_tokens: u64,
 }
 
-const CODEX_DELTA_PARSER_MIGRATION_KEY: &str = "migration:codex_delta_from_totals_v2";
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v6";
+const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
+
+fn hash_fnv1a_64(input: &str) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in input.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn normalize_import_source_id(raw: Option<&str>) -> Option<String> {
+    let value = raw?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
+    if let Some(t) = tokens {
+        format!(
+            "{}|{}|{}|{}|{}|{}",
+            t.input,
+            t.output,
+            t.cache_read.unwrap_or(0),
+            t.cache_write.unwrap_or(0),
+            t.reasoning.unwrap_or(0),
+            t.total
+        )
+    } else {
+        "null".to_string()
+    }
+}
+
+fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &UsageEntry) -> String {
+    let signature = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        assistant,
+        date,
+        entry.timestamp,
+        entry.session_id,
+        entry.turn_no,
+        entry.model.clone().unwrap_or_default(),
+        entry.model_id.clone().unwrap_or_default(),
+        entry.version.clone().unwrap_or_default(),
+        entry.cwd.clone().unwrap_or_default(),
+        entry.transcript_path.clone().unwrap_or_default(),
+        entry.parent_session_id.clone().unwrap_or_default(),
+        entry.agent_nickname.clone().unwrap_or_default(),
+        entry.agent_role.clone().unwrap_or_default(),
+        build_import_token_signature(&entry.tokens),
+        build_import_token_signature(&entry.delta_tokens)
+    );
+    format!("{:016x}", hash_fnv1a_64(&signature))
+}
 
 /// Directory resolution helpers
 pub fn get_insights_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("INSIGHTS_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("INSIGHTS_DIR") {
+        return path;
     }
+
+    #[cfg(windows)]
+    if let Some(data_dir) = dirs::data_local_dir() {
+        return data_dir.join("TokenUsageInsights");
+    }
+
     if let Some(home) = dirs::home_dir() {
-        let p = home.join(".token-usage-insights");
-        if !p.exists() {
-            let _ = fs::create_dir_all(&p);
-        }
-        return p;
+        return home.join(".token-usage-insights");
     }
     PathBuf::from(".")
 }
 
 pub fn get_antigravity_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("ANTIGRAVITY_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("ANTIGRAVITY_DIR") {
+        return path;
     }
     dirs::home_dir()
-        .map(|h| h.join(".gemini/antigravity-cli"))
+        .map(|h| h.join(".gemini").join("antigravity-cli"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub fn get_copilot_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("COPILOT_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("COPILOT_DIR") {
+        return path;
     }
     dirs::home_dir()
         .map(|h| h.join(".copilot"))
@@ -126,11 +192,8 @@ pub fn get_copilot_dir() -> PathBuf {
 }
 
 pub fn get_codex_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("CODEX_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("CODEX_DIR") {
+        return path;
     }
     dirs::home_dir()
         .map(|h| h.join(".codex"))
@@ -138,11 +201,8 @@ pub fn get_codex_dir() -> PathBuf {
 }
 
 pub fn get_claude_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("CLAUDE_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("CLAUDE_DIR") {
+        return path;
     }
     dirs::home_dir()
         .map(|h| h.join(".claude"))
@@ -150,36 +210,73 @@ pub fn get_claude_dir() -> PathBuf {
 }
 
 pub fn get_cursor_dir() -> PathBuf {
-    if let Ok(val) = std::env::var("CURSOR_DIR") {
-        let p = PathBuf::from(val);
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = crate::paths::env_path("CURSOR_DIR") {
+        return path;
     }
     dirs::home_dir()
         .map(|h| h.join(".cursor"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
+    if let Err(rename_error) = fs::rename(source, destination) {
+        let copied = fs::copy(source, destination).map_err(|copy_error| {
+            format!("重新命名失敗 ({rename_error})，跨磁碟複製也失敗: {copy_error}")
+        })?;
+        let source_size = fs::metadata(source)
+            .map_err(|error| format!("讀取來源資料庫大小失敗: {error}"))?
+            .len();
+        if copied != source_size {
+            let _ = fs::remove_file(destination);
+            return Err(format!(
+                "跨磁碟複製大小不符: source={source_size}, destination={copied}"
+            ));
+        }
+        File::open(destination)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("同步目標資料庫失敗: {error}"))?;
+        fs::remove_file(source).map_err(|error| format!("移除舊資料庫失敗: {error}"))?;
+    }
+    Ok(())
+}
+
+fn legacy_unified_database_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        #[cfg(windows)]
+        paths.push(
+            home.join(".token-usage-insights")
+                .join("token_usage_insights.db"),
+        );
+        paths.push(
+            home.join(".gemini")
+                .join("antigravity-cli")
+                .join("token_usage_insights.db"),
+        );
+    }
+    paths
+}
+
 /// Get connection to centralized SQLite DB
 pub fn get_db_conn() -> Result<Connection, String> {
     let dir = get_insights_dir();
+    fs::create_dir_all(&dir).map_err(|error| format!("無法建立資料庫目錄 {:?}: {}", dir, error))?;
     let db_path = dir.join("token_usage_insights.db");
 
     // Automatically move old centralized database if it exists in the legacy folder
     if !db_path.exists() {
-        if let Some(home) = dirs::home_dir() {
-            let old_unified_db = home.join(".gemini/antigravity-cli/token_usage_insights.db");
-            if old_unified_db.exists() {
-                println!(
-                    "🔄 偵測到存在於舊位置的統一資料庫，正在移動至新位置：{:?} -> {:?}",
-                    old_unified_db, db_path
-                );
-                if let Err(e) = fs::rename(&old_unified_db, &db_path) {
-                    eprintln!("⚠️ 移動舊統一資料庫失敗: {}", e);
-                } else {
-                    println!("✅ 統一資料庫移動完成！");
-                }
+        if let Some(old_unified_db) = legacy_unified_database_paths()
+            .into_iter()
+            .find(|path| path != &db_path && path.exists())
+        {
+            println!(
+                "🔄 偵測到存在於舊位置的統一資料庫，正在移動至新位置：{:?} -> {:?}",
+                old_unified_db, db_path
+            );
+            if let Err(e) = move_file_with_copy_fallback(&old_unified_db, &db_path) {
+                eprintln!("⚠️ 移動舊統一資料庫失敗: {}", e);
+            } else {
+                println!("✅ 統一資料庫移動完成！");
             }
         }
     }
@@ -225,6 +322,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             -- Duration and Request Count
             duration_ms INTEGER,
             premium_requests INTEGER,
+            source_kind TEXT NOT NULL DEFAULT 'legacy',
 
             -- Codex-specific fields
             parent_session_id TEXT,
@@ -249,14 +347,29 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE usage_entries ADD COLUMN delta_cache_write INTEGER",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN import_source_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE usage_entries ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
+        [],
+    );
 
-    // Unique index on assistant, session, and turn
+    // Include the original source in the identity so VS Code and Copilot CLI
+    // records can be aggregated without colliding on a reused session id.
+    let _ = conn.execute("DROP INDEX IF EXISTS uidx_assistant_session_turn", []);
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_session_turn 
-         ON usage_entries(assistant_type, session_id, turn_no)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_source_session_turn
+         ON usage_entries(assistant_type, source_kind, session_id, turn_no)",
         [],
     )
-    .map_err(|e| format!("建立唯一索引 uidx_assistant_session_turn 失敗: {}", e))?;
+    .map_err(|e| {
+        format!(
+            "建立唯一索引 uidx_assistant_source_session_turn 失敗: {}",
+            e
+        )
+    })?;
 
     // Indexes for performance
     conn.execute(
@@ -271,6 +384,11 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     )
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
+        [],
+    );
+
     // Sync state tracking table
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sync_state (
@@ -281,6 +399,30 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 sync_state 表失敗: {}", e))?;
+
+    // Before source_kind existed, every Copilot record came from the CLI
+    // collector. Classify those historical rows once so the new source-scoped
+    // unique index does not duplicate them on the first synchronization.
+    let source_kind_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !source_kind_migration_done {
+        let _ = conn.execute(
+            "UPDATE usage_entries
+             SET source_kind = 'copilot-cli'
+             WHERE assistant_type = 'copilot' AND source_kind = 'legacy'",
+            [],
+        );
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+        );
+    }
 
     Ok(())
 }
@@ -365,6 +507,11 @@ fn sync_hook_usage_logs(
     }
 
     let entries = fs::read_dir(usage_dir).map_err(|e| format!("無法讀取 usage 目錄: {}", e))?;
+    let source_kind = if assistant_type == "copilot" {
+        "copilot-cli"
+    } else {
+        "legacy"
+    };
 
     for entry in entries.flatten() {
         let file_type = match entry.file_type() {
@@ -451,13 +598,14 @@ fn sync_hook_usage_logs(
 
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
-                            assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                            assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
                             duration_ms, premium_requests
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         params![
                             assistant_type,
+                            source_kind,
                             entry.timestamp,
                             date_str,
                             entry.session_id,
@@ -511,6 +659,146 @@ fn sync_hook_usage_logs(
                 }
             }
         }
+    }
+
+    Ok(())
+}
+
+fn insert_vscode_usage_entry(
+    tx: &rusqlite::Transaction<'_>,
+    entry: &UsageEntry,
+) -> rusqlite::Result<usize> {
+    let tokens = entry.tokens.as_ref();
+    let delta = entry.delta_tokens.as_ref();
+    let cost = entry.cost.as_ref();
+    tx.execute(
+        "INSERT OR REPLACE INTO usage_entries (
+            assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?,
+            ?, ?, ?, ?, ?, ?
+        )",
+        params![
+            "copilot",
+            entry.source_kind.as_deref().unwrap_or(crate::vscode::SOURCE_KIND),
+            entry.timestamp,
+            entry.timestamp.get(0..10).unwrap_or("unknown"),
+            entry.session_id,
+            entry.session_name.as_deref(),
+            entry.transcript_path.as_deref(),
+            entry.cwd.as_deref(),
+            entry.version.as_deref(),
+            entry.turn_no as i64,
+            entry.model.as_deref(),
+            entry.model_id.as_deref(),
+            tokens.map(|value| value.input as i64),
+            tokens.map(|value| value.output as i64),
+            tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+            tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+            tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+            tokens.map(|value| value.total as i64),
+            delta.map(|value| value.input as i64),
+            delta.map(|value| value.output as i64),
+            delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+            delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+            delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+            delta.map(|value| value.total as i64),
+            cost.and_then(|value| value.total_duration_ms.or(value.total_api_duration_ms))
+                .map(|value| value as i64),
+            cost.and_then(|value| value.total_premium_requests)
+                .map(|value| value as i64),
+            entry.parent_session_id.as_deref(),
+            entry.agent_nickname.as_deref(),
+            entry.agent_role.as_deref(),
+            entry.reasoning_effort.as_deref(),
+        ],
+    )
+}
+
+fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
+    let mut seen_sessions = HashSet::new();
+
+    for filepath in crate::vscode::discover_session_files() {
+        let metadata = match fs::metadata(&filepath) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let current_size = metadata.len();
+        let modified_time = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|value| value.as_nanos() as i64)
+            .unwrap_or(0);
+        let state_key = format!("vscode:{}", filepath.to_string_lossy());
+        let previous_state: Option<(u64, i64)> = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if previous_state == Some((current_size, modified_time)) {
+            continue;
+        }
+
+        let session = match crate::vscode::read_session_file(&filepath) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("解析 VS Code Copilot 檔案 {:?} 失敗: {}", filepath, error);
+                continue;
+            }
+        };
+        let session_key = session.session_id.clone();
+        if !crate::vscode::is_github_copilot(&session) || !seen_sessions.insert(session_key.clone())
+        {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("建立 VS Code 狀態交易失敗: {error}"))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+                 VALUES (?, ?, ?)",
+                params![state_key, current_size as i64, modified_time],
+            )
+            .map_err(|error| format!("更新 VS Code 狀態失敗: {error}"))?;
+            tx.commit()
+                .map_err(|error| format!("提交 VS Code 狀態交易失敗: {error}"))?;
+            continue;
+        }
+        let entries = crate::vscode::to_usage_entries(&session, &filepath);
+
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("建立 VS Code 同步交易失敗: {error}"))?;
+        let db_session_id = format!("vscode-{session_key}");
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'copilot'
+               AND source_kind = ?
+               AND session_id = ?",
+            params![crate::vscode::SOURCE_KIND, db_session_id],
+        )
+        .map_err(|error| format!("清除舊 VS Code 工作階段失敗: {error}"))?;
+
+        for entry in &entries {
+            insert_vscode_usage_entry(&tx, entry)
+                .map_err(|error| format!("寫入 VS Code Copilot 資料失敗: {error}"))?;
+        }
+
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, modified_time],
+        )
+        .map_err(|error| format!("更新 VS Code 同步狀態失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 VS Code 同步交易失敗: {error}"))?;
     }
 
     Ok(())
@@ -649,6 +937,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     let mut agent_role: Option<String> = None;
     let mut current_model = "GPT-5.3-Codex".to_string();
     let mut reasoning_effort: Option<String> = None;
+    let mut session_identity_locked = false;
 
     for event in &events {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -659,12 +948,21 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
         let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
         if event_type == "session_meta" {
-            if let Some(id) = payload
-                .get("session_id")
-                .or_else(|| payload.get("id"))
-                .and_then(|id| id.as_str())
-            {
-                session_id = id.to_string();
+            if !session_identity_locked {
+                if let Some(id) = payload
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .filter(|id| !id.is_empty())
+                    .or_else(|| {
+                        payload
+                            .get("session_id")
+                            .and_then(|id| id.as_str())
+                            .filter(|id| !id.is_empty())
+                    })
+                {
+                    session_id = id.to_string();
+                    session_identity_locked = true;
+                }
             }
             session_cwd = payload
                 .get("cwd")
@@ -731,6 +1029,10 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
                 }
             }
         }
+    }
+
+    if parent_session_id.as_deref() == Some(session_id.as_str()) {
+        parent_session_id = None;
     }
 
     let mut results = Vec::new();
@@ -808,6 +1110,7 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
             delta_tokens: Some(delta_tokens),
             context,
             cost: None,
+            source_kind: None,
             parent_session_id: parent_session_id.clone(),
             agent_nickname: agent_nickname.clone(),
             agent_role: agent_role.clone(),
@@ -818,47 +1121,67 @@ fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> 
     Ok(results)
 }
 
-fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let codex_dir = get_codex_dir();
-    let sessions_dir = codex_dir.join("sessions");
-    if !sessions_dir.exists() {
-        return Ok(());
-    }
-
-    let delta_parser_migration_done: bool = conn
+fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
+    let parser_migration_done: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
-            params![CODEX_DELTA_PARSER_MIGRATION_KEY],
+            params![CODEX_PARSER_MIGRATION_KEY],
             |row| row.get(0),
         )
         .unwrap_or(false);
 
-    if !delta_parser_migration_done {
+    if !parser_migration_done {
         let tx = conn
             .transaction()
             .map_err(|e| format!("Codex parser migration BEGIN 失敗: {}", e))?;
         tx.execute(
-            "DELETE FROM sync_state WHERE filename LIKE 'codex:sessions/%'",
+            "UPDATE usage_entries
+             SET parent_session_id = NULL
+             WHERE assistant_type = 'codex' AND parent_session_id = session_id",
+            [],
+        )
+        .map_err(|e| format!("修正 Codex self-parent 資料失敗: {}", e))?;
+        tx.execute(
+            "DELETE FROM sync_state
+             WHERE filename LIKE 'codex:sessions/%'
+                OR filename LIKE 'codex:sessions\\%'",
             [],
         )
         .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
         tx.execute(
             "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 1, 0)",
-            params![CODEX_DELTA_PARSER_MIGRATION_KEY],
+            params![CODEX_PARSER_MIGRATION_KEY],
         )
         .map_err(|e| format!("寫入 Codex parser migration 狀態失敗: {}", e))?;
         tx.commit()
             .map_err(|e| format!("Codex parser migration COMMIT 失敗: {}", e))?;
     }
+    Ok(())
+}
+
+fn portable_relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    let codex_dir = get_codex_dir();
+    let sessions_dir = codex_dir.join("sessions");
+
+    run_codex_parser_migration(conn)?;
+
+    if !sessions_dir.exists() {
+        return Ok(());
+    }
 
     let files = find_codex_session_files(&sessions_dir);
 
     for filepath in files {
-        let state_path = filepath
-            .strip_prefix(&codex_dir)
-            .unwrap_or(&filepath)
-            .to_string_lossy()
-            .into_owned();
+        let state_path = portable_relative_path(&codex_dir, &filepath);
         let state_key = format!("codex:{}", state_path);
 
         let last_synced_size: u64 = conn
@@ -884,24 +1207,42 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 }
             };
 
+            if parsed_entries.is_empty() {
+                continue;
+            }
+
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+
+            let transcript_path = filepath.to_string_lossy().into_owned();
+            #[cfg(windows)]
+            let transcript_delete_result = tx.execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND (transcript_path = ? COLLATE NOCASE
+                        OR transcript_path = ? COLLATE NOCASE)",
+                params![transcript_path, transcript_path.replace('\\', "/")],
+            );
+            #[cfg(not(windows))]
+            let transcript_delete_result = tx.execute(
+                "DELETE FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path = ?",
+                params![transcript_path],
+            );
+            transcript_delete_result
+                .map_err(|e| format!("清空舊 Codex CLI transcript 資料失敗: {}", e))?;
 
             let session_ids: HashSet<String> = parsed_entries
                 .iter()
                 .map(|entry| entry.session_id.clone())
                 .collect();
             for session_id in session_ids {
-                let delete_res = tx.execute(
+                tx.execute(
                     "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
                     params![session_id],
-                );
-
-                if let Err(e) = delete_res {
-                    eprintln!("清空舊 Codex CLI Session 資料失敗: {}", e);
-                    continue;
-                }
+                )
+                .map_err(|e| format!("清空舊 Codex CLI Session 資料失敗: {}", e))?;
             }
 
             let mut success = true;
@@ -1164,6 +1505,7 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
             delta_tokens: Some(tokens),
             context: None,
             cost: None,
+            source_kind: None,
             parent_session_id: None,
             agent_nickname: None,
             agent_role: None,
@@ -1172,6 +1514,22 @@ fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
     }
 
     Ok(results)
+}
+
+fn migrate_legacy_claude_usage_entries(conn: &Connection) -> Result<usize, String> {
+    conn.execute(
+        "UPDATE usage_entries SET assistant_type = 'claude'
+         WHERE assistant_type = 'codex'
+           AND transcript_path IS NOT NULL
+           AND (
+                transcript_path LIKE '%.claude/%'
+             OR transcript_path LIKE '%/claude/%'
+             OR transcript_path LIKE '%.claude\\%'
+             OR transcript_path LIKE '%\\claude\\%'
+           )",
+        [],
+    )
+    .map_err(|error| format!("遷移 Claude Code 舊資料失敗: {error}"))
 }
 
 /// Sync Claude Code local transcripts into the dashboard's Claude Code assistant slot.
@@ -1186,13 +1544,7 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
         .unwrap_or(false);
 
     if !migration_done {
-        let _ = conn.execute(
-            "UPDATE usage_entries SET assistant_type = 'claude'
-             WHERE assistant_type = 'codex'
-               AND transcript_path IS NOT NULL
-               AND (transcript_path LIKE '%.claude/%' OR transcript_path LIKE '%/claude/%')",
-            [],
-        );
+        let _ = migrate_legacy_claude_usage_entries(conn);
         let mut migrated_states = Vec::new();
         if let Ok(mut stmt) = conn.prepare(
             "SELECT filename, last_synced_size, last_synced_time FROM sync_state WHERE filename LIKE 'codex:claude:%'",
@@ -1550,6 +1902,7 @@ fn parse_cursor_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String>
                 delta_tokens: Some(tokens),
                 context: None,
                 cost: None,
+                source_kind: None,
                 parent_session_id: None,
                 agent_nickname: None,
                 agent_role: None,
@@ -1708,6 +2061,11 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let copilot_dir = get_copilot_dir();
     if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
         eprintln!("❌ 同步 Copilot 失敗: {}", e);
+    }
+
+    // 2b. Sync GitHub Copilot sessions created in VS Code
+    if let Err(e) = sync_vscode_chat_sessions(conn) {
+        eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
     }
 
     // 3. Sync Codex CLI
@@ -1968,12 +2326,12 @@ pub fn get_usage_entries_by_date(
     conn: &rusqlite::Connection,
     date: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String)>, String> {
+) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
     let mut query = "SELECT 
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort
+            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind
          FROM usage_entries WHERE date = ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(date.to_string()));
@@ -2098,9 +2456,14 @@ pub fn get_usage_entries_by_date(
         } else {
             None
         };
+        let import_source_id = normalize_import_source_id(
+            row.get::<_, Option<String>>(28)
+                .map_err(|e| e.to_string())?
+                .as_deref(),
+        );
 
-        entries.push((
-            UsageEntry {
+        let mut record = UsageDayExportRecord {
+            entry: UsageEntry {
                 timestamp: row.get(0).map_err(|e| e.to_string())?,
                 session_id: row.get(1).map_err(|e| e.to_string())?,
                 session_name: row.get(2).ok(),
@@ -2114,25 +2477,170 @@ pub fn get_usage_entries_by_date(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(29).ok(),
                 parent_session_id: row.get(23).ok(),
                 agent_nickname: row.get(24).ok(),
                 agent_role: row.get(25).ok(),
                 reasoning_effort: row.get(27).ok(),
             },
-            ast_type,
-        ));
+            import_source_id,
+        };
+
+        if record.import_source_id.is_none() {
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
+        }
+
+        entries.push((record, ast_type));
     }
     Ok(entries)
+}
+
+fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
+    let trimmed = timestamp.trim();
+    trimmed
+        .split(['T', ' '])
+        .next()
+        .filter(|date_part| date_part.len() == 10)
+}
+
+pub fn export_usage_day_entries(
+    conn: &rusqlite::Connection,
+    assistant: &str,
+    date: &str,
+) -> Result<Vec<UsageDayExportRecord>, String> {
+    let rows = get_usage_entries_by_date(conn, date, assistant)?;
+    let mut records = Vec::with_capacity(rows.len());
+
+    for (mut record, _assistant_type) in rows {
+        if record.import_source_id.is_none() {
+            record.import_source_id = Some(build_usage_entry_import_source_id(
+                assistant,
+                date,
+                &record.entry,
+            ));
+        }
+        records.push(record);
+    }
+
+    Ok(records)
+}
+
+pub fn import_usage_day_entries(
+    conn: &mut Connection,
+    assistant: &str,
+    date: &str,
+    records: Vec<UsageDayExportRecord>,
+) -> Result<UsageDayImportSummary, String> {
+    let total = records.len();
+    if total == 0 {
+        return Err("匯入資料為空".to_string());
+    }
+
+    let mut inserted = 0usize;
+    let mut skipped_duplicates = 0usize;
+
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("建立匯入交易失敗: {}", e))?;
+
+    for record in records {
+        let entry = record.entry;
+        let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
+        let file_date = entry_date_from_timestamp(&entry.timestamp)
+            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
+        if file_date != date {
+            return Err(format!(
+                "匯入資料日期不一致：預期 {date}，但資料為 {file_date}"
+            ));
+        }
+
+        let source_id = normalized_id
+            .unwrap_or_else(|| build_usage_entry_import_source_id(assistant, date, &entry));
+        let source_kind = entry
+            .source_kind
+            .clone()
+            .unwrap_or_else(|| "legacy".to_string());
+
+        let imported = tx
+            .execute(
+                "INSERT OR IGNORE INTO usage_entries (
+                    assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
+                    model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests,
+                    parent_session_id, agent_nickname, agent_role, reasoning_effort, import_source_id
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?
+                )",
+                rusqlite::params![
+                    assistant,
+                    source_kind,
+                    entry.timestamp,
+                    date,
+                    entry.session_id,
+                    entry.session_name,
+                    entry.transcript_path,
+                    entry.cwd,
+                    entry.version,
+                    entry.turn_no as i64,
+                    entry.model,
+                    entry.model_id,
+                    entry.tokens.as_ref().map(|t| t.input as i64),
+                    entry.tokens.as_ref().map(|t| t.output as i64),
+                    entry.tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
+                    entry.tokens.as_ref().map(|t| t.total as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.input as i64),
+                    entry.delta_tokens.as_ref().map(|t| t.output as i64),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_read.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.cache_write.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().and_then(|t| t.reasoning.map(|v| v as i64)),
+                    entry.delta_tokens.as_ref().map(|t| t.total as i64),
+                    entry.cost.as_ref().and_then(|c| c.total_api_duration_ms).map(|v| v as i64),
+                    entry.cost.as_ref().and_then(|c| c.total_premium_requests).map(|v| v as i64),
+                    entry.parent_session_id,
+                    entry.agent_nickname,
+                    entry.agent_role,
+                    entry.reasoning_effort,
+                    source_id,
+                ],
+            )
+            .map_err(|e| format!("匯入資料寫入失敗: {}", e))?;
+
+        if imported > 0 {
+            inserted += 1;
+        } else {
+            skipped_duplicates += 1;
+        }
+    }
+
+    tx.commit()
+        .map_err(|e| format!("提交匯入結果失敗: {}", e))?;
+
+    Ok(UsageDayImportSummary {
+        date: date.to_string(),
+        total,
+        imported: inserted,
+        skipped_duplicates,
+    })
 }
 
 pub fn get_session_assistant_and_transcript(
     conn: &rusqlite::Connection,
     assistant: &str,
     session_id: &str,
-) -> Result<(String, Option<String>), String> {
+) -> Result<(String, Option<String>, String), String> {
     let mut stmt = conn
         .prepare(
-            "SELECT assistant_type, transcript_path FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
+            "SELECT assistant_type, transcript_path, source_kind FROM usage_entries WHERE session_id = ? AND assistant_type = ? LIMIT 1",
         )
         .map_err(|e| e.to_string())?;
     let mut rows = stmt
@@ -2141,7 +2649,12 @@ pub fn get_session_assistant_and_transcript(
     if let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let ast: String = row.get(0).map_err(|e| e.to_string())?;
         let path: Option<String> = row.get(1).ok();
-        Ok((ast, path))
+        let source_kind = row
+            .get::<_, Option<String>>(2)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "legacy".to_string());
+        Ok((ast, path, source_kind))
     } else {
         Err("Session not found".to_string())
     }
@@ -2272,7 +2785,7 @@ pub fn get_usage_entries_by_month(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date
+            date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_month));
@@ -2407,6 +2920,7 @@ pub fn get_usage_entries_by_month(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(27).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -2470,7 +2984,7 @@ pub fn get_usage_entries_by_year(
             tokens_input, tokens_output, tokens_cache_read, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date
+            date, source_kind
          FROM usage_entries WHERE date LIKE ?".to_string();
     let mut params_vec = Vec::new();
     params_vec.push(rusqlite::types::Value::Text(query_year));
@@ -2605,6 +3119,7 @@ pub fn get_usage_entries_by_year(
                 delta_tokens,
                 context: None,
                 cost,
+                source_kind: row.get(27).ok(),
                 parent_session_id: row.get(21).ok(),
                 agent_nickname: row.get(22).ok(),
                 agent_role: row.get(23).ok(),
@@ -2643,6 +3158,138 @@ mod tests {
             unique
         ));
         path
+    }
+
+    fn sample_import_record() -> UsageDayExportRecord {
+        UsageDayExportRecord {
+            entry: UsageEntry {
+                timestamp: "2026-07-10T12:34:56Z".to_string(),
+                session_id: "import-session".to_string(),
+                session_name: Some("匯入測試".to_string()),
+                transcript_path: Some("/tmp/import.json".to_string()),
+                cwd: Some("/tmp".to_string()),
+                version: Some("0.1.4".to_string()),
+                turn_no: 1,
+                model: Some("gpt-5".to_string()),
+                model_id: Some("gpt-5".to_string()),
+                tokens: Some(TokenStats {
+                    input: 100,
+                    output: 20,
+                    cache_read: Some(30),
+                    cache_write: Some(10),
+                    reasoning: Some(5),
+                    total: 120,
+                }),
+                delta_tokens: Some(TokenStats {
+                    input: 10,
+                    output: 2,
+                    cache_read: Some(3),
+                    cache_write: Some(1),
+                    reasoning: Some(1),
+                    total: 12,
+                }),
+                context: None,
+                cost: Some(CostStats {
+                    total_api_duration_ms: Some(125.0),
+                    total_duration_ms: None,
+                    total_premium_requests: Some(1.0),
+                }),
+                source_kind: None,
+                parent_session_id: Some("parent-session".to_string()),
+                agent_nickname: Some("worker".to_string()),
+                agent_role: Some("analysis".to_string()),
+                reasoning_effort: Some("high".to_string()),
+            },
+            import_source_id: Some("import-test-record".to_string()),
+        }
+    }
+
+    #[test]
+    fn sync_antigravity_usage_log_writes_all_columns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let usage_file = temp_jsonl_path("antigravity-sync");
+        let base_dir = usage_file.with_extension("");
+        let usage_dir = base_dir.join("usage");
+        fs::create_dir_all(&usage_dir).unwrap();
+        let log_path = usage_dir.join("usage-2026-07-12.jsonl");
+        let record = sample_import_record().entry;
+        fs::write(
+            &log_path,
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+
+        sync_hook_usage_logs(&mut conn, "antigravity", &base_dir).unwrap();
+
+        let inserted: (u64, String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT COUNT(*), source_kind, tokens_cache_write, delta_cache_write
+                 FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(inserted, (1, "legacy".to_string(), Some(10), Some(1)));
+
+        fs::remove_dir_all(base_dir).unwrap();
+    }
+
+    #[test]
+    fn import_usage_day_entries_writes_and_deduplicates_records() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let record = sample_import_record();
+
+        let first =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record.clone()])
+                .unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.skipped_duplicates, 0);
+
+        let second =
+            import_usage_day_entries(&mut conn, "codex", "2026-07-10", vec![record]).unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1);
+
+        let imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = ? AND import_source_id = ?",
+                params!["codex", "import-test-record"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_copilot_source_kind() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('copilot', '2026-07-10T00:00:00Z', '2026-07-10', 'legacy-copilot', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![COPILOT_SOURCE_KIND_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let source_kind: String = conn
+            .query_row(
+                "SELECT source_kind FROM usage_entries WHERE session_id = 'legacy-copilot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_kind, "copilot-cli");
     }
 
     #[test]
@@ -2718,6 +3365,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_codex_session_file_keeps_subagent_identity_separate_from_parent() {
+        let path = temp_jsonl_path("codex-subagent");
+        let content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"child-session","forked_from_id":"parent-session","parent_thread_id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","agent_nickname":"reviewer","agent_role":"review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"reviewer","agent_role":"review"}}}}}
+{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":"cli"}}
+{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+
+        fs::write(&path, content).unwrap();
+        let entries = parse_codex_session_file(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].session_id, "child-session");
+        assert_eq!(
+            entries[0].parent_session_id.as_deref(),
+            Some("parent-session")
+        );
+        assert_ne!(entries[0].session_id, "parent-session");
+    }
+
+    #[test]
     fn sync_codex_usage_logs_writes_recomputed_delta_totals() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -2749,6 +3417,204 @@ mod tests {
             )
             .unwrap();
         assert_eq!(total, 110);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_preserves_parent_and_subagent_sessions() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-parent-child-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir.join("sessions/2026/07/10");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let parent_path = sessions_dir.join("rollout-2026-07-10T03-43-00-parent-session.jsonl");
+        let child_path = sessions_dir.join("rollout-2026-07-10T03-45-00-child-session.jsonl");
+
+        let parent_content = r#"{"timestamp":"2026-07-10T03:43:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
+{"timestamp":"2026-07-10T03:43:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+        let child_content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"child-session","forked_from_id":"parent-session","parent_thread_id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}}}}
+{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":"cli"}}
+{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":2,"total_tokens":55},"last_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":2,"total_tokens":55},"model_context_window":258400}}}
+"#;
+
+        fs::write(&parent_path, parent_content).unwrap();
+        fs::write(&child_path, child_content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:codex_delta_from_totals_v2', 1, 0)",
+            [],
+        )
+        .unwrap();
+        let parent_state_key =
+            format!("codex:{}", portable_relative_path(&codex_dir, &parent_path));
+        let child_state_key = format!("codex:{}", portable_relative_path(&codex_dir, &child_path));
+        for (path, state_key) in [
+            (&parent_path, parent_state_key.as_str()),
+            (&child_path, child_state_key.as_str()),
+        ] {
+            let size = fs::metadata(path).unwrap().len() as i64;
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, 0)",
+                params![state_key, size],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 10, 0)",
+            params![r"codex:sessions\2026\07\10\legacy.jsonl"],
+        )
+        .unwrap();
+        #[cfg(windows)]
+        let stale_transcript_path = child_path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .to_uppercase();
+        #[cfg(not(windows))]
+        let stale_transcript_path = child_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                parent_session_id
+             ) VALUES ('codex', '2026-07-10T00:00:00Z', '2026-07-10',
+                'legacy-shared', ?, 1, 'legacy-shared')",
+            params![stale_transcript_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('antigravity', '2026-07-10T00:00:00Z', '2026-07-10',
+                'unrelated-session', 1)",
+            [],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let session_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT session_id) FROM usage_entries WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_count, 2);
+
+        let child_parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE assistant_type = 'codex' AND session_id = 'child-session' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(child_parent.as_deref(), Some("parent-session"));
+
+        let self_parent_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'codex' AND parent_session_id = session_id",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let transcript_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT transcript_path) FROM usage_entries WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let unrelated_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'antigravity' AND session_id = 'unrelated-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'codex' AND session_id = 'legacy-shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migration_marker_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![CODEX_PARSER_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_state_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:sessions\\%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(self_parent_count, 0);
+        assert_eq!(transcript_count, 2);
+        assert_eq!(unrelated_count, 1);
+        assert_eq!(legacy_count, 0);
+        assert_eq!(migration_marker_count, 1);
+        assert_eq!(legacy_state_count, 0);
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let codex_rows_after_second_sync: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_rows_after_second_sync, 2);
+
+        let synced_child_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![child_state_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let empty_child_content = format!(
+            "{{\"timestamp\":\"2026-07-10T03:45:00.000Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"child-session\"}}}}\n{}",
+            " ".repeat(1000)
+        );
+        fs::write(&child_path, empty_child_content).unwrap();
+        assert_ne!(fs::metadata(&child_path).unwrap().len(), synced_child_size);
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let preserved_child_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'codex' AND session_id = 'child-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let state_size_after_empty_parse: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![child_state_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_child_rows, 1);
+        assert_eq!(state_size_after_empty_parse, synced_child_size);
 
         if let Some(value) = old_codex_dir {
             std::env::set_var("CODEX_DIR", value);
@@ -2792,5 +3658,149 @@ mod tests {
         let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
         let parsed = parse_cursor_timestamp(ts);
         assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
+    }
+
+    #[test]
+    fn codex_parser_migration_clears_all_codex_file_state_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:codex_delta_from_totals_v2', 1, 0)",
+            [],
+        )
+        .unwrap();
+        for key in [
+            "codex:sessions/2026/07/session.jsonl",
+            r"codex:sessions\2026\07\session.jsonl",
+        ] {
+            conn.execute(
+                "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 10, 0)",
+                params![key],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('codex:claude:legacy.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, parent_session_id
+             ) VALUES ('codex', '2026-07-10T00:00:00Z', '2026-07-10',
+                'codex-session', 1, 'codex-session')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('antigravity', '2026-07-10T00:00:00Z', '2026-07-10',
+                'antigravity-session', 1)",
+            [],
+        )
+        .unwrap();
+
+        run_codex_parser_migration(&mut conn).unwrap();
+
+        let remaining: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:sessions%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+
+        let codex_entries: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let antigravity_entries: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let codex_parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_session_id FROM usage_entries WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_claude_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = 'codex:claude:legacy.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_entries, 1);
+        assert_eq!(antigravity_entries, 1);
+        assert_eq!(codex_parent, None);
+        assert_eq!(legacy_claude_state, 1);
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('codex:sessions/new.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        run_codex_parser_migration(&mut conn).unwrap();
+        let state_after_second_run: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = 'codex:sessions/new.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after_second_run, 1);
+    }
+
+    #[test]
+    fn portable_state_paths_use_forward_slashes() {
+        let root = PathBuf::from("root");
+        let path = root
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("session.jsonl");
+
+        assert_eq!(
+            portable_relative_path(&root, &path),
+            "sessions/2026/07/session.jsonl"
+        );
+    }
+
+    #[test]
+    fn claude_migration_recognizes_windows_and_unix_transcript_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session_id, transcript_path) in [
+            ("windows", r"C:\Users\name\.claude\projects\session.jsonl"),
+            ("unix", "/home/name/.claude/projects/session.jsonl"),
+        ] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, turn_no, transcript_path
+                 ) VALUES ('codex', '2026-07-10T00:00:00Z', '2026-07-10', ?, 1, ?)",
+                params![session_id, transcript_path],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(migrate_legacy_claude_usage_entries(&conn).unwrap(), 2);
+        let migrated: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE assistant_type = 'claude'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated, 2);
     }
 }

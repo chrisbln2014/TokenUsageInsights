@@ -1,6 +1,7 @@
 use axum::{
+    extract::DefaultBodyLimit,
     http::{header::CONTENT_TYPE, Method},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use std::path::PathBuf;
@@ -9,11 +10,19 @@ use tower_http::services::ServeDir;
 
 mod db;
 mod handlers;
+mod paths;
 mod pricing;
 mod snapshot;
 mod timeline;
+mod vscode;
 
 use handlers::*;
+
+const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
+
+fn import_usage_route() -> axum::routing::MethodRouter {
+    post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))
+}
 
 fn build_cors_layer() -> CorsLayer {
     let default_port = std::env::var("PORT")
@@ -155,6 +164,8 @@ fn build_db_router(static_dir: &PathBuf) -> Router {
         .route("/api/:assistant/dates", get(get_available_dates))
         .route("/api/:assistant/setup-info", get(get_setup_info))
         .route("/api/:assistant/usage/:date", get(get_usage_details))
+        .route("/api/:assistant/usage/:date/export", get(export_usage_day))
+        .route("/api/:assistant/usage/:date/import", import_usage_route())
         .route(
             "/api/:assistant/session/:session_id",
             get(get_session_details),
@@ -199,37 +210,42 @@ fn build_snapshot_router(static_dir: &PathBuf) -> Router {
 
 /// 獲取靜態檔案的基準路徑
 fn get_static_dir() -> PathBuf {
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        let p = PathBuf::from(manifest_dir).join("static");
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            let p = exe_dir.join("static");
-            if p.exists() {
-                return p;
-            }
-            if let Some(grandparent) = exe_dir.parent().and_then(|p| p.parent()) {
-                let p = grandparent.join("static");
-                if p.exists() {
-                    return p;
-                }
-            }
-        }
-    }
-    let pwd = PathBuf::from("static");
-    if pwd.exists() {
-        return pwd;
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        let p = cwd.join("static");
-        if p.exists() {
-            return p;
-        }
+    if let Some(path) = paths::find_resource("static") {
+        return path;
     }
     eprintln!("❌ 無法定位 static 目錄。請在專案根目錄下執行此程式。");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Method, Request, StatusCode},
+        Router,
+    };
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[test]
+    fn import_payload_limit_is_200_megabytes() {
+        assert_eq!(MAX_IMPORT_PAYLOAD_BYTES, 200_000_000);
+    }
+
+    #[tokio::test]
+    async fn import_route_allows_json_larger_than_the_default_limit() {
+        let app = Router::new().route("/api/:assistant/usage/:date/import", import_usage_route());
+        let payload = format!(r#"{{"padding":"{}"}}"#, "x".repeat(3 * 1024 * 1024));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/unsupported/usage/2026-07-10/import")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

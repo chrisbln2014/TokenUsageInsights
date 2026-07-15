@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=15';
+import i18n from './i18n.js?v=17';
 
 // Globals
 let tokenChartInstance = null;
@@ -53,7 +53,7 @@ const assistantMeta = {
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
-    label: 'GitHub Copilot CLI',
+    label: 'GitHub Copilot',
     shortLabel: 'Copilot',
     alt: 'Copilot',
     badgeStyle: 'background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;',
@@ -276,19 +276,35 @@ function updateBrandLogo() {
 
 function languageMeta(lang) {
   return lang === 'en'
-    ? { flag: '🇺🇸', label: '美國', next: 'zh-TW' }
-    : { flag: '🇹🇼', label: '臺灣', next: 'en' };
+    ? { label: 'United States', next: 'zh-TW' }
+    : { label: '臺灣', next: 'en' };
+}
+
+// Flag artwork sourced from the open-source "flag-icons" project (lipis/flag-icons, MIT license):
+// https://github.com/lipis/flag-icons — local copies live in static/flags/{us,tw}.svg
+function languageFlagIcon(lang) {
+  const code = lang === 'en' ? 'us' : 'tw';
+  const label = lang === 'en' ? 'United States flag' : 'Taiwan flag';
+  return `<img src="/static/flags/${code}.svg" alt="${label}" class="lang-flag-icon" />`;
 }
 
 function updateLanguageToggle() {
   const langToggle = document.getElementById('lang-toggle-btn');
   if (!langToggle) return;
 
+  const langToggleIcon = document.getElementById('lang-toggle-icon');
+  const langToggleText = document.getElementById('lang-toggle-text');
+
   const meta = languageMeta(currentLang);
   const label = currentLang === 'en'
     ? `Switch language, current: United States`
     : `切換語言，目前：${meta.label}`;
-  langToggle.textContent = meta.flag;
+  if (langToggleIcon) {
+    langToggleIcon.innerHTML = languageFlagIcon(currentLang);
+  }
+  if (langToggleText) {
+    langToggleText.textContent = t('btn_language');
+  }
   langToggle.title = label;
   langToggle.setAttribute('aria-label', label);
 }
@@ -915,6 +931,24 @@ function initApp() {
     });
   }
 
+  const btnExportUsageDay = document.getElementById('btn-export-usage-day');
+  if (btnExportUsageDay) {
+    btnExportUsageDay.addEventListener('click', async () => {
+      await exportCurrentUsageDay();
+    });
+  }
+
+  const usageImportInput = document.getElementById('usage-day-import-input');
+  const btnImportUsageDay = document.getElementById('btn-import-usage-day');
+  if (btnImportUsageDay && usageImportInput) {
+    btnImportUsageDay.addEventListener('click', () => usageImportInput.click());
+    usageImportInput.addEventListener('change', async (e) => {
+      const file = e.target && e.target.files ? e.target.files[0] : null;
+      await importUsageDayFromFile(file);
+      e.target.value = '';
+    });
+  }
+
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
@@ -1340,6 +1374,144 @@ async function loadUsageData(date) {
   }
 }
 
+function getCurrentUsageDayDate() {
+  const dateSelect = document.getElementById('date-select');
+  return dateSelect && dateSelect.value ? dateSelect.value : getLocalDateString();
+}
+
+function getUsageExportFilename(payload) {
+  const safeAssistant = currentAssistant || 'unknown';
+  const date = payload?.date || getCurrentUsageDayDate();
+  return `token-usage-${safeAssistant}-${date}-day-v${payload?.version || 1}.json`;
+}
+
+async function exportCurrentUsageDay() {
+  const date = getCurrentUsageDayDate();
+  const btnExport = document.getElementById('btn-export-usage-day');
+  if (btnExport) btnExport.classList.add('loading');
+
+  try {
+    const res = await fetch(`/api/${currentAssistant}/usage/${date}/export`);
+    const payload = await res.json().catch(() => null);
+
+    if (!res.ok) {
+      const err = payload && payload.error
+        ? payload.error
+        : t('export_no_data');
+      showNotification(err || t('export_failed').replace('{msg}', `${res.status} ${res.statusText}`), 'error');
+      return;
+    }
+    
+    const records = Array.isArray(payload?.records) ? payload.records : [];
+    if (records.length === 0) {
+      showNotification(t('export_no_data'), 'info');
+      return;
+    }
+
+    const filename = getUsageExportFilename(payload);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: 'application/json;charset=utf-8',
+    });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(downloadUrl);
+
+    showNotification(
+      t('usage_exported')
+        .replace('{count}', String(records.length))
+        .replace('{date}', payload.date || date),
+      'success'
+    );
+  } catch (err) {
+    console.error('Export failed:', err);
+    showNotification(t('export_failed').replace('{msg}', err.message || String(err)), 'error');
+  } finally {
+    if (btnExport) btnExport.classList.remove('loading');
+  }
+}
+
+async function importUsageDayFromFile(file) {
+  if (!file) {
+    showNotification(t('import_no_file'), 'info');
+    return;
+  }
+
+  const importBtn = document.getElementById('btn-import-usage-day');
+  if (importBtn) importBtn.classList.add('loading');
+
+  try {
+    const rawText = await file.text();
+    let payload = null;
+
+    try {
+      payload = JSON.parse(rawText);
+    } catch {
+      showNotification(t('import_parse_failed'), 'error');
+      return;
+    }
+
+    const targetDate = typeof payload?.date === 'string' && payload.date.trim()
+      ? payload.date.trim()
+      : getCurrentUsageDayDate();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
+      showNotification(t('import_failed').replace('{msg}', t('invalid_import_date')), 'error');
+      return;
+    }
+    const records = Array.isArray(payload?.records) ? payload.records : [];
+
+    const res = await fetch(`/api/${currentAssistant}/usage/${targetDate}/import`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        date: targetDate,
+        records,
+      }),
+    });
+
+    const summary = await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = summary && summary.error
+        ? summary.error
+        : t('import_failed').replace('{msg}', `${res.status} ${res.statusText}`);
+      showNotification(`${err}`, 'error');
+      return;
+    }
+
+    const imported = summary && typeof summary.imported === 'number' ? summary.imported : 0;
+    const total = summary && typeof summary.total === 'number' ? summary.total : records.length;
+    const skipped = summary && typeof summary.skipped_duplicates === 'number' ? summary.skipped_duplicates : 0;
+    let msg = t('usage_import_success')
+      .replace('{imported}', String(imported))
+      .replace('{total}', String(total));
+    if (skipped > 0) {
+      msg = `${msg}，${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
+    }
+    showNotification(msg, 'success');
+
+    const dateSelect = document.getElementById('date-select');
+    if (dateSelect) {
+      dateSelect.value = targetDate;
+    }
+    await fetchDates(targetDate, true);
+    if (activeTab !== 'daily') {
+      switchTab('daily');
+    }
+    await loadUsageData(targetDate);
+  } catch (err) {
+    console.error('Import failed:', err);
+    showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
+  } finally {
+    if (importBtn) importBtn.classList.remove('loading');
+  }
+}
+
 // 顯示「此 Agent 於當日無資料」的提示畫面
 function showNoDataForDate(date) {
   const meta = getAssistantMeta(currentAssistant);
@@ -1683,7 +1855,7 @@ function renderChart(sessions) {
           const index = elements[0].index;
           const session = currentChartSessions[index];
           if (session) {
-            openSessionTimeline(session.session_id, session.session_name, session.total_tokens, session.total_cache_read_tokens);
+            openSessionTimeline(session);
           }
         }
       },
@@ -1826,16 +1998,17 @@ function initTableSorting() {
 }
 
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
-  const map = {};
+  const map = new Map();
   sessions.forEach(s => {
-    map[s.session_id] = { ...s, children: [] };
+    map.set(s.session_id, { ...s, children: [] });
   });
 
+  const nodes = [...map.values()];
   const roots = [];
-  sessions.forEach(s => {
-    const item = map[s.session_id];
-    if (s.parent_session_id && map[s.parent_session_id]) {
-      map[s.parent_session_id].children.push(item);
+  nodes.forEach(item => {
+    const parent = item.parent_session_id ? map.get(item.parent_session_id) : null;
+    if (parent && parent !== item) {
+      parent.children.push(item);
     } else {
       roots.push(item);
     }
@@ -1855,26 +2028,30 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
 
   // 排序 Root 節點
   roots.sort(compare);
-
-  // 遞迴排序子節點
-  const sortTree = (node) => {
-    node.children.sort(compare);
-    node.children.forEach(sortTree);
-  };
-  roots.forEach(sortTree);
+  nodes.sort(compare);
 
   // 扁平化
   const flat = [];
+  const visited = new Set();
   const traverse = (node, depth, parentName) => {
+    if (visited.has(node.session_id)) return;
+    visited.add(node.session_id);
     flat.push({
       ...node,
       depth,
       isSubagent: depth > 0,
       parentName
     });
-    node.children.forEach(child => traverse(child, depth + 1, node.session_name));
+    node.children
+      .sort(compare)
+      .forEach(child => traverse(child, depth + 1, node.session_name));
   };
   roots.forEach(r => traverse(r, 0, null));
+  nodes.forEach(node => {
+    if (!visited.has(node.session_id)) {
+      traverse(node, 0, null);
+    }
+  });
 
   return flat;
 }
@@ -1936,17 +2113,35 @@ function renderSessionTable(sessions) {
   }
 
   // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = {};
+  const sessionsMap = Object.create(null);
   sessions.forEach(s => {
     sessionsMap[s.session_id] = s;
   });
 
   function getRootParentId(session) {
     let curr = session;
-    while (curr && curr.parent_session_id && sessionsMap[curr.parent_session_id]) {
+    const path = [];
+    const positions = new Map();
+
+    while (curr) {
+      const id = curr.session_id;
+      if (positions.has(id)) {
+        return path
+          .slice(positions.get(id))
+          .map(node => String(node.session_id))
+          .sort((a, b) => a.localeCompare(b))[0];
+      }
+
+      positions.set(id, path.length);
+      path.push(curr);
+
+      if (!curr.parent_session_id || !sessionsMap[curr.parent_session_id]) {
+        return id;
+      }
       curr = sessionsMap[curr.parent_session_id];
     }
-    return curr ? curr.session_id : session.session_id;
+
+    return session.session_id;
   }
 
   sessions.forEach(s => {
@@ -1966,6 +2161,11 @@ function renderSessionTable(sessions) {
       const meta = getAssistantMeta(s.assistant_type);
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
+    const sourceBadge = s.source_kind === 'vscode-chat'
+      ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
+      : (s.assistant_type === 'copilot'
+        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
+        : '');
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -1981,18 +2181,21 @@ function renderSessionTable(sessions) {
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
+            ${sourceBadge}
             ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
             ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
           </div>
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          <span class="session-id-sub">${s.session_id}</span>
+          ${sourceBadge}
+          <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
     } else {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          <span class="session-id-sub">${s.session_id}</span>
+          ${sourceBadge}
+          <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
     }
@@ -2021,21 +2224,7 @@ function renderSessionTable(sessions) {
 
     // 當點擊 Session 時，開啟對話詳細還原
     tr.addEventListener('click', () => {
-      openSessionTimeline(
-        s.session_id,
-        s.session_name,
-        s.total_tokens,
-        s.total_cache_read_tokens,
-        s.total_input_tokens,
-        s.total_output_tokens,
-        s.total_reasoning_tokens,
-        s.cwd,
-        s.model,
-        s.assistant_type,
-        s.agent_nickname,
-        s.agent_role,
-        s.reasoning_effort
-      );
+      openSessionTimeline(s);
     });
 
     // 群組 Hover 高亮
@@ -2065,7 +2254,22 @@ function renderSessionTable(sessions) {
 // =========================================================================
 // API 呼叫: 載入並渲染特定 Session 對話時間軸 (Timeline)
 // =========================================================================
-async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheReadTokens, inputTokens, outputTokens, reasoningTokens, cwd, model, assistantType, agentNickname, agentRole) {
+async function openSessionTimeline(session) {
+  const {
+    session_id: sessionId,
+    session_name: sessionName,
+    total_tokens: totalTokens,
+    total_cache_read_tokens: cacheReadTokens,
+    total_input_tokens: inputTokens,
+    total_output_tokens: outputTokens,
+    total_reasoning_tokens: reasoningTokens,
+    cwd,
+    model,
+    assistant_type: assistantType,
+    agent_nickname: agentNickname,
+    agent_role: agentRole,
+    cost_usd: estimatedCost,
+  } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
 
@@ -2104,6 +2308,7 @@ async function openSessionTimeline(sessionId, sessionName, totalTokens, cacheRea
   document.getElementById('meta-input').textContent = formatToken(inputTokens || 0);
   document.getElementById('meta-output').textContent = formatToken(outputTokens || 0);
   document.getElementById('meta-reasoning').textContent = formatToken(reasoningTokens || 0);
+  document.getElementById('meta-cost').textContent = formatCost(estimatedCost);
 
   const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
   const roleContainer = document.getElementById('drawer-meta-role-container');
@@ -2245,7 +2450,7 @@ function renderTimeline(data) {
           attachmentsHTML = `<div class="bubble-attachments">`;
           item.event_data.attachments.forEach(att => {
             const path = att.filePath || att.path || '檔名未知';
-            const basename = path.split('/').pop();
+            const basename = path.split(/[\\/]/).pop();
             const attType = att.type || 'file';
             attachmentsHTML += `
               <div class="attachment-badge" title="${escapeHtml(path)}">
@@ -3976,8 +4181,9 @@ async function loadSetupInfo() {
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
     
-    // Dynamic values based on home_dir
-    const homeDir = data.home_dir || '/home/user';
+    const isWindows = data.platform === 'windows';
+    const quotePowerShell = value => `'${String(value).replace(/'/g, "''")}'`;
+    const quoteShell = value => `'${String(value).replace(/'/g, `'"'"'`)}'`;
 
     // Localize modal title based on selected assistant
     const titleH2 = document.getElementById('setup-modal-title');
@@ -3996,13 +4202,18 @@ async function loadSetupInfo() {
     }
     
     if (currentAssistant === 'antigravity' || currentAssistant === 'copilot') {
-      const folder = currentAssistant === 'copilot' ? '.copilot' : '.gemini/antigravity-cli';
-      const targetScriptPath = `$HOME/${folder}/statusline-token.sh`;
+      const assistantSetup = data[currentAssistant] || {};
+      const targetScriptPath = assistantSetup.script_path || '';
+      const sourceScriptPath = assistantSetup.source_script_path || '';
+      const settingsPath = assistantSetup.settings_path || '';
+      const targetScriptCommand = isWindows
+        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${currentAssistant}`
+        : targetScriptPath;
 
       const settingsJson = JSON.stringify({
         "statusLine": {
           "type": "command",
-          "command": targetScriptPath,
+          "command": targetScriptCommand,
           "padding": 1
         }
       }, null, 2);
@@ -4014,7 +4225,7 @@ async function loadSetupInfo() {
         },
         "statusLine": {
           "type": "command",
-          "command": targetScriptPath,
+          "command": targetScriptCommand,
           "padding": 1
         }
       }, null, 2);
@@ -4079,31 +4290,35 @@ async function loadSetupInfo() {
 
       const editCmdEl = document.getElementById('code-edit-settings');
       if (editCmdEl) {
-        editCmdEl.textContent = `vi ~/${folder}/settings.json`;
+        editCmdEl.textContent = isWindows
+          ? `notepad ${quotePowerShell(settingsPath)}`
+          : `vi ${quoteShell(settingsPath)}`;
       }
 
       if (setupCmdEl) {
-        const srcScript = `shell/${currentAssistant === 'copilot' ? 'copilot' : 'antigravity'}/statusline-token.sh`;
-        setupCmdEl.textContent = `mkdir -p ~/${folder} && cp ${srcScript} ~/${folder}/statusline-token.sh && chmod +x ~/${folder}/statusline-token.sh`;
+        setupCmdEl.textContent = isWindows
+          ? `New-Item -ItemType Directory -Force -Path ${quotePowerShell(assistantSetup.dir_path)} | Out-Null; Copy-Item -LiteralPath ${quotePowerShell(sourceScriptPath)} -Destination ${quotePowerShell(targetScriptPath)} -Force`
+          : `mkdir -p ${quoteShell(assistantSetup.dir_path)} && cp ${quoteShell(sourceScriptPath)} ${quoteShell(targetScriptPath)} && chmod +x ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootAEl) {
-        troubleshootAEl.textContent = `echo '{}' | ~/${folder}/statusline-token.sh`;
+        troubleshootAEl.textContent = isWindows
+          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${currentAssistant}`
+          : `echo '{}' | ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootBEl) {
-        const displaySettingsPath = currentAssistant === 'copilot' 
-          ? `~/.copilot/settings.json`
-          : `~/.gemini/antigravity-cli/settings.json`;
-        troubleshootBEl.textContent = `jq . ${displaySettingsPath}`;
+        troubleshootBEl.textContent = isWindows
+          ? `Get-Content -Raw -LiteralPath ${quotePowerShell(settingsPath)} | ConvertFrom-Json | Out-Null`
+          : `jq . ${quoteShell(settingsPath)}`;
       }
     } else if (currentAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
-      if (homeLabelCodex) homeLabelCodex.textContent = `${homeDir}/.codex/sessions`;
+      if (homeLabelCodex) homeLabelCodex.textContent = data.codex?.data_path || '';
     } else if (currentAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
-      if (homeLabelClaude) homeLabelClaude.textContent = `${homeDir}/.claude/projects`;
+      if (homeLabelClaude) homeLabelClaude.textContent = data.claude?.data_path || '';
     } else if (currentAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
-      if (homeLabelCursor) homeLabelCursor.textContent = `${homeDir}/.cursor/projects`;
+      if (homeLabelCursor) homeLabelCursor.textContent = data.cursor?.data_path || '';
     }
 
     // Apply updated language translations

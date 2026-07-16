@@ -16,8 +16,10 @@
   - session-event 上傳改 best-effort：單筆失敗只略過不中斷；遇 401 立即清 token 讓後續筆自動重取。
   - 核心 snapshot 上傳遇 401 重取 token 重試一次，確保每日資料一定上得去。
   - 新增 `-SkipSessionEventAssistants` 參數，可跳過指定 assistant（目前排程跳過 `copilot` 積壓）。
-- **配套**：排程 `ExecutionTimeLimit` 20 分 → 2 小時；`upload-drive-snapshot-hidden.vbs` 加 `-SkipSessionEventAssistants copilot`。
-- **待辦**：copilot 積壓需要「index 增量存檔（checkpoint）」才能跨多次 run 補完；核心匯出逐日打 API 的效能可再優化。
+- **index 增量存檔（checkpoint）**：每成功上傳 25 筆 session event 就存一次 index（原本只在 run 全部跑完才存），即使 run 中斷進度也保留，讓 copilot 這類大量積壓能跨多次 run 逐步收斂；Drive 上傳補上 timeout（snapshot 300s、session/metadata 120s、權限 60s）防偶發卡死。
+- **copilot 積壓已清空**：backfill 一次補完 803 筆 copilot session event（index copilot 1 → 804，32 次 checkpoint 存檔），session 細項恢復；隨後移除排程 vbs 的 `-SkipSessionEventAssistants copilot`，讓 copilot 之後持續更新。
+- **配套**：排程 `ExecutionTimeLimit` 20 分 → 2 小時。
+- **待辦**：核心匯出逐日打 API（copilot 164 天）約 18.5 分偏慢，可改批次匯出優化。
 
 ### 2026-07-09 - Windows 狀態列 (Statusline) 架構升級
 - **修正超時 Issue**：解決 Windows 下 PowerShell 冷啟動耗時長、導致狀態列超時報錯 `exit status 1` 的問題。

@@ -27,6 +27,8 @@ $script:AccessToken = $null
 $script:AccessTokenAcquiredAt = $null
 $script:AccessTokenTtlMinutes = 45
 $script:SessionEventIndex = @{}
+$script:UploadsSinceCheckpoint = 0
+$script:CheckpointEvery = 25
 
 function Resolve-DefaultPath {
     param([string]$Leaf)
@@ -123,6 +125,7 @@ function Invoke-DriveUpload {
             -Uri $metadataUri `
             -Headers $headers `
             -ContentType "application/json; charset=utf-8" `
+            -TimeoutSec 120 `
             -Body ($metadata | ConvertTo-Json -Depth 10 -Compress)
 
         $ExistingFileId = $created.id
@@ -134,6 +137,7 @@ function Invoke-DriveUpload {
         -Uri $updateUri `
         -Headers $headers `
         -ContentType "application/json; charset=utf-8" `
+        -TimeoutSec 300 `
         -Body $fileBytes
 }
 
@@ -166,6 +170,7 @@ function Invoke-DriveUploadContent {
             -Uri $metadataUri `
             -Headers $headers `
             -ContentType "application/json; charset=utf-8" `
+            -TimeoutSec 120 `
             -Body ($metadata | ConvertTo-Json -Depth 10 -Compress)
 
         $ExistingFileId = $created.id
@@ -177,6 +182,7 @@ function Invoke-DriveUploadContent {
         -Uri $updateUri `
         -Headers $headers `
         -ContentType $ContentType `
+        -TimeoutSec 120 `
         -Body $fileBytes
 }
 
@@ -208,7 +214,7 @@ function Grant-DriveReader {
         } | ConvertTo-Json -Depth 5 -Compress
 
         try {
-            Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $permission | Out-Null
+            Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $permission -TimeoutSec 60 | Out-Null
         } catch {
             if ($_.Exception.Response.StatusCode.value__ -ne 409) {
                 throw
@@ -511,6 +517,7 @@ function Upload-SessionEvent {
             -Name $fileName `
             -ExistingFileId $existingFileId
         $fileId = $uploaded.id
+        $script:UploadsSinceCheckpoint++
         Write-Host "Uploaded session event: $Assistant/$SessionId"
     }
 
@@ -590,6 +597,18 @@ function Collect-SessionEventsFromApi {
             }
             if ($null -ne $eventRef) {
                 $sessionEvents[$sessionId] = $eventRef
+            }
+
+            if ($script:UploadsSinceCheckpoint -ge $script:CheckpointEvery) {
+                # 增量存檔 index：即使 run 中途被中止，已上傳的 session 進度也不會遺失，
+                # 讓 copilot 這類大量積壓能跨多次 run 逐步收斂。
+                try {
+                    Save-SessionEventIndex -Index $script:SessionEventIndex -Path $SessionEventIndexPath
+                    Write-Host "Checkpoint: session index saved ($($script:SessionEventIndex.Count) entries)"
+                } catch {
+                    Write-Warning "Checkpoint 存檔失敗：$($_.Exception.Message)"
+                }
+                $script:UploadsSinceCheckpoint = 0
             }
         }
     }

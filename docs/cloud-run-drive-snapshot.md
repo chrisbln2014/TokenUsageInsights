@@ -58,10 +58,21 @@ gcloud --account=chris@berlin.com.tw auth application-default login `
 pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
   -GcloudAccount chris@berlin.com.tw `
   -ProjectId tokenusage-chris-20260709 `
-  -ShareWithServiceAccount token-insights-run@tokenusage-chris-20260709.iam.gserviceaccount.com
+  -ShareWithServiceAccount token-insights-drive@demoproject-dotnet.iam.gserviceaccount.com
 ```
 
 腳本會把 Drive file ID 存在 `%LOCALAPPDATA%\TokenUsageInsights\drive-snapshot-file-id.txt`。之後排程重跑會更新同一個檔案，而不是每次建立新檔。
+Session timeline 事件會另外上傳成獨立 JSON 檔，並記錄在 `%LOCALAPPDATA%\TokenUsageInsights\drive-session-events-index.json`。預設只重新檢查最近 2 天的 session events，以避免每次排程都重抓並重設所有舊 session 的 Drive 權限；若需要完整重刷，執行時加上 `-RefreshAllSessionEvents`。
+
+若某個 assistant 有大量從未上傳的 session（例如 copilot 的歷史積壓），會讓整個 run 因逐筆上傳而超時、連核心 snapshot 都上傳不了。此時可用 `-SkipSessionEventAssistants` 跳過該 assistant 的 session event 上傳（其每日／每月／每年核心資料仍照常匯出）：
+
+```powershell
+pwsh -ExecutionPolicy Bypass -File .\scripts\upload-drive-snapshot.ps1 `
+  -ExportFromApi -ApiUrl http://localhost:3003 `
+  -SkipSessionEventAssistants copilot
+```
+
+注意：目前 session event index 只在整個 run 成功結束時才存檔，因此積壓過大導致 run 無法完成時，已上傳的進度不會被記住。要讓大量積壓能跨多次排程逐步補完，需改為「增量存檔（checkpoint）」。
 
 若本機已安裝的 `token-usage-insights.exe` 還不是支援 `--export-snapshot` 的版本，腳本會自動改從正在執行的本機看板 API 匯出。預設 API 是 `http://localhost:3003`，也可以明確指定：
 

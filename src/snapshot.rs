@@ -151,10 +151,14 @@ pub fn build_snapshot_from_conn(
 
         let mut daily = HashMap::new();
         for date in &dates {
-            let entries = db::get_usage_entries_by_date(conn, date, &assistant)?;
-            if entries.is_empty() {
+            let records = db::get_usage_entries_by_date(conn, date, &assistant)?;
+            if records.is_empty() {
                 continue;
             }
+            let entries = records
+                .into_iter()
+                .map(|(record, assistant_type)| (record.entry, assistant_type))
+                .collect();
             let response = build_daily_response(date.clone(), entries)?;
             daily.insert(date.clone(), serde_json::to_value(response).map_err(|e| e.to_string())?);
         }
@@ -289,6 +293,10 @@ fn build_daily_response(
                 .clone()
                 .unwrap_or_else(|| "Start Coding Session".to_string()),
             assistant_type: assistant_type.clone(),
+            source_kind: last_entry
+                .source_kind
+                .clone()
+                .unwrap_or_else(|| "legacy".to_string()),
             cwd: last_entry.cwd.clone().unwrap_or_default(),
             model,
             total_tokens: session_totals.total,

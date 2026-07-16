@@ -12,7 +12,10 @@ param(
     [string]$DriveFolderId = "",
     [string]$ShareWithServiceAccount = "token-insights-drive@demoproject-dotnet.iam.gserviceaccount.com",
     [string]$SessionEventIndexPath = "",
-    [switch]$SkipSessionEvents
+    [switch]$SkipSessionEvents,
+    [int]$SessionEventRefreshDays = 2,
+    [switch]$RefreshAllSessionEvents,
+    [string[]]$SkipSessionEventAssistants = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +24,8 @@ $DriveScope = "https://www.googleapis.com/auth/drive.file"
 $CloudScope = "https://www.googleapis.com/auth/cloud-platform"
 $Assistants = @("antigravity", "copilot", "codex", "claude", "cursor")
 $script:AccessToken = $null
+$script:AccessTokenAcquiredAt = $null
+$script:AccessTokenTtlMinutes = 45
 $script:SessionEventIndex = @{}
 
 function Resolve-DefaultPath {
@@ -44,8 +49,19 @@ function Get-GcloudAccessToken {
 }
 
 function Ensure-AccessToken {
-    if ([string]::IsNullOrWhiteSpace($script:AccessToken)) {
+    # ADC access token 壽命約 1 小時；長時間 run（大量 session event 上傳）會讓快取的
+    # token 中途過期而 Drive API 回 401，整個 run abort。超過 TTL 就重新取得，避免過期。
+    $expired = $false
+    if ($null -ne $script:AccessTokenAcquiredAt) {
+        $ageMinutes = ((Get-Date) - $script:AccessTokenAcquiredAt).TotalMinutes
+        if ($ageMinutes -ge $script:AccessTokenTtlMinutes) {
+            $expired = $true
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:AccessToken) -or $expired) {
         $script:AccessToken = Get-GcloudAccessToken
+        $script:AccessTokenAcquiredAt = Get-Date
     }
 
     return $script:AccessToken
@@ -179,9 +195,7 @@ function Grant-DriveReader {
         "Content-Type" = "application/json"
         "X-Goog-User-Project" = $ProjectId
     }
-    $readerEmails = $ShareWithServiceAccount -split "[,;]" |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $readerEmails = Get-SharedReaderEmails
 
     $escapedFileId = [System.Uri]::EscapeDataString($UploadedFileId)
     $uri = "https://www.googleapis.com/drive/v3/files/$escapedFileId/permissions?sendNotificationEmail=false&fields=id"
@@ -201,6 +215,12 @@ function Grant-DriveReader {
             }
         }
     }
+}
+
+function Get-SharedReaderEmails {
+    return @($ShareWithServiceAccount -split "[,;]" |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
 
 function Get-AsArray {
@@ -330,6 +350,74 @@ function Get-StringSha256 {
     }
 }
 
+function Get-SessionEventFileId {
+    param([object]$Existing)
+
+    if ($null -eq $Existing -or -not $Existing.PSObject.Properties["file_id"]) {
+        return ""
+    }
+
+    return [string]$Existing.file_id
+}
+
+function Convert-SessionEventRefFromIndex {
+    param(
+        [object]$Existing,
+        [string]$FallbackFileName
+    )
+
+    $fileId = Get-SessionEventFileId $Existing
+    if ([string]::IsNullOrWhiteSpace($fileId)) {
+        return $null
+    }
+
+    $fileName = $FallbackFileName
+    if ($Existing.PSObject.Properties["file_name"] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Existing.file_name)) {
+        $fileName = [string]$Existing.file_name
+    }
+
+    $uploadedAt = ""
+    if ($Existing.PSObject.Properties["uploaded_at"] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Existing.uploaded_at)) {
+        $uploadedAt = [string]$Existing.uploaded_at
+    }
+
+    return [ordered]@{
+        drive_file_id = $fileId
+        file_name = $fileName
+        content_type = "application/json"
+        uploaded_at = $uploadedAt
+    }
+}
+
+function Test-ShouldRefreshSessionEvent {
+    param(
+        [string]$SessionDate,
+        [object]$Existing
+    )
+
+    if ($RefreshAllSessionEvents) {
+        return $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace((Get-SessionEventFileId $Existing))) {
+        return $true
+    }
+
+    if ($SessionEventRefreshDays -le 0) {
+        return $false
+    }
+
+    $parsedDate = [datetime]::MinValue
+    if (-not [datetime]::TryParse($SessionDate, [ref]$parsedDate)) {
+        return $true
+    }
+
+    $cutoff = (Get-Date).Date.AddDays(-1 * ($SessionEventRefreshDays - 1))
+    return $parsedDate.Date -ge $cutoff
+}
+
 function Load-SessionEventIndex {
     param([string]$Path)
 
@@ -375,22 +463,28 @@ function Save-SessionEventIndex {
 function Upload-SessionEvent {
     param(
         [string]$Assistant,
-        [string]$SessionId
+        [string]$SessionId,
+        [string]$SessionDate
     )
 
     if ($SkipSessionEvents -or [string]::IsNullOrWhiteSpace($SessionId)) {
         return $null
     }
 
-    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId"
-    if ([string]::IsNullOrWhiteSpace($raw)) {
-        return $null
-    }
-
-    $hash = Get-StringSha256 $raw
     $key = "$Assistant/$SessionId"
     $fileName = "token-usage-insights-session-$Assistant-$SessionId.json"
     $existing = $script:SessionEventIndex[$key]
+
+    if (-not (Test-ShouldRefreshSessionEvent -SessionDate $SessionDate -Existing $existing)) {
+        return Convert-SessionEventRefFromIndex -Existing $existing -FallbackFileName $fileName
+    }
+
+    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId"
+    if ([string]::IsNullOrWhiteSpace($raw)) {
+        return Convert-SessionEventRefFromIndex -Existing $existing -FallbackFileName $fileName
+    }
+
+    $hash = Get-StringSha256 $raw
     $existingFileId = $null
     if ($null -ne $existing -and $existing.PSObject.Properties["file_id"]) {
         $existingFileId = [string]$existing.file_id
@@ -424,7 +518,9 @@ function Upload-SessionEvent {
         return $null
     }
 
-    Grant-DriveReader -Token (Ensure-AccessToken) -UploadedFileId $fileId
+    if ($shouldUpload) {
+        Grant-DriveReader -Token (Ensure-AccessToken) -UploadedFileId $fileId
+    }
 
     $script:SessionEventIndex[$key] = [ordered]@{
         assistant = $Assistant
@@ -433,6 +529,7 @@ function Upload-SessionEvent {
         file_name = $fileName
         sha256 = $hash
         uploaded_at = $uploadedAt
+        shared_with = @(Get-SharedReaderEmails)
     }
 
     return [ordered]@{
@@ -450,6 +547,12 @@ function Collect-SessionEventsFromApi {
     )
 
     $sessionEvents = [ordered]@{}
+    if ($SkipSessionEventAssistants -contains $Assistant) {
+        # 跳過此 assistant 的 session event 上傳（例如 copilot 有大量從未上傳的積壓，
+        # 會讓整個 run 跑不完；核心 daily/monthly/yearly 資料仍照常匯出）。
+        Write-Host "Skipping session events for $Assistant (skip list)"
+        return $sessionEvents
+    }
     foreach ($date in $Dates) {
         $day = Invoke-TokenUsageApi "/api/$Assistant/usage/$date"
         if ($null -eq $day) {
@@ -466,7 +569,25 @@ function Collect-SessionEventsFromApi {
                 continue
             }
 
-            $eventRef = Upload-SessionEvent -Assistant $Assistant -SessionId $sessionId
+            try {
+                $eventRef = Upload-SessionEvent -Assistant $Assistant -SessionId $sessionId -SessionDate ([string]$date)
+            } catch {
+                # 單筆 session event 上傳失敗（例如 Drive 短暫錯誤）不應中斷整個 run，
+                # 否則核心 snapshot 永遠上傳不到 Drive。略過此筆、繼續。
+                $status = $null
+                if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+                    $status = [int]$_.Exception.Response.StatusCode.value__
+                }
+                if ($status -eq 401) {
+                    # token 中途過期：清掉快取，讓後續 session 自動重取新 token 繼續上傳。
+                    Write-Warning "Session event 遇 401（$Assistant/$sessionId），重取 token 後續筆繼續。"
+                    $script:AccessToken = $null
+                    $script:AccessTokenAcquiredAt = $null
+                } else {
+                    Write-Warning "Session event 上傳失敗（$Assistant/$sessionId），略過不中斷：$($_.Exception.Message)"
+                }
+                $eventRef = $null
+            }
             if ($null -ne $eventRef) {
                 $sessionEvents[$sessionId] = $eventRef
             }
@@ -582,26 +703,58 @@ if ([string]::IsNullOrWhiteSpace($SessionEventIndexPath)) {
 
 $script:SessionEventIndex = Load-SessionEventIndex -Path $SessionEventIndexPath
 
-if ($ExportFromApi -and -not $SkipExport) {
-    Export-SnapshotFromApi -OutputPath $SnapshotPath
-} elseif (-not $SkipExport) {
-    $exportArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "export-snapshot.ps1"), "-OutputPath", $SnapshotPath)
-    if (-not [string]::IsNullOrWhiteSpace($ExePath)) {
-        $exportArgs += @("-ExePath", $ExePath)
+$snapshotExportPath = $SnapshotPath
+$tempSnapshotPath = ""
+if (-not $SkipExport) {
+    $snapshotDir = Split-Path -Parent $SnapshotPath
+    if (-not [string]::IsNullOrWhiteSpace($snapshotDir)) {
+        New-Item -ItemType Directory -Path $snapshotDir -Force | Out-Null
     }
 
-    try {
-        & pwsh @exportArgs
-        if ($LASTEXITCODE -ne 0) {
-            throw "snapshot 匯出失敗，exit code: $LASTEXITCODE"
-        }
-    } catch {
-        if ([string]::IsNullOrWhiteSpace($ApiUrl)) {
-            throw
-        }
-        Write-Warning "執行檔匯出失敗，改從 $ApiUrl 匯出 snapshot。原始錯誤：$($_.Exception.Message)"
-        Export-SnapshotFromApi -OutputPath $SnapshotPath
+    $snapshotLeaf = Split-Path -Leaf $SnapshotPath
+    if ([string]::IsNullOrWhiteSpace($snapshotLeaf)) {
+        $snapshotLeaf = "snapshot.json"
     }
+    if ([string]::IsNullOrWhiteSpace($snapshotDir)) {
+        $tempSnapshotPath = "$SnapshotPath.tmp-$PID"
+    } else {
+        $tempSnapshotPath = Join-Path $snapshotDir "$snapshotLeaf.tmp-$PID"
+    }
+    $snapshotExportPath = $tempSnapshotPath
+}
+
+try {
+    if ($ExportFromApi -and -not $SkipExport) {
+        Export-SnapshotFromApi -OutputPath $snapshotExportPath
+    } elseif (-not $SkipExport) {
+        $exportArgs = @("-ExecutionPolicy", "Bypass", "-File", (Join-Path $PSScriptRoot "export-snapshot.ps1"), "-OutputPath", $snapshotExportPath)
+        if (-not [string]::IsNullOrWhiteSpace($ExePath)) {
+            $exportArgs += @("-ExePath", $ExePath)
+        }
+
+        try {
+            & pwsh @exportArgs
+            if ($LASTEXITCODE -ne 0) {
+                throw "snapshot 匯出失敗，exit code: $LASTEXITCODE"
+            }
+        } catch {
+            if ([string]::IsNullOrWhiteSpace($ApiUrl)) {
+                throw
+            }
+            Write-Warning "執行檔匯出失敗，改從 $ApiUrl 匯出 snapshot。原始錯誤：$($_.Exception.Message)"
+            Export-SnapshotFromApi -OutputPath $snapshotExportPath
+        }
+    }
+
+    if (-not $SkipExport) {
+        Move-Item -LiteralPath $snapshotExportPath -Destination $SnapshotPath -Force
+    }
+} catch {
+    if (-not [string]::IsNullOrWhiteSpace($tempSnapshotPath) -and
+        (Test-Path -LiteralPath $tempSnapshotPath)) {
+        Remove-Item -LiteralPath $tempSnapshotPath -Force
+    }
+    throw
 }
 
 if (-not $SkipSessionEvents) {
@@ -616,9 +769,28 @@ if ([string]::IsNullOrWhiteSpace($FileId) -and (Test-Path -LiteralPath $FileIdPa
     $FileId = (Get-Content -LiteralPath $FileIdPath -Raw).Trim()
 }
 
-$accessToken = Ensure-AccessToken
-$uploaded = Invoke-DriveUpload -Token $accessToken -ContentPath $SnapshotPath -ExistingFileId $FileId
-Grant-DriveReader -Token $accessToken -UploadedFileId $uploaded.id
+$uploaded = $null
+for ($uploadAttempt = 1; $uploadAttempt -le 2; $uploadAttempt++) {
+    try {
+        $accessToken = Ensure-AccessToken
+        $uploaded = Invoke-DriveUpload -Token $accessToken -ContentPath $SnapshotPath -ExistingFileId $FileId
+        Grant-DriveReader -Token $accessToken -UploadedFileId $uploaded.id
+        break
+    } catch {
+        $status = $null
+        if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
+            $status = [int]$_.Exception.Response.StatusCode.value__
+        }
+        if ($status -eq 401 -and $uploadAttempt -lt 2) {
+            # token 中途過期，強制重取後重試，確保核心 snapshot 一定上得去。
+            Write-Warning "上傳 snapshot 時 Drive 回 401，重新取得 token 後重試。"
+            $script:AccessToken = $null
+            $script:AccessTokenAcquiredAt = $null
+            continue
+        }
+        throw
+    }
+}
 
 $fileIdDir = Split-Path -Parent $FileIdPath
 if (-not [string]::IsNullOrWhiteSpace($fileIdDir)) {

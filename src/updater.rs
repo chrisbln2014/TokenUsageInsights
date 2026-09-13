@@ -2360,7 +2360,7 @@ fn validate_download_url(url: &str) -> Result<(), String> {
     let is_loopback =
         host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
 
-    if scheme == "https" || (scheme == "http" && (cfg!(test) || is_loopback)) {
+    if scheme == "https" || (scheme == "http" && cfg!(test) && is_loopback) {
         Ok(())
     } else {
         Err(format!("拒絕使用非 HTTPS 下載網址以維護傳輸安全: {url}"))
@@ -2373,7 +2373,7 @@ fn build_secure_http_client(timeout_secs: u64) -> Result<reqwest::Client, String
         let host = attempt.url().host_str().unwrap_or_default();
         let is_loopback =
             host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
-        if scheme == "https" || (scheme == "http" && (cfg!(test) || is_loopback)) {
+        if scheme == "https" || (scheme == "http" && cfg!(test) && is_loopback) {
             if attempt.previous().len() >= 10 {
                 attempt.error("超過重新導向次數上限 (10)")
             } else {
@@ -3807,15 +3807,23 @@ if ($startupSuccess) {
     $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 新版看板進程已確認健康就緒 (PID: $($childProc.Id))，標記更新提交並清理備份目錄..."
     $committedMarker = Join-Path $backupDir '.committed'
+    $commitSuccess = $false
     try {
         Set-Content -LiteralPath $committedMarker -Value 'committed' -Force
-    } catch {}
-    $handoffMarker = Join-Path $backupDir '.handing_off'
-    if (Test-Path -LiteralPath $handoffMarker) {
-        Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+        $commitSuccess = (Test-Path -LiteralPath $committedMarker)
+    } catch {
+        $commitSuccess = $false
     }
-    if (Test-Path -LiteralPath $backupDir) {
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($commitSuccess) {
+        $handoffMarker = Join-Path $backupDir '.handing_off'
+        if (Test-Path -LiteralPath $handoffMarker) {
+            Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } else {
+        Add-Content -LiteralPath $logFile -Value "[$logTime] [WARN] [RESTART] 寫入提交標記失敗；保留備份目錄以供手動清理或後續救援安全處理。"
     }
 } else {
     $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -3832,7 +3840,7 @@ if ($startupSuccess) {
                 if ($originalItems -notcontains $m) {
                     $p = Join-Path $installDir $m
                     if (Test-Path -LiteralPath $p) {
-                        Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
                     }
                 }
             }
@@ -3841,13 +3849,13 @@ if ($startupSuccess) {
                 $dst = Join-Path $installDir $rel
                 if (Test-Path -LiteralPath $src) {
                     if (Test-Path -LiteralPath $dst) {
-                        Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction Stop
                     }
                     $parent = Split-Path -Parent $dst
                     if ($parent -and -not (Test-Path -LiteralPath $parent)) {
                         New-Item -ItemType Directory -Force -Path $parent | Out-Null
                     }
-                    Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
+                    Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse -ErrorAction Stop
                 }
             }
 
@@ -3883,10 +3891,16 @@ if ($startupSuccess) {
             if ($restoredHealthy) {
                 Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 原版服務已確認健康就緒 (PID: $($restoredProc.Id))，標記提交並清理更新備份目錄..."
                 $committedMarker = Join-Path $backupDir '.committed'
+                $commitSuccess = $false
                 try {
                     Set-Content -LiteralPath $committedMarker -Value 'committed' -Force
-                } catch {}
-                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+                    $commitSuccess = (Test-Path -LiteralPath $committedMarker)
+                } catch {
+                    $commitSuccess = $false
+                }
+                if ($commitSuccess) {
+                    Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+                }
             } else {
                 $failedMarker = Join-Path $backupDir '.rollback_failed'
                 Set-Content -LiteralPath $failedMarker -Value "restored service failed to become healthy" -Force -ErrorAction SilentlyContinue

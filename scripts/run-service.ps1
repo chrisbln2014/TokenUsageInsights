@@ -289,7 +289,7 @@ function Restore-ServiceBackup {
             if ($originalItems -notcontains $m) {
                 $p = Join-Path $InstallDir $m
                 if (Test-Path -LiteralPath $p) {
-                    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
                 }
             }
         }
@@ -300,13 +300,13 @@ function Restore-ServiceBackup {
             $dst = Join-Path $InstallDir $rel
             if (Test-Path -LiteralPath $src) {
                 if (Test-Path -LiteralPath $dst) {
-                    Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction Stop
                 }
                 $parent = Split-Path -Parent $dst
                 if ($parent -and -not (Test-Path -LiteralPath $parent)) {
                     New-Item -ItemType Directory -Force -Path $parent | Out-Null
                 }
-                Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
+                Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse -ErrorAction Stop
             }
         }
         Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -469,14 +469,22 @@ while ($true) {
         if ($isHealthy) {
             Write-Host "新版服務進程已確認健康就緒，標記更新提交並清理備份目錄..."
             $committedMarker = Join-Path $backupDir ".committed"
+            $commitSuccess = $false
             try {
                 Set-Content -LiteralPath $committedMarker -Value "committed" -Force
-            } catch {}
-            $handoffMarker = Join-Path $backupDir ".handing_off"
-            if (Test-Path -LiteralPath $handoffMarker) {
-                Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+                $commitSuccess = (Test-Path -LiteralPath $committedMarker)
+            } catch {
+                $commitSuccess = $false
             }
-            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($commitSuccess) {
+                $handoffMarker = Join-Path $backupDir ".handing_off"
+                if (Test-Path -LiteralPath $handoffMarker) {
+                    Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+                }
+                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                Write-Warning "標記更新提交失敗；保留備份目錄以供手動清理或後續救援處理。"
+            }
         } else {
             Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."
             if ($Process -and -not $Process.HasExited) {

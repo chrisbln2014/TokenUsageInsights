@@ -3831,6 +3831,16 @@ fn configure_windows_runner_command(
         .stderr(std::process::Stdio::null());
 }
 
+/// 環境變數名稱僅允許 `[A-Za-z_][A-Za-z0-9_]*`：避免任何字元被插值進 PowerShell 腳本而改變其行為
+fn is_safe_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 #[allow(dead_code)] // 於 Windows 移交重啟流程使用，並於跨平台單元測試驗證腳本產生與命令列跳脫
 fn build_windows_deferred_restart_script(
     updater_pid: u32,
@@ -3907,8 +3917,12 @@ fn build_windows_deferred_restart_script(
             key
         ));
     }
-    // 再套用先前進程保留之完整環境變數
+    // 再套用先前進程保留之完整環境變數：
+    // 僅允許白名單中的變數名稱（並再次檢查名稱格式），避免非預期鍵名被插值進 PowerShell 而改寫產生之腳本
     for (k, v) in envs {
+        if !RELEVANT_ENV_VARS.contains(&k.as_str()) || !is_safe_env_var_name(k) {
+            continue;
+        }
         ps_script.push_str(&format!("$env:{} = '{}';\n", k, v.replace('\'', "''")));
     }
 
@@ -8112,6 +8126,63 @@ update_check_interval: 5 # check every 5 days
         assert!(validate_download_url("http://localhost:3000/archive.zip").is_ok());
         assert!(validate_download_url("not a url").is_err());
         assert!(validate_download_url("ftp://example.com/file.zip").is_err());
+    }
+
+    #[test]
+    fn is_safe_env_var_name_accepts_only_portable_names() {
+        assert!(is_safe_env_var_name("PORT"));
+        assert!(is_safe_env_var_name("_INTERNAL"));
+        assert!(is_safe_env_var_name("TOKEN_USAGE_INSIGHTS_SERVICE"));
+
+        assert!(!is_safe_env_var_name(""));
+        assert!(!is_safe_env_var_name("1PORT"));
+        assert!(!is_safe_env_var_name("BAD-KEY"));
+        assert!(!is_safe_env_var_name("BAD KEY"));
+        assert!(!is_safe_env_var_name("PORT;Remove-Item"));
+        assert!(!is_safe_env_var_name("PORT'"));
+    }
+
+    #[test]
+    fn deferred_restart_script_ignores_unlisted_environment_variables() {
+        let spec = StoppedProcessSpec {
+            pid: 999,
+            is_supervised: false,
+            supervisor_pid: None,
+            is_server: true,
+            exe_path: PathBuf::from("C:\\test\\bin\\token-usage-insights.exe"),
+            args: Some(vec!["token-usage-insights.exe".to_string()]),
+            envs: vec![
+                ("PORT".to_string(), "3003".to_string()),
+                (
+                    "EVIL;Remove-Item -Recurse -Force C:\\".to_string(),
+                    "x".to_string(),
+                ),
+                ("NOT_LISTED".to_string(), "y".to_string()),
+            ],
+            cwd: Some(PathBuf::from("C:\\test")),
+        };
+
+        let script = build_windows_deferred_restart_script(
+            4242,
+            &PathBuf::from("C:\\test\\install"),
+            &PathBuf::from("C:\\test\\install\\token-usage-insights.exe"),
+            "0.9.6",
+            Some(&spec),
+        )
+        .expect("腳本產生應成功");
+
+        assert!(
+            script.contains("$env:PORT = '3003';"),
+            "白名單內的環境變數應被寫入腳本"
+        );
+        assert!(
+            !script.contains("EVIL"),
+            "未列入白名單的環境變數名稱不得被插值進 PowerShell 腳本: {script}"
+        );
+        assert!(
+            !script.contains("NOT_LISTED"),
+            "僅白名單內的環境變數可被套用，避免任意鍵名改寫產生之腳本"
+        );
     }
 
     #[test]

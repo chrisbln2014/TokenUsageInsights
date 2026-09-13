@@ -1090,6 +1090,7 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True $restartPendingSegment.Success "run-service.ps1 should handle the pending restart marker inside the wait loop."
     Assert-True (-not ($restartPendingSegment.Value -match 'Stop-Process')) "run-service.ps1 must not force-terminate the dashboard when an update is pending."
     Assert-True ($restartPendingSegment.Value -match 'Stop-ServiceProcessGracefully') "run-service.ps1 must coordinate a graceful stop when an update is pending."
+    Assert-True ($whileBodyText -match '(?s)ExitCode -eq 75.*保留更新備份') "run-service.ps1 must not roll back a dashboard that exited with code 75 after an in-place update."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)\.committed.*保留目前版本') "Restore-ServiceBackup must not roll back an already committed backup."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.sh"') "Restore-ServiceBackup managedItems must contain install.sh."

@@ -255,6 +255,9 @@ async fn main() {
         tokio::sync::mpsc::channel::<updater::ShutdownReason>(1);
     let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
 
+    // 記錄終止訊號是否已抵達：自動更新路徑需要據此讓訊號優先於更新請求
+    let signal_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // 啟動背景非阻塞自動更新檢查（若非標準安裝或檢查間隔未滿將自動略過）
     updater::spawn_background_auto_update(shutdown_reason_tx.clone());
 
@@ -264,6 +267,7 @@ async fn main() {
         updater::detect_environment()
     {
         let stop_watch_tx = shutdown_reason_tx.clone();
+        let stop_watch_signal = signal_received.clone();
         tokio::spawn(async move {
             let stop_request = install_dir.join(".service_stop_requested");
             loop {
@@ -276,6 +280,8 @@ async fn main() {
                         "SHUTDOWN",
                         "收到服務 runner 之優雅停機要求 (.service_stop_requested)",
                     );
+                    // 與終止訊號共用同一旗標：自動更新路徑據此讓停機要求優先於更新請求
+                    stop_watch_signal.store(true, std::sync::atomic::Ordering::SeqCst);
                     let _ = stop_watch_tx.send(updater::ShutdownReason::Signal).await;
                     return;
                 }
@@ -284,8 +290,6 @@ async fn main() {
     }
 
     let signal_tx = shutdown_reason_tx.clone();
-    // 記錄終止訊號是否已抵達：自動更新路徑需要據此讓訊號優先於更新請求
-    let signal_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signal_received_watcher = signal_received.clone();
     tokio::spawn(async move {
         shutdown_signal(signal_tx, signal_received_watcher).await;

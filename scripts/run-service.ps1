@@ -732,6 +732,10 @@ while ($true) {
                     $commitLock.Dispose()
                 }
             }
+        } elseif ($Process.HasExited -and ($Process.ExitCode -eq 75)) {
+            # 退出碼 75 表示看板已完成就地更新並要求 runner 重啟：不得視為啟動失敗而回滾，
+            # 交由下方的退出碼 75 分支等待新版執行檔就緒後重新啟動
+            Write-Host "看板已回報就地更新完成（退出碼 75）；保留更新備份並等待新版執行檔就緒。"
         } else {
             Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."
             if ($Process -and -not $Process.HasExited) {

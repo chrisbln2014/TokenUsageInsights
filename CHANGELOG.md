@@ -4,16 +4,38 @@
 
 ## [未發行]
 
+## [0.9.6] - 2026-09-14
+
 ### 新增與改善
 
-- 新增原地自動更新功能：`update`／`--update` CLI 子命令可檢查並安裝最新版本，看板啟動後亦會依設定的間隔自動檢查更新；更新流程以 `.backup` 備份交易搭配 `.update.lock` 更新鎖執行，並在檔案替換前完成下載與 SHA256 校驗。
-- 新增雙平台重啟移交協定：更新完成後由新版看板（Unix 由 systemd／launchd 監管重啟，Windows 由 `run-service.ps1` 或延遲重啟守護進程接手）完成健康確認，健康就緒即標記 `.committed` 並清理備份，啟動失敗則自備份自動回滾至先前版本；服務 runner 於健康驗證通過後才提交更新，並以 `.service_stop_requested` 要求看板優雅停機。
+- 新增原地自動更新功能：`update`／`--update`／`-u` CLI 子命令可檢查並安裝最新版本，支援 `--check`（僅檢查不下載）、`--force`（強制重新下載覆蓋）與 `--target-version <TAG>`（指定版本）等參數；看板啟動後亦會依設定的間隔自動檢查更新，更新流程以 `.backup` 備份交易搭配 `.update.lock` 更新鎖執行，並在檔案替換前完成下載與 SHA256 校驗（比對 Release 的 `SHA256SUMS`）。
+- 新增 `config.yaml` 設定檔與環境變數支援：可於資料目錄（預設 `~/.token-usage-insights/config.yaml`，Windows 為 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`）設定 `auto_update` 與 `update_check_interval`（天），並新增 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`（預設 `true`）、`TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS`（預設 `24`，有效範圍 1 至 87600）與 `TOKEN_USAGE_INSIGHTS_INSTALL_DIR`（自訂安裝目錄）環境變數；設定優先順序為命令列旗標（如 `--no-auto-update`）> 環境變數 > `config.yaml` > 預設值。
+- 新增雙平台重啟移交協定：更新完成後由新版看板（Unix 由 systemd／launchd 監管重啟，Windows 由 `run-service.ps1` 或延遲重啟守護進程接手）完成健康確認，健康就緒即標記 `.committed` 並清理備份，啟動失敗則自備份自動回滾至先前版本；服務 runner 於健康驗證通過後才提交更新，並以 `.service_stop_requested` 要求看板優雅停機，Windows 服務管理器可依退出碼 75 接手重啟新版程序。
 - 更新流程支援終止訊號取消（下載與校驗期間收到 SIGTERM／CTRL+C 即中止且不變更任何檔案），並於停機時等待背景日誌同步（含 SQLite 寫入）完成後才結束程序。
+- 五種語言 README（正體中文、英文、日文、韓文、簡體中文）同步補齊自動更新子命令、`config.yaml` 設定檔、環境變數與 `--no-auto-update` 旗標說明。
 
 ### 修正
 
 - 修復 Codex 工作階段耗時永遠顯示為「-」的問題（[#43](https://github.com/doggy8088/TokenUsageInsights/issues/43)、[#48](https://github.com/doggy8088/TokenUsageInsights/pull/48)）。解析 Codex transcript 中的 `event_msg/task_complete` 事件並累加已完成 task 的 `payload.duration_ms`，寫入資料庫的 `duration_ms` 欄位；更新 parser migration marker 至 `migration:codex_session_identity_v7`，觸發既有 Codex transcript 重新同步以補齊耗時資訊。
 - 補充 DeepSeek V4.1-Flash（`deepseek-v4.1-flash`）定價規則，依 DeepSeek API 官方尖峰費率設定輸入 0.30、快取輸入 0.006、輸出 1.20 美元／每百萬 Token，修復該模型工作階段無法估算成本的問題。
+- 修正更新流程多項韌性問題：非同步移交與延遲重啟的備份提交時機、已提交備份不再被誤回滾、服務重啟與停機的訊號協商、Windows 服務重裝時的設定與捷徑繼承，以及資料庫初始化異常時終止啟動並回滾。
+
+### 安全性
+
+- 更新下載於正式建置強制使用 HTTPS（僅測試環境允許 loopback HTTP），解壓與檔案替換前會拒絕符號連結、驗證備份清單完整性並阻擋解壓路徑穿越，避免惡意壓縮檔覆寫安裝目錄以外的檔案。
+- 更新鎖改用作業系統檔案顧問鎖並搭配有界重試與 TOCTOU 防護，更新與回滾會獨占更新鎖；備份提交前須先通過健康驗證，回滾失敗將停止重啟並回報錯誤，避免留下無法啟動的安裝。
+- Windows 服務更新改以 `safe_write_file` 寫入 PID 標記、以 Win32 原生 API 驗證行程歸屬，並限制只有標記持有者能移除標記；`update` 子命令在開發／原始碼目錄執行時會以退出碼 2 拒絕原地更新。
+
+### 資料影響
+
+- 資料庫新增 `system_metadata` 資料表（`key`／`value`／`updated_at`），用於保存最後一次更新檢查時間等系統狀態，升級後首次啟動即自動建立，不影響既有資料表。
+- Codex 解析器遷移版本提升至 `migration:codex_session_identity_v7`，既有資料庫升級後會清除舊版同步游標並重新解析 Codex transcript，以補齊工作階段耗時。
+
+### 相容性
+
+- 自動更新預設啟用；若需維持舊行為，可設定 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`、於 `config.yaml` 設定 `auto_update: false`，或啟動時加上 `--no-auto-update`。
+- 原地更新僅支援已安裝環境（含 npx 安裝與 `install.sh`／`install.ps1` 安裝）；在開發或原始碼目錄執行 `update` 會受安全防護拒絕，僅 `update --check` 可正常查詢版本。
+- 其餘 CLI 子命令、看板 HTTP API、資料來源目錄與既有環境變數皆維持相容，未安裝的使用者可續用 `cargo run` 或 npx 啟動。
 
 ## [0.9.5] - 2026-09-11
 
@@ -601,7 +623,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.2...v0.9.3

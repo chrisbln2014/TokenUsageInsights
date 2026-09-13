@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Background service runner for Token 戰情室 on Windows.
 #>

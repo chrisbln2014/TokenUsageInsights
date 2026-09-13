@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   One-line bootstrap installer for Token 戰情室 (Windows).
 

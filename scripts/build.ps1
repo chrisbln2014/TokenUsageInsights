@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Build Token 戰情室 release executables on Windows.
 

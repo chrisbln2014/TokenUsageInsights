@@ -5752,11 +5752,14 @@ pub async fn perform_startup_recovery() {
     }
 }
 
+/// 是否存在尚未提交的更新移交交易（`.backup/.handing_off`），
+/// 代表目前啟動的是尚未確認健康並提交的新版，備份目錄即其唯一的回滾來源
+pub(crate) fn has_pending_handoff_transaction(install_dir: &Path) -> bool {
+    install_dir.join(".backup").join(".handing_off").exists()
+}
+
 pub fn complete_handoff_and_commit_if_needed(install_dir: &Path) {
     let backup_dir = install_dir.join(".backup");
-    if !backup_dir.exists() {
-        return;
-    }
     let handoff_marker = backup_dir.join(".handing_off");
     if !handoff_marker.exists() {
         return;
@@ -5781,7 +5784,18 @@ pub fn complete_handoff_and_commit_if_needed(install_dir: &Path) {
         "STARTUP",
         "新版看板服務已確認啟動健康就緒，完成移交握手並提交更新",
     );
-    let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
+    if let Err(e) = safe_write_file(&backup_dir.join(".committed"), b"committed") {
+        // 無法耐久記錄提交狀態時絕不可清理備份：否則新版日後啟動失敗將失去唯一的回滾來源
+        eprintln!("⚠️ 寫入提交確認標記失敗: {e}；已保留更新備份與移交標記，未完成提交。");
+        log_update(
+            "ERROR",
+            "STARTUP",
+            &format!(
+                "寫入提交確認標記失敗 ({e})；保留移交標記與備份目錄 {backup_dir:?}，不執行提交清理"
+            ),
+        );
+        return;
+    }
     let _ = fs::remove_file(&handoff_marker);
     let _ = fs::remove_file(backup_dir.join(".startup_attempt"));
     if let Err(e) = fs::remove_dir_all(&backup_dir) {
@@ -8043,6 +8057,74 @@ update_check_interval: 5 # check every 5 days
         drop(lock);
         complete_handoff_and_commit_if_needed(&install_dir);
         assert!(!backup_dir.exists(), "釋放鎖後應可完成提交並清理備份");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complete_handoff_and_commit_preserves_backup_when_marker_write_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root 身分下目錄權限限制不生效，無法重現寫入失敗情境
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "test-handoff-commit-fail-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join(".handing_off"), Utc::now().to_rfc3339()).unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o555)).unwrap();
+        complete_handoff_and_commit_if_needed(&install_dir);
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            backup_dir.join(".handing_off").exists(),
+            "提交標記寫入失敗時必須保留移交標記"
+        );
+        assert!(
+            backup_dir.exists(),
+            "提交標記寫入失敗時必須保留備份目錄（唯一回滾來源）"
+        );
+        assert!(
+            !backup_dir.join(".committed").exists(),
+            "不得在標記寫入失敗時留下不完整的提交狀態"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn has_pending_handoff_transaction_detects_handoff_marker() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-pending-handoff-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        assert!(
+            !has_pending_handoff_transaction(&install_dir),
+            "未含移交標記時不應視為待提交交易"
+        );
+        assert!(
+            !has_pending_handoff_transaction(&temp.join("missing-install")),
+            "安裝目錄不存在時不得誤判為待提交交易"
+        );
+
+        fs::write(backup_dir.join(".handing_off"), Utc::now().to_rfc3339()).unwrap();
+        assert!(
+            has_pending_handoff_transaction(&install_dir),
+            "含 .handing_off 時應視為待提交交易"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }

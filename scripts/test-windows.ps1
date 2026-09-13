@@ -889,9 +889,14 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
 
     Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.sh"') "Restore-ServiceBackup managedItems must contain install.sh."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.ps1"') "Restore-ServiceBackup managedItems must contain install.ps1."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '"\.install_marker"') "Restore-ServiceBackup managedItems must contain .install_marker."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '"\.service\.env"') "Restore-ServiceBackup managedItems must contain .service.env."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Remove-Item.*-LiteralPath \$dst.*Copy-Item') "Restore-ServiceBackup must remove destination items before copying to prevent mixed files."
 
     Assert-True ($whileBodyText -match '(?s)Start-Process.*Test-IsProcessHealthy.*Restore-ServiceBackup') "run-service.ps1 main while loop must verify process health before committing backup and restore on failure."
+    Assert-True ($whileBodyText -match '(?s)Test-IsProcessHealthy.*\.committed.*Remove-Item') "run-service.ps1 must mark .committed before removing .backup."
     Assert-True (-not ($fnDefReady[0].Extent.Text -match 'Remove-Item.*\.backup')) "Wait-ForExecutableReady must not delete .backup before process launch."
 
     Write-Host "Windows collector smoke tests passed."

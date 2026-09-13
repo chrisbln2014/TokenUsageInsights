@@ -3805,7 +3805,15 @@ if ($versionMatched) {
 
 if ($startupSuccess) {
     $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 新版看板進程已確認健康就緒 (PID: $($childProc.Id))，清理更新備份目錄..."
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 新版看板進程已確認健康就緒 (PID: $($childProc.Id))，標記更新提交並清理備份目錄..."
+    $committedMarker = Join-Path $backupDir '.committed'
+    try {
+        Set-Content -LiteralPath $committedMarker -Value 'committed' -Force
+    } catch {}
+    $handoffMarker = Join-Path $backupDir '.handing_off'
+    if (Test-Path -LiteralPath $handoffMarker) {
+        Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+    }
     if (Test-Path -LiteralPath $backupDir) {
         Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -3819,7 +3827,7 @@ if ($startupSuccess) {
     if (Test-Path -LiteralPath $manifestPath) {
         try {
             $originalItems = @(Get-Content -LiteralPath $manifestPath | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'VERSION', 'LICENSE', 'README.md', 'scripts', 'shell')
+            $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'shell', 'scripts', 'install.sh', 'install.ps1', 'VERSION', 'README.md', 'LICENSE', '.install_marker', '.service.env')
             foreach ($m in $managedItems) {
                 if ($originalItems -notcontains $m) {
                     $p = Join-Path $installDir $m
@@ -3842,16 +3850,55 @@ if ($startupSuccess) {
                     Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
                 }
             }
-            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-            Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份回滾至先前版本，正在重新啟動原版服務..."
-            if ($argList.Count -gt 0) {
-                Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden
+
+            Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份還原檔案，正在重新啟動原版服務..."
+            $restoredProc = if ($argList.Count -gt 0) {
+                Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
             } else {
-                Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden
+                Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
+            }
+
+            $restoredHealthy = $false
+            if ($restoredProc) {
+                $pidFile = Join-Path $installDir '.server.pid'
+                $rWait = 0
+                while ($rWait -lt 50) {
+                    if ($restoredProc.HasExited) {
+                        break
+                    }
+                    if (Test-Path -LiteralPath $pidFile) {
+                        try {
+                            $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+                            if ($pidContent -eq "$($restoredProc.Id)" -and -not $restoredProc.HasExited) {
+                                $restoredHealthy = $true
+                                break
+                            }
+                        } catch {}
+                    }
+                    Start-Sleep -Milliseconds 100
+                    $rWait++
+                }
+            }
+
+            if ($restoredHealthy) {
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 原版服務已確認健康就緒 (PID: $($restoredProc.Id))，標記提交並清理更新備份目錄..."
+                $committedMarker = Join-Path $backupDir '.committed'
+                try {
+                    Set-Content -LiteralPath $committedMarker -Value 'committed' -Force
+                } catch {}
+                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            } else {
+                $failedMarker = Join-Path $backupDir '.rollback_failed'
+                Set-Content -LiteralPath $failedMarker -Value "restored service failed to become healthy" -Force -ErrorAction SilentlyContinue
+                $directMarker = Join-Path $installDir '.rollback_failed'
+                Set-Content -LiteralPath $directMarker -Value "restored service failed to become healthy" -Force -ErrorAction SilentlyContinue
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 原版服務啟動後未就緒；保留備份與失敗標記供手動修復。"
             }
         } catch {
             $failedMarker = Join-Path $backupDir '.rollback_failed'
-            Set-Content -LiteralPath $failedMarker -Value "deferred restart rollback failed: $_"
+            Set-Content -LiteralPath $failedMarker -Value "deferred restart rollback failed: $_" -Force -ErrorAction SilentlyContinue
+            $directMarker = Join-Path $installDir '.rollback_failed'
+            Set-Content -LiteralPath $directMarker -Value "deferred restart rollback failed: $_" -Force -ErrorAction SilentlyContinue
             Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 回滾失敗: $_；保留備份供手動修復。"
         }
     }
@@ -5171,6 +5218,7 @@ pub fn spawn_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<Shutd
 
 async fn run_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>) {
     if std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_some() {
+        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
         return;
     }
 
@@ -6990,7 +7038,7 @@ update_check_interval: 5 # check every 5 days
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         run_background_auto_update(tx).await;
         assert!(rx.try_recv().is_err());
-        std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
+        assert!(std::env::var_os("_TOKEN_USAGE_INSIGHTS_RESTARTED").is_none());
     }
 
     #[tokio::test]

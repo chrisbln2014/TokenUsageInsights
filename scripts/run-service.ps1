@@ -268,7 +268,21 @@ function Restore-ServiceBackup {
 
     try {
         $originalItems = @(Get-Content -LiteralPath $manifest | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        $managedItems = @("token-usage-insights", "token-usage-insights.exe", "static", "pricing.csv", "VERSION", "LICENSE", "README.md", "scripts", "shell")
+        $managedItems = @(
+            "token-usage-insights",
+            "token-usage-insights.exe",
+            "static",
+            "pricing.csv",
+            "shell",
+            "scripts",
+            "install.sh",
+            "install.ps1",
+            "VERSION",
+            "README.md",
+            "LICENSE",
+            ".install_marker",
+            ".service.env"
+        )
 
         # 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
         foreach ($m in $managedItems) {
@@ -299,7 +313,9 @@ function Restore-ServiceBackup {
         return $true
     } catch {
         $marker = Join-Path $backupDir ".rollback_failed"
-        Set-Content -LiteralPath $marker -Value "run-service rollback failed: $_"
+        Set-Content -LiteralPath $marker -Value "run-service rollback failed: $_" -Force -ErrorAction SilentlyContinue
+        $directMarker = Join-Path $InstallDir ".rollback_failed"
+        Set-Content -LiteralPath $directMarker -Value "run-service rollback failed: $_" -Force -ErrorAction SilentlyContinue
         return $false
     }
 }
@@ -451,7 +467,15 @@ while ($true) {
     if (Test-Path -LiteralPath $backupDir) {
         $isHealthy = Test-IsProcessHealthy -Process $Process -InstallDir $InstallDir -TimeoutSeconds 5
         if ($isHealthy) {
-            Write-Host "新版服務進程已確認健康就緒，清理更新備份目錄..."
+            Write-Host "新版服務進程已確認健康就緒，標記更新提交並清理備份目錄..."
+            $committedMarker = Join-Path $backupDir ".committed"
+            try {
+                Set-Content -LiteralPath $committedMarker -Value "committed" -Force
+            } catch {}
+            $handoffMarker = Join-Path $backupDir ".handing_off"
+            if (Test-Path -LiteralPath $handoffMarker) {
+                Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+            }
             Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
         } else {
             Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."

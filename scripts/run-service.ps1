@@ -350,6 +350,13 @@ function Restore-ServiceBackup {
             }
         }
 
+        # 清單必須包含平台執行檔與靜態資源，否則截斷或遭竄改的清單會在移除執行檔後無法還原
+        foreach ($required in @("token-usage-insights.exe", "static")) {
+            if ($originalItems -notcontains $required) {
+                throw "備份清單缺少必要項目 ($required)，拒絕還原以避免安裝目錄失去執行檔或基礎資源。"
+            }
+        }
+
         # 驗證清單項目皆確實存在於備份目錄，避免截斷或遭竄改的備份被誤判為還原成功而留下混合版本
         foreach ($rel in $originalItems) {
             $relSrcPath = Join-Path $backupDir $rel

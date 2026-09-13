@@ -864,7 +864,9 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     New-Item -ItemType Directory -Force -Path $rollbackBackupDir | Out-Null
     Set-Content -LiteralPath (Join-Path $rollbackInstallDir "VERSION") -Value "v0.9.6-broken"
     Set-Content -LiteralPath (Join-Path $rollbackBackupDir "VERSION") -Value "v0.9.5"
-    Set-Content -LiteralPath (Join-Path $rollbackBackupDir ".manifest") -Value "VERSION"
+    Set-Content -LiteralPath (Join-Path $rollbackBackupDir "token-usage-insights.exe") -Value "old binary"
+    New-Item -ItemType Directory -Force -Path (Join-Path $rollbackBackupDir "static") | Out-Null
+    Set-Content -LiteralPath (Join-Path $rollbackBackupDir ".manifest") -Value "token-usage-insights.exe`nstatic`nVERSION"
 
     $rollbackTestScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
@@ -882,7 +884,9 @@ Exit-WithRollback -InstallDir '$rollbackInstallDir' -Message 'startup validation
     New-Item -ItemType Directory -Force -Path $lockedBackupDir | Out-Null
     Set-Content -LiteralPath (Join-Path $lockedInstallDir "VERSION") -Value "v0.9.6-broken"
     Set-Content -LiteralPath (Join-Path $lockedBackupDir "VERSION") -Value "v0.9.5"
-    Set-Content -LiteralPath (Join-Path $lockedBackupDir ".manifest") -Value "VERSION"
+    Set-Content -LiteralPath (Join-Path $lockedBackupDir "token-usage-insights.exe") -Value "old binary"
+    New-Item -ItemType Directory -Force -Path (Join-Path $lockedBackupDir "static") | Out-Null
+    Set-Content -LiteralPath (Join-Path $lockedBackupDir ".manifest") -Value "token-usage-insights.exe`nstatic`nVERSION"
 
     $lockedTestScript = @"
 `$ErrorActionPreference = 'SilentlyContinue'
@@ -934,6 +938,27 @@ if (Restore-ServiceBackup -InstallDir '$truncatedInstallDir') { exit 2 } else { 
     Assert-Equal 0 $truncatedExit "Restore-ServiceBackup should fail closed when a manifest entry is missing from the backup."
     Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not partially restore a truncated backup."
     Assert-Equal "new pricing" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Raw).Trim()) "Restore-ServiceBackup must not touch the install directory when the backup is truncated."
+
+    # 5c-2. Restore-ServiceBackup 必須拒絕缺少基準項目（執行檔／static）的截斷清單
+    $baselineRoot = Join-Path $Root "manifest-baseline-tests"
+    $baselineInstallDir = Join-Path $baselineRoot "install"
+    $baselineBackupDir = Join-Path $baselineInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $baselineBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $baselineInstallDir "token-usage-insights.exe") -Value "new binary"
+    New-Item -ItemType Directory -Force -Path (Join-Path $baselineInstallDir "static") | Out-Null
+    Set-Content -LiteralPath (Join-Path $baselineInstallDir "VERSION") -Value "v0.9.6"
+    Set-Content -LiteralPath (Join-Path $baselineBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $baselineBackupDir ".manifest") -Value "VERSION"
+
+    $baselineTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+if (Restore-ServiceBackup -InstallDir '$baselineInstallDir') { exit 2 } else { exit 0 }
+"@
+    $baselineExit = Invoke-ScopedScript -ScriptText $baselineTestScript -Name "manifest-baseline"
+    Assert-Equal 0 $baselineExit "Restore-ServiceBackup should fail closed when the manifest lacks the required baseline."
+    Assert-True (Test-Path -LiteralPath (Join-Path $baselineInstallDir "token-usage-insights.exe")) "Restore-ServiceBackup must not remove the installed executable for an incomplete manifest."
+    Assert-True (Test-Path -LiteralPath (Join-Path $baselineInstallDir "static")) "Restore-ServiceBackup must not remove static assets for an incomplete manifest."
 
     # 5d. Restore-ServiceBackup 必須拒絕符號連結或重剖析點的備份根目錄
     $linkedRoot = Join-Path $Root "backup-root-link-tests"
@@ -1042,6 +1067,7 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)PSIsContainer.*ReparsePoint') "Restore-ServiceBackup must validate that the backup root is a regular directory before reading the manifest."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)不存在於備份目錄.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must fail closed on truncated backups before touching the install directory."
     Assert-True ($fnDefRestore[0].Extent.Text -match 'ReparsePoint') "Restore-ServiceBackup must reject symlinked manifest entries."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)token-usage-insights\.exe.*static.*缺少必要項目') "Restore-ServiceBackup must require the platform executable and static assets in the manifest."
     $readyText = $fnDefReady[0].Extent.Text
     Assert-Equal 4 ([regex]::Matches($readyText, 'Exit-WithRollback -InstallDir').Count) "Wait-ForExecutableReady must roll back the backup before every post-lock startup validation failure."
     Assert-Equal 2 ([regex]::Matches($readyText, 'Exit-WithError -Message').Count) "Wait-ForExecutableReady must only exit without rollback for the rollback-failed check and the update lock wait timeout."

@@ -139,20 +139,20 @@ if [[ "$install_service" == true ]]; then
       # 若未於環境變數明確指定更新設定，自動繼承既有 systemd 服務單元之設定
       if [[ -f "$service_file" ]]; then
         if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
-          existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=(([^"\\]|\\.)*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$existing_auto_update" ]]; then
             TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$(systemd_unescape_value "$existing_auto_update")"
           fi
         fi
         if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
-          existing_interval="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          existing_interval="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=(([^"\\]|\\.)*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$existing_interval" ]]; then
             TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$(systemd_unescape_value "$existing_interval")"
           fi
         fi
         for var in "${runtime_vars[@]}"; do
           if [[ -z "${!var+x}" ]]; then
-            existing_val="$(sed -n -E "s/^[[:space:]]*Environment=\"?${var}=([^\"]*)\"?\$/\\1/p" "$service_file" | tail -n 1)"
+            existing_val="$(sed -n -E "s/^[[:space:]]*Environment=\"?${var}=(([^\"\\\\]|\\\\.)*)\"?\$/\\1/p" "$service_file" | tail -n 1)"
             if [[ -n "$existing_val" ]]; then
               existing_unescaped="$(systemd_unescape_value "$existing_val")"
               printf -v "$var" '%s' "$existing_unescaped"
@@ -160,7 +160,7 @@ if [[ "$install_service" == true ]]; then
           fi
         done
         if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
-          legacy_cors="$(sed -n -E 's/^[[:space:]]*Environment="?CORS_ALLOW_ORIGIN=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
+          legacy_cors="$(sed -n -E 's/^[[:space:]]*Environment="?CORS_ALLOW_ORIGIN=(([^"\\]|\\.)*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$legacy_cors" ]]; then
             CORS_ALLOWED_ORIGINS="$(systemd_unescape_value "$legacy_cors")"
           fi

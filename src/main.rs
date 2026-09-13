@@ -356,12 +356,16 @@ async fn main() {
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     let usage_sync_task = spawn_usage_sync_task();
     let pid_guard = updater::create_server_pid_guard();
+    // 移交提交閘門：進入更新流程前必須關閉，避免本世代（舊版）的延遲任務在更新期間誤提交並刪除唯一的回滾備份
+    let handoff_commit_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
         updater::detect_environment()
     {
         // Windows 服務 runner 監管模式下，更新提交與備份清理由 runner 於新版進程確認健康就緒後執行；
         // 此處提早提交會刪除備份而使 runner 失去回滾依據，無法在服務後續啟動失敗時還原舊版
-        if updater::is_windows_service_runner() {
+        // 僅 Windows 服務 runner 監管模式才由 runner 提交；Unix 即使在環境變數設定下也不可略過提交，
+        // 否則 .backup/.handing_off 會永久殘留，下次啟動將誤判為未完成的更新交易
+        if cfg!(windows) && updater::is_windows_service_runner() {
             updater::log_update(
                 "INFO",
                 "STARTUP",
@@ -371,8 +375,17 @@ async fn main() {
             // 移交提交會刪除唯一的回滾備份，因此延後到服務確實開始提供後才執行：
             // 若 axum::serve 立即失敗或程序在就緒前退出，本任務會隨程序結束而不會誤提交
             let commit_install_dir = install_dir.clone();
+            let commit_gate = handoff_commit_allowed.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(HANDOFF_COMMIT_DELAY).await;
+                if !commit_gate.load(std::sync::atomic::Ordering::SeqCst) {
+                    updater::log_update(
+                        "INFO",
+                        "STARTUP",
+                        "更新流程已開始；略過本世代之移交提交，改由新版程序於健康就緒後提交",
+                    );
+                    return;
+                }
                 updater::complete_handoff_and_commit_if_needed(&commit_install_dir);
             });
         }
@@ -430,6 +443,11 @@ async fn main() {
 
             println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
             updater::log_update("INFO", "RESTART", "服務已優雅停機，開始執行自動更新");
+
+            // 進入更新流程前關閉本世代的移交提交閘門：更新完成後由新版程序自行提交，
+            // 避免舊世代的延遲任務在更新期間刪除唯一的回滾備份
+            handoff_commit_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
+
             match updater::run_update(opts).await {
                 Ok(_outcome) => {
                     let installed = install_dir

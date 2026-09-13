@@ -2227,6 +2227,17 @@ fn is_stale_temp_artifact(name: &str) -> bool {
     MANAGED_ITEMS.contains(&prefix) || BACKUP_MARKER_FILES.contains(&prefix)
 }
 
+/// 備份清單必須包含的最低限度項目：平台執行檔與靜態資源。
+/// 缺少這些項目代表清單遭截斷或竄改，還原時第一階段會移除安裝目錄的執行檔而無法復原
+fn required_install_baseline() -> Vec<&'static str> {
+    let exec_name = if cfg!(windows) {
+        "token-usage-insights.exe"
+    } else {
+        APP_NAME
+    };
+    vec![exec_name, "static"]
+}
+
 /// 寫入更新移交標記（`.backup/.handing_off`）。
 ///
 /// 必須在釋放更新鎖與任何重啟動作之前完成：被重啟的新版看板若看到仍含 `.manifest` 卻無移交標記的備份，
@@ -2365,6 +2376,16 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         if !MANAGED_ITEMS.contains(&item.as_str()) {
             return Err(format!(
                 "備份清單包含非受管理項目 ({item})，拒絕還原以防範路徑穿越攻擊"
+            ));
+        }
+    }
+
+    // 驗證清單包含必要基準項目（平台執行檔與靜態資源）：
+    // 僅含 VERSION 或空白的截斷清單會通過白名單檢查，卻讓第一階段刪除執行檔與受管理資源後無法還原
+    for required in required_install_baseline() {
+        if !original_items.contains(required) {
+            return Err(format!(
+                "備份清單缺少必要項目 ({required})，拒絕還原以避免安裝目錄失去執行檔或基礎資源"
             ));
         }
     }
@@ -3970,7 +3991,8 @@ if ($versionMatched) {
         if ($childProc) {
             $pidFile = Join-Path $installDir '.server.pid'
             $hWait = 0
-            while ($hWait -lt 50) {
+            $dwellWait = 0
+            while ($hWait -lt 200) {
                 if ($childProc.HasExited) {
                     break
                 }
@@ -3978,8 +4000,17 @@ if ($versionMatched) {
                     try {
                         $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
                         if ($pidContent -eq "$($childProc.Id)" -and -not $childProc.HasExited) {
-                            $startupSuccess = $true
-                            break
+                            # 僅出現 PID 不足以代表啟動完成：新版會在建立 PID 守衛後才進入服務迴圈。
+                            # 因此改以「子程序持續存活達觀察窗口」或「新版自行完成提交（.committed 或已清理備份）」作為健康證據
+                            if ((Test-Path -LiteralPath (Join-Path $backupDir '.committed')) -or (-not (Test-Path -LiteralPath $backupDir))) {
+                                $startupSuccess = $true
+                                break
+                            }
+                            $dwellWait++
+                            if ($dwellWait -ge 30) {
+                                $startupSuccess = $true
+                                break
+                            }
                         }
                     } catch {}
                 }
@@ -4006,6 +4037,10 @@ if ($startupSuccess) {
         $commitSuccess = (Test-Path -LiteralPath $committedMarker)
     } catch {
         $commitSuccess = $false
+    }
+    if ((-not $commitSuccess) -and (-not (Test-Path -LiteralPath $backupDir))) {
+        # 新版服務已自行完成提交並清理備份目錄：視為提交成功，無需重複處理
+        $commitSuccess = $true
     }
     if ($commitSuccess) {
         $handoffMarker = Join-Path $backupDir '.handing_off'
@@ -4075,6 +4110,12 @@ if ($startupSuccess) {
             foreach ($rel in $originalItems) {
                 if ($managedItems -notcontains $rel) {
                     throw "備份清單包含非受管理項目 ($rel)，拒絕還原以防範路徑穿越攻擊"
+                }
+            }
+            # 清單必須包含平台執行檔與靜態資源，否則截斷或遭竄改的清單會在移除執行檔後無法還原
+            foreach ($required in @('token-usage-insights.exe', 'static')) {
+                if ($originalItems -notcontains $required) {
+                    throw "備份清單缺少必要項目 ($required)，拒絕還原以避免安裝目錄失去執行檔或基礎資源"
                 }
             }
             # 驗證清單項目皆確實存在於備份目錄，避免截斷或遭竄改的備份被誤判為還原成功而留下混合版本
@@ -5150,7 +5191,12 @@ fn apply_installation_with_rollback(
         }
         #[cfg(not(windows))]
         {
-            is_current_exe && is_current_process_server()
+            // 被重啟的看板進程會在完成啟動（綁定連接埠並建立 PID 守衛）後自行提交移交交易；
+            // 若由本行程立即提交，新版稍後啟動失敗時將失去唯一的回滾來源。
+            // 因此除了「目前行程本身即看板」之外，任何已重啟的看板服務或已通知重啟的監管進程都改走移交提交
+            (is_current_exe && is_current_process_server())
+                || !process_plan.supervised_unix_pids.is_empty()
+                || process_plan.stopped_specs.iter().any(|s| s.is_server)
         }
     };
 
@@ -6026,6 +6072,12 @@ update_check_interval: 5 # check every 5 days
         let backup_dir = temp.join("backup");
         fs::create_dir_all(&install_dir).unwrap();
 
+        let exec_name = if cfg!(windows) {
+            "token-usage-insights.exe"
+        } else {
+            APP_NAME
+        };
+        fs::write(install_dir.join(exec_name), "old binary").unwrap();
         fs::write(install_dir.join("VERSION"), "v0.9.5").unwrap();
         fs::write(install_dir.join("pricing.csv"), "model,price").unwrap();
         fs::create_dir_all(install_dir.join("static")).unwrap();
@@ -6464,6 +6516,19 @@ update_check_interval: 5 # check every 5 days
         let _ = fs::remove_dir_all(&temp);
     }
 
+    /// 建立備份目錄中的必要基準項目（平台執行檔與 static）並回傳其清單項目名稱
+    fn write_backup_baseline(backup_dir: &std::path::Path) -> Vec<&'static str> {
+        let exec_name = if cfg!(windows) {
+            "token-usage-insights.exe"
+        } else {
+            APP_NAME
+        };
+        fs::write(backup_dir.join(exec_name), "old binary").unwrap();
+        fs::create_dir_all(backup_dir.join("static")).unwrap();
+        fs::write(backup_dir.join("static").join("index.html"), "old html").unwrap();
+        vec![exec_name, "static"]
+    }
+
     #[cfg(unix)]
     #[test]
     fn restore_from_backup_rejects_symlink_backup_dir() {
@@ -6508,7 +6573,12 @@ update_check_interval: 5 # check every 5 days
 
         let outside_secret = outside_dir.join("secret.txt");
         fs::write(&outside_secret, "sensitive data").unwrap();
-        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        let baseline = write_backup_baseline(&backup_dir);
+        fs::write(
+            backup_dir.join(".manifest"),
+            format!("VERSION\n{}\n{}", baseline[0], baseline[1]),
+        )
+        .unwrap();
         fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
 
         let symlink_entry = backup_dir.join("VERSION");
@@ -6565,6 +6635,45 @@ update_check_interval: 5 # check every 5 days
     }
 
     #[test]
+    fn restore_from_backup_rejects_manifest_without_baseline() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-baseline-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        let exec_name = if cfg!(windows) {
+            "token-usage-insights.exe"
+        } else {
+            APP_NAME
+        };
+        fs::write(install_dir.join(exec_name), "new binary").unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::create_dir_all(install_dir.join("static")).unwrap();
+        fs::write(install_dir.join("static").join("index.html"), "new html").unwrap();
+
+        // 僅含 VERSION 的截斷清單會通過白名單檢查，卻讓第一階段刪除執行檔與 static 後無法還原
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "缺少必要基準項目的清單應被拒絕");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("缺少必要項目"),
+            "錯誤訊息應指出缺少必要基準項目: {err}"
+        );
+        assert!(
+            install_dir.join(exec_name).exists() && install_dir.join("static").exists(),
+            "驗證失敗時不得移除安裝目錄的執行檔或基礎資源"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn restore_from_backup_rejects_manifest_path_traversal() {
         let temp = std::env::temp_dir().join(format!(
             "test-restore-manifest-traversal-{}",
@@ -6612,7 +6721,12 @@ update_check_interval: 5 # check every 5 days
         fs::create_dir_all(&backup_dir).unwrap();
         fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
 
-        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        let baseline = write_backup_baseline(&backup_dir);
+        fs::write(
+            backup_dir.join(".manifest"),
+            format!("VERSION\n{}\n{}", baseline[0], baseline[1]),
+        )
+        .unwrap();
         fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
         fs::write(backup_dir.join("evil.sh"), "rm -rf /").unwrap();
 
@@ -6639,7 +6753,12 @@ update_check_interval: 5 # check every 5 days
         fs::create_dir_all(&backup_dir).unwrap();
         fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
 
-        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        let baseline = write_backup_baseline(&backup_dir);
+        fs::write(
+            backup_dir.join(".manifest"),
+            format!("VERSION\n{}\n{}", baseline[0], baseline[1]),
+        )
+        .unwrap();
         fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
         fs::write(backup_dir.join(".handing_off"), "handing_off").unwrap();
         fs::write(backup_dir.join(".committed"), "committed").unwrap();
@@ -6675,7 +6794,12 @@ update_check_interval: 5 # check every 5 days
         fs::write(install_dir.join("pricing.csv"), "new pricing").unwrap();
 
         // 清單列舉 VERSION 與 pricing.csv，但備份目錄僅有 VERSION：若逐檔還原將靜默略過而留下混合版本
-        fs::write(backup_dir.join(".manifest"), "VERSION\npricing.csv").unwrap();
+        let baseline = write_backup_baseline(&backup_dir);
+        fs::write(
+            backup_dir.join(".manifest"),
+            format!("VERSION\npricing.csv\n{}\n{}", baseline[0], baseline[1]),
+        )
+        .unwrap();
         fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
 
         let res = restore_from_backup(&backup_dir, &install_dir);
@@ -6710,7 +6834,12 @@ update_check_interval: 5 # check every 5 days
         fs::create_dir_all(&backup_dir).unwrap();
         fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
 
-        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        let baseline = write_backup_baseline(&backup_dir);
+        fs::write(
+            backup_dir.join(".manifest"),
+            format!("VERSION\n{}\n{}", baseline[0], baseline[1]),
+        )
+        .unwrap();
         fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
         // 安全寫入流程中途被終止時可能遺留的暫存檔
         fs::write(backup_dir.join(".committed.tmp.4242"), "committed").unwrap();

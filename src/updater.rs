@@ -1090,12 +1090,16 @@ fn is_cli_subcommand(arg: &str) -> bool {
     )
 }
 
-fn is_current_process_server() -> bool {
-    let args: Vec<String> = std::env::args().collect();
+/// 依命令列參數判斷此行程是否為看板服務（而非 export/import/update/version 等 CLI 子命令）
+fn args_indicate_server(args: &[String]) -> bool {
     if args.len() <= 1 {
         return true;
     }
     !args[1..].iter().any(|arg| is_cli_subcommand(arg))
+}
+
+fn is_current_process_server() -> bool {
+    args_indicate_server(&std::env::args().collect::<Vec<_>>())
 }
 
 fn get_process_cmdline_with_retry(pid: u32) -> Option<Vec<String>> {
@@ -5598,7 +5602,23 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         };
         let attempt_file = backup_dir.join(".startup_attempt");
         if is_valid {
-            if !attempt_file.exists() {
+            if attempt_file.exists() {
+                log_update(
+                    "WARN",
+                    "STARTUP_RECOVERY",
+                    "偵測到新版服務先前啟動嘗試未確認健康即異常終止，執行自動救援回滾至健全版本",
+                );
+            } else if !args_indicate_server(args) {
+                // 非看板行程（例如 CLI update）不得消耗移交啟動嘗試標記：
+                // 否則真正的新版看板會看到該標記而誤判為第二次啟動，把仍健康的更新回滾
+                log_update(
+                    "INFO",
+                    "STARTUP_RECOVERY",
+                    "目前行程非看板服務，略過啟動嘗試標記之建立並保留該次嘗試額度",
+                );
+                drop(recovery_lock);
+                return RecoveryStatus::CleanedOrNoBackup;
+            } else {
                 match safe_write_file(&attempt_file, std::process::id().to_string().as_bytes()) {
                     Ok(()) => {
                         log_update(
@@ -5618,12 +5638,6 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
                         );
                     }
                 }
-            } else {
-                log_update(
-                    "WARN",
-                    "STARTUP_RECOVERY",
-                    "偵測到新版服務先前啟動嘗試未確認健康即異常終止，執行自動救援回滾至健全版本",
-                );
             }
         } else {
             log_update(
@@ -8236,6 +8250,56 @@ update_check_interval: 5 # check every 5 days
             !backup_dir.join(".committed").exists(),
             "不得在標記寫入失敗時留下不完整的提交狀態"
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn args_indicate_server_classifies_cli_subcommands() {
+        assert!(args_indicate_server(&["token-usage-insights".to_string()]));
+        assert!(args_indicate_server(&[
+            "token-usage-insights".to_string(),
+            "--no-auto-update".to_string()
+        ]));
+        assert!(!args_indicate_server(&[
+            "token-usage-insights".to_string(),
+            "update".to_string()
+        ]));
+        assert!(!args_indicate_server(&[
+            "token-usage-insights".to_string(),
+            "--version".to_string()
+        ]));
+    }
+
+    #[test]
+    fn attempt_startup_recovery_skips_attempt_marker_for_cli_process() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-cli-startup-attempt-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION\n").unwrap();
+        fs::write(backup_dir.join(".handing_off"), Utc::now().to_rfc3339()).unwrap();
+
+        // CLI 更新行程（非看板服務）不得消耗移交啟動嘗試標記
+        let args = vec!["token-usage-insights".to_string(), "update".to_string()];
+        let status = attempt_startup_recovery(&install_dir, &args);
+
+        assert_eq!(status, RecoveryStatus::CleanedOrNoBackup);
+        assert!(
+            !backup_dir.join(".startup_attempt").exists(),
+            "非看板行程不得建立啟動嘗試標記，否則真正的新版看板會被誤判為第二次啟動而回滾"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "非看板行程不得回滾仍健康的更新"
+        );
+        assert!(backup_dir.exists(), "非看板行程不得清理備份交易");
 
         let _ = fs::remove_dir_all(&temp);
     }

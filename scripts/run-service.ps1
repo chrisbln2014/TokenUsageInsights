@@ -573,10 +573,20 @@ while ($true) {
 
         if ($isHealthy) {
             # 提交流程（標記 .committed、移除移交標記、清理備份）必須在獨占更新鎖保護下完成，
-            # 且必須於健康驗證之後才取得鎖：新版看板在啟動救援階段同樣需要更新鎖才能完成就緒
-            $commitLock = Enter-UpdateLock -LockFile (Join-Path $InstallDir ".update.lock")
+            # 且必須於健康驗證之後才取得鎖：新版看板在啟動救援階段同樣需要更新鎖才能完成就緒。
+            # 取鎖可能與其他更新程序競爭，故採有界重試，避免交易永久殘留而阻擋後續更新
+            $lockFile = Join-Path $InstallDir ".update.lock"
+            $commitLock = $null
+            $commitLockWait = 0
+            while ((-not $commitLock) -and ($commitLockWait -lt 300)) {
+                $commitLock = Enter-UpdateLock -LockFile $lockFile
+                if (-not $commitLock) {
+                    Start-Sleep -Milliseconds 200
+                    $commitLockWait++
+                }
+            }
             if (-not $commitLock) {
-                Write-Warning "無法取得更新鎖（其他更新程序可能正在進行）；本次不提交更新並保留備份目錄與移交標記。"
+                Write-Warning "無法取得更新鎖（已重試 60 秒，其他更新程序可能正在進行）；本次不提交更新並保留備份目錄與移交標記，該交易將由持有鎖之更新程序處理。"
             } else {
                 try {
                     Write-Host "新版服務進程已確認健康就緒，標記更新提交並清理備份目錄..."

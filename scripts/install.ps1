@@ -707,14 +707,9 @@ exit /b %APP_EXIT_CODE%
                 }
             }
 
-            try {
-                Start-ScheduledTask -TaskName $TaskName
-            } catch {
-                Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
-            }
-
             # Registration in Task Scheduler succeeded; remove any stale Startup folder shortcut
-            # to avoid dual launches on logon.
+            # before starting the task, so a cleanup failure cannot leave both a running task and a
+            # shortcut that would launch a duplicate runner on the next logon.
             if (Test-Path $startupShortcutPath) {
                 if ($PSCmdlet.ShouldProcess($startupShortcutPath, "Remove stale Startup shortcut")) {
                     try {
@@ -723,6 +718,12 @@ exit /b %APP_EXIT_CODE%
                         throw "Scheduled task registered, but removing the stale Startup shortcut failed: $($_.Exception.Message). Please remove it manually to avoid duplicate execution: $startupShortcutPath"
                     }
                 }
+            }
+
+            try {
+                Start-ScheduledTask -TaskName $TaskName
+            } catch {
+                Write-Warning "Scheduled task registered, but automatic start failed: $($_.Exception.Message)"
             }
         }
     } elseif ($hadPersistentServiceRegistration) {

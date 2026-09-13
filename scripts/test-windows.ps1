@@ -1052,6 +1052,7 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True ($null -ne $fnDefEnterLock -and $fnDefEnterLock.Count -eq 1) "run-service.ps1 should define Enter-UpdateLock."
     Assert-True ($fnDefEnterLock[0].Extent.Text -match 'FileShare\]::None') "Enter-UpdateLock must open the update lock with exclusive share mode."
     Assert-True ($whileBodyText -match '(?s)Enter-UpdateLock.*\.committed') "run-service.ps1 must acquire the update lock before committing the update."
+    Assert-True ($whileBodyText -match '(?s)while \(\(-not \$commitLock\).*Enter-UpdateLock') "run-service.ps1 must retry acquiring the commit lock instead of giving up after one attempt."
     Assert-True ($whileBodyText -match '(?s)Enter-UpdateLock.*Restore-ServiceBackup') "run-service.ps1 must acquire the update lock before rolling back."
 
     Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."

@@ -232,6 +232,10 @@ function Test-IsProcessHealthy {
         [int]$TimeoutSeconds = 5
     )
 
+    if (-not $Process) {
+        return $false
+    }
+
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $pidFile = Join-Path $InstallDir ".server.pid"
     while ((Get-Date) -lt $deadline) {
@@ -242,13 +246,13 @@ function Test-IsProcessHealthy {
             try {
                 $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
                 if ($pidContent -eq "$($Process.Id)") {
-                    return $true
+                    return (-not $Process.HasExited)
                 }
             } catch {}
         }
         Start-Sleep -Milliseconds 100
     }
-    return (-not $Process.HasExited)
+    return $false
 }
 
 function Restore-ServiceBackup {
@@ -263,18 +267,32 @@ function Restore-ServiceBackup {
     }
 
     try {
-        Get-Content -LiteralPath $manifest | ForEach-Object {
-            $rel = $_.Trim()
-            if ($rel) {
-                $src = Join-Path $backupDir $rel
-                $dst = Join-Path $InstallDir $rel
-                if (Test-Path -LiteralPath $src) {
-                    $parent = Split-Path -Parent $dst
-                    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
-                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
-                    }
-                    Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
+        $originalItems = @(Get-Content -LiteralPath $manifest | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $managedItems = @("token-usage-insights", "token-usage-insights.exe", "static", "pricing.csv", "VERSION", "LICENSE", "README.md", "scripts", "shell")
+
+        # 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
+        foreach ($m in $managedItems) {
+            if ($originalItems -notcontains $m) {
+                $p = Join-Path $InstallDir $m
+                if (Test-Path -LiteralPath $p) {
+                    Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
                 }
+            }
+        }
+
+        # 2. 還原備份項目；若目標項目為目錄，先完整移除目標目錄再遞迴複製，防範新舊檔案混合
+        foreach ($rel in $originalItems) {
+            $src = Join-Path $backupDir $rel
+            $dst = Join-Path $InstallDir $rel
+            if (Test-Path -LiteralPath $src) {
+                if (Test-Path -LiteralPath $dst) {
+                    Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                $parent = Split-Path -Parent $dst
+                if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                    New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                }
+                Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
             }
         }
         Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue

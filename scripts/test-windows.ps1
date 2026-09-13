@@ -887,6 +887,10 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     $fnDefRestore = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Restore-ServiceBackup" }, $true)
     Assert-True ($null -ne $fnDefRestore -and $fnDefRestore.Count -eq 1) "run-service.ps1 should define Restore-ServiceBackup."
 
+    Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Remove-Item.*-LiteralPath \$dst.*Copy-Item') "Restore-ServiceBackup must remove destination items before copying to prevent mixed files."
+
     Assert-True ($whileBodyText -match '(?s)Start-Process.*Test-IsProcessHealthy.*Restore-ServiceBackup') "run-service.ps1 main while loop must verify process health before committing backup and restore on failure."
     Assert-True (-not ($fnDefReady[0].Extent.Text -match 'Remove-Item.*\.backup')) "Wait-ForExecutableReady must not delete .backup before process launch."
 

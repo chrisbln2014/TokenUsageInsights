@@ -3764,22 +3764,97 @@ while ($vCheckCount -lt 50) {
     $vCheckCount++
 }
 
-# 5. 依版本驗證結果決定啟動或拒絕載入舊版
+# 5. 依版本驗證結果啟動新版並進行健康確認，確認健康始清理備份；若啟動失敗或版本不符則自備份自動回滾
+$backupDir = Join-Path $installDir '.backup'
+$manifestPath = Join-Path $backupDir '.manifest'
 $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
+$startupSuccess = $false
+$childProc = $null
 if ($versionMatched) {
-    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在重新啟動看板服務..."
-    $backupDir = Join-Path $installDir '.backup'
-    if (Test-Path -LiteralPath $backupDir) {
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    if ($argList.Count -gt 0) {
-        Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在啟動新版看板進程..."
+    $childProc = if ($argList.Count -gt 0) {
+        Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
     } else {
-        Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden
+        Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
+    }
+
+    if ($childProc) {
+        $pidFile = Join-Path $installDir '.server.pid'
+        $hWait = 0
+        while ($hWait -lt 50) {
+            if ($childProc.HasExited) {
+                break
+            }
+            if (Test-Path -LiteralPath $pidFile) {
+                try {
+                    $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+                    if ($pidContent -eq "$($childProc.Id)" -and -not $childProc.HasExited) {
+                        $startupSuccess = $true
+                        break
+                    }
+                } catch {}
+            }
+            Start-Sleep -Milliseconds 100
+            $hWait++
+        }
     }
 } else {
     Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 移交守護進程驗證新版執行檔版本失敗 (預期 $expectedVersion)，中止啟動以防載入舊版。"
+}
+
+if ($startupSuccess) {
+    $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 新版看板進程已確認健康就緒 (PID: $($childProc.Id))，清理更新備份目錄..."
+    if (Test-Path -LiteralPath $backupDir) {
+        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+} else {
+    $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 新版看板進程啟動後異常或未能及時就緒，執行自備份自動回滾..."
+    if ($childProc -and -not $childProc.HasExited) {
+        try { Stop-Process -Id $childProc.Id -Force } catch {}
+        try { $null = $childProc.WaitForExit(3000) } catch {}
+    }
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $originalItems = @(Get-Content -LiteralPath $manifestPath | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'VERSION', 'LICENSE', 'README.md', 'scripts', 'shell')
+            foreach ($m in $managedItems) {
+                if ($originalItems -notcontains $m) {
+                    $p = Join-Path $installDir $m
+                    if (Test-Path -LiteralPath $p) {
+                        Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+            foreach ($rel in $originalItems) {
+                $src = Join-Path $backupDir $rel
+                $dst = Join-Path $installDir $rel
+                if (Test-Path -LiteralPath $src) {
+                    if (Test-Path -LiteralPath $dst) {
+                        Remove-Item -LiteralPath $dst -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                    $parent = Split-Path -Parent $dst
+                    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                    }
+                    Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse
+                }
+            }
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份回滾至先前版本，正在重新啟動原版服務..."
+            if ($argList.Count -gt 0) {
+                Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden
+            } else {
+                Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden
+            }
+        } catch {
+            $failedMarker = Join-Path $backupDir '.rollback_failed'
+            Set-Content -LiteralPath $failedMarker -Value "deferred restart rollback failed: $_"
+            Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 回滾失敗: $_；保留備份供手動修復。"
+        }
+    }
 }
 "#);
 
@@ -4600,10 +4675,13 @@ pub(crate) fn apply_installation_with_rollback(
     };
 
     if is_async_restart {
+        let handoff_marker = backup_dir.join(".handing_off");
+        let now_str = Utc::now().to_rfc3339();
+        let _ = safe_write_file(&handoff_marker, now_str.as_bytes());
         log_update(
             "INFO",
             "CLEANUP",
-            "Windows 非同步/監管重啟已就緒；保留備份目錄直至服務管理器或移交守護進程驗證新版就緒後清理",
+            "Windows 非同步/監管重啟已就緒；寫入移交標記 (.handing_off) 並保留備份目錄直至服務管理器或移交守護進程驗證新版就緒後清理",
         );
         return Ok(server_restarted);
     }
@@ -4924,6 +5002,33 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         );
         log_update("ERROR", "STARTUP_FATAL", "先前回滾失敗，程序終止");
         std::process::exit(1);
+    }
+
+    // 若存在 .handing_off 移交標記，檢查是否處於有效的非同步重啟移交驗證窗口內 (60 秒)
+    let handoff_path = backup_dir.join(".handing_off");
+    if handoff_path.exists() {
+        let is_valid = match fs::metadata(&handoff_path).and_then(|m| m.modified()) {
+            Ok(modified) => match modified.elapsed() {
+                Ok(dur) => dur < Duration::from_secs(60),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if is_valid {
+            log_update(
+                "INFO",
+                "STARTUP_RECOVERY",
+                "偵測到非同步重啟移交標記 (.handing_off) 且處於驗證窗口內，略過自動回滾以利守護進程執行健康驗證",
+            );
+            drop(recovery_lock);
+            return RecoveryStatus::CleanedOrNoBackup;
+        } else {
+            log_update(
+                "WARN",
+                "STARTUP_RECOVERY",
+                "非同步重啟移交標記 (.handing_off) 已逾時過期，視為未完成之更新並繼續執行安全救援回滾",
+            );
+        }
     }
 
     let manifest_path = backup_dir.join(".manifest");
@@ -5895,6 +6000,40 @@ update_check_interval: 5 # check every 5 days
     }
 
     #[test]
+    fn handoff_marker_prevents_erroneous_rollback_during_handoff_window() {
+        let temp = std::env::temp_dir().join(format!(
+            "handoff-marker-test-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(
+            backup_dir.join(".handing_off"),
+            Utc::now().to_rfc3339().as_bytes(),
+        )
+        .unwrap();
+
+        let status = attempt_startup_recovery(&install_dir, &[]);
+        assert_eq!(status, RecoveryStatus::CleanedOrNoBackup);
+
+        // 因為存在 .handing_off 標記且在時間窗口內，新版絕不可被錯誤回滾至舊版 v0.9.5
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+        // .backup 應保留供服務管理器或移交腳本後續健康驗證
+        assert!(backup_dir.exists(), ".backup 應保留以利後續健康檢查");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
     fn is_cli_subcommand_identifies_cli_commands() {
         assert!(is_cli_subcommand("export"));
         assert!(is_cli_subcommand("export-all"));
@@ -6837,6 +6976,11 @@ update_check_interval: 5 # check every 5 days
         assert!(script.contains("$env:PORT = '3003';"));
         assert!(script.contains("$env:HOST = '127.0.0.1';"));
         assert!(script.contains("$env:INSIGHTS_DIR = 'C:\\data';"));
+
+        // 驗證啟動後監控健康就緒、清理備份與自動回滾
+        assert!(script.contains("新版看板進程已確認健康就緒"));
+        assert!(script.contains("自備份自動回滾"));
+        assert!(script.contains(".server.pid"));
     }
 
     #[tokio::test]

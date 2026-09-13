@@ -7,6 +7,7 @@
 ### 修正
 
 - 修復 Codex 工作階段耗時永遠顯示為「-」的問題（[#43](https://github.com/doggy8088/TokenUsageInsights/issues/43)、[#48](https://github.com/doggy8088/TokenUsageInsights/pull/48)）。解析 Codex transcript 中的 `event_msg/task_complete` 事件並累加已完成 task 的 `payload.duration_ms`，寫入資料庫的 `duration_ms` 欄位；更新 parser migration marker 至 `migration:codex_session_identity_v7`，觸發既有 Codex transcript 重新同步以補齊耗時資訊。
+- 補充 DeepSeek V4.1-Flash（`deepseek-v4.1-flash`）定價規則，依 DeepSeek API 官方尖峰費率設定輸入 0.30、快取輸入 0.006、輸出 1.20 美元／每百萬 Token，修復該模型工作階段無法估算成本的問題。
 
 ## [0.9.5] - 2026-09-11
 

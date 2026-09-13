@@ -514,6 +514,34 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_v4_1_flash_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "deepseek-v4.1-flash",
+            "DeepSeek-V4.1-Flash",
+            "deepseek-v4.1-flash:cloud",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // Peak input 0.30 + cache read 0.006 + output 1.20 = 1.506.
+            assert!(
+                (cost - 1.506).abs() < 1e-12,
+                "unexpected DeepSeek V4.1-Flash cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_6_astra_context_tiers_use_packaged_pricing() {
         let rules = load_pricing_rules();
 

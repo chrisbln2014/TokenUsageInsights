@@ -4082,7 +4082,19 @@ if ($startupSuccess) {
         try { Stop-Process -Id $childProc.Id -Force } catch {}
         try { $null = $childProc.WaitForExit(3000) } catch {}
     }
-    if (Test-Path -LiteralPath $manifestPath) {
+    # 先驗證備份根目錄本身為正規目錄：符號連結、重剖析點或非目錄會讓讀取清單與複製操作落在無關目錄上
+    $backupItem = Get-Item -LiteralPath $backupDir -Force -ErrorAction SilentlyContinue
+    $backupSafe = $false
+    if ($backupItem) {
+        $backupSafe = $backupItem.PSIsContainer -and (-not ($backupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint))
+    }
+    if (-not $backupSafe) {
+        $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 備份目錄為符號連結、重剖析點或非正規目錄 ($backupDir)，拒絕還原以確保安全。"
+        $directMarker = Join-Path $installDir '.rollback_failed'
+        Set-Content -LiteralPath $directMarker -Value "unsafe backup directory (symbolic link, reparse point or non-directory): $backupDir" -Force -ErrorAction SilentlyContinue
+    }
+    if ($backupSafe -and (Test-Path -LiteralPath $manifestPath)) {
         try {
             $originalItems = @(Get-Content -LiteralPath $manifestPath | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'shell', 'scripts', 'install.sh', 'install.ps1', 'VERSION', 'README.md', 'LICENSE', '.install_marker', '.service.env')

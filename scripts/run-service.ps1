@@ -287,6 +287,19 @@ function Restore-ServiceBackup {
     )
 
     $backupDir = Join-Path $InstallDir ".backup"
+
+    # 先驗證備份根目錄本身為正規目錄：符號連結、重剖析點或非目錄會讓後續的讀取清單、
+    # 複製與刪除操作落在無關目錄上，繞過清單白名單檢查而把外部檔案還原進安裝目錄
+    $backupItem = Get-Item -LiteralPath $backupDir -Force -ErrorAction SilentlyContinue
+    if (-not $backupItem) {
+        return $false
+    }
+    if ((-not $backupItem.PSIsContainer) -or ($backupItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        Set-Content -LiteralPath (Join-Path $InstallDir ".rollback_failed") -Value "unsafe backup directory (symbolic link, reparse point or non-directory): $backupDir" -Force -ErrorAction SilentlyContinue
+        Write-Error -Message "備份目錄為符號連結、重剖析點或非正規目錄 ($backupDir)；拒絕還原以確保安全。" -ErrorAction Continue
+        return $false
+    }
+
     $manifest = Join-Path $backupDir ".manifest"
     if (-not (Test-Path -LiteralPath $manifest)) {
         return $false

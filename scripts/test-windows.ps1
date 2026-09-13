@@ -935,6 +935,36 @@ if (Restore-ServiceBackup -InstallDir '$truncatedInstallDir') { exit 2 } else { 
     Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not partially restore a truncated backup."
     Assert-Equal "new pricing" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Raw).Trim()) "Restore-ServiceBackup must not touch the install directory when the backup is truncated."
 
+    # 5d. Restore-ServiceBackup 必須拒絕符號連結或重剖析點的備份根目錄
+    $linkedRoot = Join-Path $Root "backup-root-link-tests"
+    $linkedInstallDir = Join-Path $linkedRoot "install"
+    $linkedOutsideDir = Join-Path $linkedRoot "outside"
+    New-Item -ItemType Directory -Force -Path $linkedInstallDir | Out-Null
+    New-Item -ItemType Directory -Force -Path $linkedOutsideDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $linkedInstallDir "VERSION") -Value "v0.9.6"
+    Set-Content -LiteralPath (Join-Path $linkedOutsideDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $linkedOutsideDir ".manifest") -Value "VERSION"
+
+    $symlinkCreated = $true
+    try {
+        New-Item -ItemType SymbolicLink -Path (Join-Path $linkedInstallDir ".backup") -Target $linkedOutsideDir -Force | Out-Null
+    } catch {
+        $symlinkCreated = $false
+        Write-Host "略過備份根目錄符號連結測試（無法建立符號連結）: $($_.Exception.Message)"
+    }
+
+    if ($symlinkCreated) {
+        $linkedTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exit 0 }
+"@
+        $linkedExit = Invoke-ScopedScript -ScriptText $linkedTestScript -Name "backup-root-symlink"
+        Assert-Equal 0 $linkedExit "Restore-ServiceBackup should fail closed when .backup is a symbolic link."
+        Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $linkedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not restore from a symbolic-linked backup root."
+        Assert-True (Test-Path -LiteralPath (Join-Path $linkedInstallDir ".rollback_failed")) "Restore-ServiceBackup must record .rollback_failed for an unsafe backup root."
+    }
+
     # 6. Verify run-service.ps1 loop gates launch when update markers exist
     $loopGateAst = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
     $allWhileLoops = $loopGateAst.FindAll({ $args[0] -is [System.Management.Automation.Language.WhileStatementAst] }, $true)
@@ -1002,6 +1032,7 @@ if (Restore-ServiceBackup -InstallDir '$truncatedInstallDir') { exit 2 } else { 
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel') "Restore-ServiceBackup must validate manifest entries against managedItems."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must reject non-managed manifest entries before touching the install directory."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Test-Path -LiteralPath \$relSrcPath') "Restore-ServiceBackup must verify every manifest entry exists in the backup directory."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)PSIsContainer.*ReparsePoint') "Restore-ServiceBackup must validate that the backup root is a regular directory before reading the manifest."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)不存在於備份目錄.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must fail closed on truncated backups before touching the install directory."
     Assert-True ($fnDefRestore[0].Extent.Text -match 'ReparsePoint') "Restore-ServiceBackup must reject symlinked manifest entries."
     $readyText = $fnDefReady[0].Extent.Text

@@ -103,10 +103,36 @@ fn initialize_database_schema() -> Result<(), String> {
     db::init_db(&conn)
 }
 
-fn spawn_usage_sync_task() {
-    tokio::spawn(async {
+/// 背景日誌同步任務的控制代碼：支援通知停止並等待進行中的同步（含 spawn_blocking 的 SQLite 寫入）完成
+struct UsageSyncTask {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl UsageSyncTask {
+    /// 通知同步迴圈停止，並等待進行中的同步與資料庫寫入完成後才返回。
+    /// 若逾時則記錄警告並繼續停機流程，避免更新或停機被無限阻塞
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        if tokio::time::timeout(std::time::Duration::from_secs(30), self.handle)
+            .await
+            .is_err()
+        {
+            eprintln!("⚠️ 等待背景日誌同步結束逾時（30 秒），將直接繼續停機流程。");
+        }
+    }
+}
+
+fn spawn_usage_sync_task() -> UsageSyncTask {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let handle = tokio::spawn(async move {
         let mut migrate_legacy_databases = true;
         loop {
+            // 收到停機通知時不再排入新的同步，讓進行中的同步（若有的話）自然結束
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
             let should_migrate = migrate_legacy_databases;
             let sync_res = tokio::task::spawn_blocking(move || {
                 let mut conn = db::get_db_conn()?;
@@ -127,9 +153,22 @@ fn spawn_usage_sync_task() {
             }
 
             migrate_legacy_databases = false;
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            // 以可取消的等待取代固定睡眠，停機時可立即結束迴圈而不必等滿 5 秒
+            let stop_requested = tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => false,
+                changed = shutdown_rx.changed() => changed.is_err() || *shutdown_rx.borrow(),
+            };
+            if stop_requested {
+                break;
+            }
         }
     });
+
+    UsageSyncTask {
+        shutdown_tx,
+        handle,
+    }
 }
 
 #[tokio::main]
@@ -143,9 +182,13 @@ async fn main() {
     // 看板服務啟動前優先檢查並執行本機交易救援（若先前更新意外中斷）
     updater::perform_startup_recovery().await;
 
-    if let Err(error) = initialize_database_schema() {
-        eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
-    }
+    let database_ready = match initialize_database_schema() {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("❌ 初始化 SQLite 資料庫失敗: {error}");
+            false
+        }
+    };
 
     // 建立協調式優雅停機通知通道，供系統終止信號與背景自動更新任務協同使用
     let (shutdown_reason_tx, mut shutdown_reason_rx) =
@@ -250,7 +293,7 @@ async fn main() {
     );
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
-    spawn_usage_sync_task();
+    let usage_sync_task = spawn_usage_sync_task();
     let pid_guard = updater::create_server_pid_guard();
     if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
         updater::detect_environment()
@@ -263,8 +306,18 @@ async fn main() {
                 "STARTUP",
                 "偵測到 Windows 服務 runner 監管模式；更新提交與備份清理交由 runner 於健康驗證通過後執行",
             );
-        } else {
+        } else if database_ready {
             updater::complete_handoff_and_commit_if_needed(&install_dir);
+        } else {
+            // 資料庫結構初始化失敗代表新版無法健康服務；提交會刪除唯一的回滾備份，故改為保留備份並於下次啟動自動回滾
+            eprintln!(
+                "⚠️ SQLite 資料庫結構初始化失敗，保留更新備份 (.backup) 以維持回滾能力，本次啟動不提交更新。"
+            );
+            updater::log_update(
+                "ERROR",
+                "STARTUP",
+                "資料庫結構初始化失敗；保留備份目錄且不提交更新，下次啟動將自動回滾至先前版本",
+            );
         }
     }
     axum::serve(listener, app)
@@ -275,6 +328,10 @@ async fn main() {
         .unwrap();
 
     drop(pid_guard);
+
+    // HTTP 伺服器已停止服務，但背景日誌同步（含 spawn_blocking 中的 SQLite 寫入）可能仍在進行；
+    // 必須先等待其結束再決定套用更新或結束程序，否則更新流程可能在資料庫寫入中途終止程序
+    usage_sync_task.shutdown().await;
 
     let shutdown_reason = shutdown_reason_task
         .await
@@ -400,6 +457,35 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn usage_sync_task_shutdown_waits_for_inflight_sync() {
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_flag = finished.clone();
+
+        let handle = tokio::spawn(async move {
+            // 模擬進行中的同步：等待停機通知後才結束（正常情況下不會收到，除非 shutdown 被呼叫）
+            while !*shutdown_rx.borrow_and_update() {
+                if shutdown_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            finished_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let task = UsageSyncTask {
+            shutdown_tx,
+            handle,
+        };
+        task.shutdown().await;
+
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "shutdown 必須等待進行中的同步結束後才返回，避免更新流程在 SQLite 寫入中途終止程序"
+        );
+    }
 
     #[test]
     fn import_payload_limit_is_200_megabytes() {

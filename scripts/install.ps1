@@ -511,6 +511,42 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "Install Token Usage Insights")) {
         }
     }
 
+    # 若未明確指定綁定位址與連接埠，自動繼承既有 runner 參數，避免重裝時把自訂綁定改寫回預設值
+    $persistedHostAddress = $null
+    if ($PSBoundParameters.ContainsKey('HostAddress')) {
+        $persistedHostAddress = $HostAddress
+    } elseif ($env:HOST) {
+        $persistedHostAddress = $HostAddress
+    }
+
+    $persistedPort = $null
+    if ($PSBoundParameters.ContainsKey('Port')) {
+        $persistedPort = $Port
+    } elseif ($env:PORT) {
+        $persistedPort = $Port
+    }
+
+    if ($null -eq $persistedHostAddress) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingHostAddress = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "HostAddress"
+            if ($null -ne $existingHostAddress) {
+                $persistedHostAddress = $existingHostAddress
+                $HostAddress = $existingHostAddress
+                break
+            }
+        }
+    }
+    if ($null -eq $persistedPort) {
+        foreach ($candArgs in $candidateServiceArguments) {
+            $existingPort = Get-RunnerArgumentValue -Arguments $candArgs -ParameterName "Port"
+            if ($null -ne $existingPort) {
+                $persistedPort = $existingPort
+                $Port = [int]$existingPort
+                break
+            }
+        }
+    }
+
     if ($Service -or $hadPersistentServiceRegistration) {
         Stop-ExistingServiceInstance -TaskNames $taskNamesToStop -ProcessName $AppName -InstallDir $InstallDir
     }

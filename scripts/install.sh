@@ -165,6 +165,20 @@ if [[ "$install_service" == true ]]; then
             CORS_ALLOWED_ORIGINS="$(systemd_unescape_value "$legacy_cors")"
           fi
         fi
+        # 保留既有服務單元之綁定位址與連接埠：重裝時若未明確指定 HOST／PORT，
+        # 不得將自訂綁定（如 127.0.0.1:8080）改寫回預設值
+        if [[ -z "${PORT+x}" ]]; then
+          existing_port="$(sed -n -E 's/^[[:space:]]*Environment="?PORT=(([^"\\]|\\.)*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_port" ]]; then
+            port="$(systemd_unescape_value "$existing_port")"
+          fi
+        fi
+        if [[ -z "${HOST+x}" ]]; then
+          existing_host="$(sed -n -E 's/^[[:space:]]*Environment="?HOST=(([^"\\]|\\.)*)"?$/\1/p' "$service_file" | tail -n 1)"
+          if [[ -n "$existing_host" ]]; then
+            host="$(systemd_unescape_value "$existing_host")"
+          fi
+        fi
       fi
 
       extra_env_systemd=""
@@ -263,6 +277,17 @@ SERVICE
         if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
           if legacy_cors="$(plutil -extract EnvironmentVariables.CORS_ALLOW_ORIGIN raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$legacy_cors" ]]; then
             CORS_ALLOWED_ORIGINS="$legacy_cors"
+          fi
+        fi
+        # 保留既有 launchd agent 之綁定位址與連接埠：重裝時若未明確指定 HOST／PORT，不得改寫回預設值
+        if [[ -z "${PORT+x}" ]]; then
+          if existing_port="$(plutil -extract EnvironmentVariables.PORT raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_port" ]]; then
+            port="$existing_port"
+          fi
+        fi
+        if [[ -z "${HOST+x}" ]]; then
+          if existing_host="$(plutil -extract EnvironmentVariables.HOST raw -o - "$launch_agent_file" 2>/dev/null)" && [[ -n "$existing_host" ]]; then
+            host="$existing_host"
           fi
         fi
       fi

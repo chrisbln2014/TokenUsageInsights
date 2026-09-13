@@ -422,7 +422,20 @@ async fn main() {
                     );
                     return;
                 }
-                updater::complete_handoff_and_commit_if_needed(&commit_install_dir);
+                // 提交可能因其他更新程序持有更新鎖而暫時無法進行：改為有界重試，
+                // 避免移交交易與備份永久殘留而阻擋後續更新
+                for _ in 0..120 {
+                    updater::complete_handoff_and_commit_if_needed(&commit_install_dir);
+                    if !updater::has_pending_handoff_transaction(&commit_install_dir) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                updater::log_update(
+                    "WARN",
+                    "STARTUP",
+                    "移交提交重試逾時；備份交易將由後續啟動或更新程序處理",
+                );
             });
         }
     }
@@ -479,6 +492,12 @@ async fn main() {
                 return;
             }
 
+            // 開始更新前先收斂既有的移交交易（例如本次啟動的延遲提交任務尚未執行）：
+            // 否則殘留備份會讓後續 backup_installation 拒絕本次更新
+            if let Some(dir) = install_dir.as_deref() {
+                updater::complete_handoff_and_commit_if_needed(dir);
+            }
+
             println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
             updater::log_update("INFO", "RESTART", "服務已優雅停機，開始執行自動更新");
 
@@ -501,6 +520,16 @@ async fn main() {
                         "RESTART",
                         &format!("未執行安裝（其他更新程序已完成或已是最新版本），維持目前版本 v{current} 並重新啟動服務"),
                     );
+                    // 取得結果期間可能已收到終止訊號：此時應依停機要求停止，而非把停機轉為重啟
+                    if signal_received.load(std::sync::atomic::Ordering::SeqCst) {
+                        println!("👋 未執行安裝且已收到終止信號，依停機要求停止服務。");
+                        updater::log_update(
+                            "INFO",
+                            "RESTART",
+                            "未執行安裝且已收到終止信號；停止服務且不重啟",
+                        );
+                        return;
+                    }
                     // 目前伺服器已為自動更新優雅停機：此處必須重新啟動，否則手動啟動且未受監管的安裝會永久停止
                     updater::restart_current_process(&target_exe, &args);
                 }

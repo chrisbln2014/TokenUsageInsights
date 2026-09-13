@@ -3135,6 +3135,7 @@ pub(crate) async fn run_update_in_dir(
                 &install_dir,
                 &backup_dir,
                 update_lock,
+                cancel_flag,
             )?;
 
             println!("🎉 成功更新至版本 {remote_version}！");
@@ -4511,6 +4512,7 @@ fn apply_installation_with_rollback(
     install_dir: &Path,
     backup_dir: &Path,
     update_lock: Option<UpdateLock>,
+    cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<bool, UpdateError> {
     // 呼叫端持有之獨占更新鎖；檔案替換完成後、任何重啟動作前必須釋放，
     // 否則被重啟之看板進程會在啟動救援階段等待鎖而無法於時限內就緒
@@ -4652,6 +4654,14 @@ fn apply_installation_with_rollback(
             &install_dir.join(".install_marker"),
             b"token-usage-insights:installed",
         )?;
+
+        // 檔案替換完成、尚未寫入任何移交標記之前做最後一次仲裁：
+        // 若期間收到終止訊號則視為安裝失敗，由下方的安裝失敗路徑執行完整回滾，避免服務被重新啟動
+        if let Some(flag) = cancel_flag.as_ref() {
+            if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("更新已取消（檔案替換期間收到終止訊號），將回復先前版本".to_string());
+            }
+        }
 
         // 寫入更新就緒標記，供 Windows 服務守護進程確認新執行檔已完全寫入就緒
         safe_write_file(&install_dir.join(".update_ready"), b"ready")?;
@@ -6423,7 +6433,7 @@ update_check_interval: 5 # check every 5 days
 
         // 1. Success case
         let result =
-            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir, None);
+            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir, None, None);
         assert!(
             result.is_ok(),
             "apply_installation_with_rollback failed: {:?}",
@@ -6458,7 +6468,7 @@ update_check_interval: 5 # check every 5 days
         fs::write(bad_release.join("static").join("index.html"), "broken html").unwrap();
 
         let fail_result =
-            apply_installation_with_rollback(&bad_release, &install_dir, &backup_dir, None);
+            apply_installation_with_rollback(&bad_release, &install_dir, &backup_dir, None, None);
         assert!(
             fail_result.is_err(),
             "expected installation to fail with directory as binary"
@@ -6529,8 +6539,13 @@ update_check_interval: 5 # check every 5 days
             "測試前置條件：更新鎖應處於持有狀態"
         );
 
-        let result =
-            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir, Some(lock));
+        let result = apply_installation_with_rollback(
+            &release_root,
+            &install_dir,
+            &backup_dir,
+            Some(lock),
+            None,
+        );
         assert!(result.is_ok(), "安裝應成功: {result:?}");
         assert!(
             !UpdateLock::is_locked(&install_dir),

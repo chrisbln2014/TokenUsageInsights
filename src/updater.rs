@@ -3611,25 +3611,33 @@ fn build_windows_deferred_restart_script(
     install_dir: &Path,
     exe_path: &Path,
     expected_version: &str,
-    spec: &StoppedProcessSpec,
+    spec: Option<&StoppedProcessSpec>,
 ) -> Result<String, String> {
     let fallback_args = vec![APP_NAME.to_string()];
-    let args = match &spec.args {
-        Some(a) => a,
-        None if spec.is_server => &fallback_args,
-        None => {
-            return Err("無法可靠取得先前進程之命令列參數，略過自動重啟以防組態重設".to_string());
+    let (child_args, envs, cwd, restart_service) = match spec {
+        Some(s) => {
+            let args = match &s.args {
+                Some(a) => a,
+                None if s.is_server => &fallback_args,
+                None => {
+                    return Err(
+                        "無法可靠取得先前進程之命令列參數，略過自動重啟以防組態重設".to_string()
+                    );
+                }
+            };
+
+            let child = if args.len() > 1 { &args[1..] } else { &[] };
+            if child.iter().any(|arg| is_cli_subcommand(arg)) {
+                return Err("先前進程包含非看板 CLI 子命令，略過自動重啟".to_string());
+            }
+
+            let c = match &s.cwd {
+                Some(c) => c.as_path(),
+                None => install_dir,
+            };
+            (child, s.envs.as_slice(), c, true)
         }
-    };
-
-    let child_args = if args.len() > 1 { &args[1..] } else { &[] };
-    if child_args.iter().any(|arg| is_cli_subcommand(arg)) {
-        return Err("先前進程包含非看板 CLI 子命令，略過自動重啟".to_string());
-    }
-
-    let cwd = match &spec.cwd {
-        Some(c) => c.as_path(),
-        None => install_dir,
+        None => (&[][..], &[][..], install_dir, false),
     };
 
     let expected_clean = expected_version.trim().trim_start_matches(['v', 'V']);
@@ -3652,6 +3660,10 @@ fn build_windows_deferred_restart_script(
         "$cwd = '{}';\n",
         cwd.to_string_lossy().replace('\'', "''")
     ));
+    ps_script.push_str(&format!(
+        "$restartService = {};\n",
+        if restart_service { "$true" } else { "$false" }
+    ));
 
     ps_script.push_str("$argList = @(");
     for (idx, arg) in child_args.iter().enumerate() {
@@ -3670,7 +3682,7 @@ fn build_windows_deferred_restart_script(
         ));
     }
     // 再套用先前進程保留之完整環境變數
-    for (k, v) in &spec.envs {
+    for (k, v) in envs {
         ps_script.push_str(&format!("$env:{} = '{}';\n", k, v.replace('\'', "''")));
     }
 
@@ -3786,32 +3798,37 @@ $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $startupSuccess = $false
 $childProc = $null
 if ($versionMatched) {
-    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在啟動新版看板進程..."
-    $childProc = if ($argList.Count -gt 0) {
-        Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
-    } else {
-        Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
-    }
-
-    if ($childProc) {
-        $pidFile = Join-Path $installDir '.server.pid'
-        $hWait = 0
-        while ($hWait -lt 50) {
-            if ($childProc.HasExited) {
-                break
-            }
-            if (Test-Path -LiteralPath $pidFile) {
-                try {
-                    $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-                    if ($pidContent -eq "$($childProc.Id)" -and -not $childProc.HasExited) {
-                        $startupSuccess = $true
-                        break
-                    }
-                } catch {}
-            }
-            Start-Sleep -Milliseconds 100
-            $hWait++
+    if ($restartService) {
+        Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，正在啟動新版看板進程..."
+        $childProc = if ($argList.Count -gt 0) {
+            Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
+        } else {
+            Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
         }
+
+        if ($childProc) {
+            $pidFile = Join-Path $installDir '.server.pid'
+            $hWait = 0
+            while ($hWait -lt 50) {
+                if ($childProc.HasExited) {
+                    break
+                }
+                if (Test-Path -LiteralPath $pidFile) {
+                    try {
+                        $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+                        if ($pidContent -eq "$($childProc.Id)" -and -not $childProc.HasExited) {
+                            $startupSuccess = $true
+                            break
+                        }
+                    } catch {}
+                }
+                Start-Sleep -Milliseconds 100
+                $hWait++
+            }
+        }
+    } else {
+        Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 移交守護進程已確認新版執行檔版本 ($expectedVersion)，非服務程序無需重啟進程。"
+        $startupSuccess = $true
     }
 } else {
     Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 移交守護進程驗證新版執行檔版本失敗 (預期 $expectedVersion)，中止啟動以防載入舊版。"
@@ -3819,7 +3836,8 @@ if ($versionMatched) {
 
 if ($startupSuccess) {
     $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
-    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 新版看板進程已確認健康就緒 (PID: $($childProc.Id))，標記更新提交並清理備份目錄..."
+    $readyMsg = if ($childProc) { "新版看板進程已確認健康就緒 (PID: $($childProc.Id))" } else { "新版執行檔已確認置換就緒" }
+    Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] $readyMsg，標記更新提交並清理備份目錄..."
     $committedMarker = Join-Path $backupDir '.committed'
     $commitSuccess = $false
     try {
@@ -3903,37 +3921,44 @@ if ($startupSuccess) {
                 }
             }
 
-            Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份還原檔案，正在重新啟動原版服務..."
-            $restoredProc = if ($argList.Count -gt 0) {
-                Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
-            } else {
-                Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
-            }
-
             $restoredHealthy = $false
-            if ($restoredProc) {
-                $pidFile = Join-Path $installDir '.server.pid'
-                $rWait = 0
-                while ($rWait -lt 50) {
-                    if ($restoredProc.HasExited) {
-                        break
-                    }
-                    if (Test-Path -LiteralPath $pidFile) {
-                        try {
-                            $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
-                            if ($pidContent -eq "$($restoredProc.Id)" -and -not $restoredProc.HasExited) {
-                                $restoredHealthy = $true
-                                break
-                            }
-                        } catch {}
-                    }
-                    Start-Sleep -Milliseconds 100
-                    $rWait++
+            $restoredProc = $null
+            if ($restartService) {
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份還原檔案，正在重新啟動原版服務..."
+                $restoredProc = if ($argList.Count -gt 0) {
+                    Start-Process -FilePath $exePath -ArgumentList $argList -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
+                } else {
+                    Start-Process -FilePath $exePath -WorkingDirectory $cwd -WindowStyle Hidden -PassThru
                 }
+
+                if ($restoredProc) {
+                    $pidFile = Join-Path $installDir '.server.pid'
+                    $rWait = 0
+                    while ($rWait -lt 50) {
+                        if ($restoredProc.HasExited) {
+                            break
+                        }
+                        if (Test-Path -LiteralPath $pidFile) {
+                            try {
+                                $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
+                                if ($pidContent -eq "$($restoredProc.Id)" -and -not $restoredProc.HasExited) {
+                                    $restoredHealthy = $true
+                                    break
+                                }
+                            } catch {}
+                        }
+                        Start-Sleep -Milliseconds 100
+                        $rWait++
+                    }
+                }
+            } else {
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 已成功自備份還原檔案，非服務程序無需重啟原版服務。"
+                $restoredHealthy = $true
             }
 
             if ($restoredHealthy) {
-                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 原版服務已確認健康就緒 (PID: $($restoredProc.Id))，標記提交並清理更新備份目錄..."
+                $pidMsg = if ($restoredProc) { " (PID: $($restoredProc.Id))" } else { "" }
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 原版服務已確認健康就緒$pidMsg，標記提交並清理更新備份目錄..."
                 $committedMarker = Join-Path $backupDir '.committed'
                 $commitSuccess = $false
                 try {
@@ -4002,16 +4027,15 @@ if ($startupSuccess) {
 
 #[cfg(windows)]
 fn schedule_windows_deferred_restart(
-    spec: &StoppedProcessSpec,
+    spec: Option<&StoppedProcessSpec>,
     install_dir: &Path,
     expected_version: &str,
 ) -> Result<(), String> {
     let my_pid = std::process::id();
     let exec_name = format!("{APP_NAME}.exe");
-    let exe = if spec.exe_path.exists() {
-        spec.exe_path.clone()
-    } else {
-        install_dir.join(&exec_name)
+    let exe = match spec {
+        Some(s) if s.exe_path.exists() => s.exe_path.clone(),
+        _ => install_dir.join(&exec_name),
     };
 
     let ps_script =
@@ -4377,8 +4401,11 @@ pub(crate) fn apply_installation_with_rollback(
                     if is_current_exe {
                         let original_version =
                             fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
-                        let _ =
-                            schedule_windows_deferred_restart(spec, install_dir, &original_version);
+                        let _ = schedule_windows_deferred_restart(
+                            Some(spec),
+                            install_dir,
+                            &original_version,
+                        );
                         println!(
                             "🔄 回滾完成，已排定於更新程序退出後重新啟動 PID {} 對應之原版背景看板服務。",
                             spec.pid
@@ -4420,6 +4447,15 @@ pub(crate) fn apply_installation_with_rollback(
                 let has_supervised = process_plan.stopped_specs.iter().any(|s| s.is_supervised);
                 if !has_supervised {
                     let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
+                }
+                if is_current_exe
+                    && !process_plan.stopped_specs.iter().any(|s| !s.is_supervised)
+                    && !is_windows_service_runner()
+                    && !process_plan.stopped_specs.iter().any(|s| s.is_supervised)
+                {
+                    let original_version =
+                        fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
+                    let _ = schedule_windows_deferred_restart(None, install_dir, &original_version);
                 }
             }
         }
@@ -4546,7 +4582,8 @@ pub(crate) fn apply_installation_with_rollback(
         } else {
             #[cfg(windows)]
             if is_current_exe {
-                match schedule_windows_deferred_restart(spec, install_dir, &expected_version) {
+                match schedule_windows_deferred_restart(Some(spec), install_dir, &expected_version)
+                {
                     Ok(_) => {
                         println!(
                             "🔄 已排定於更新程序退出後由移交守護進程自動啟動 PID {} 對應之新版背景看板服務。",
@@ -4600,6 +4637,32 @@ pub(crate) fn apply_installation_with_rollback(
                     log_update("ERROR", "RESTART", &msg);
                     restart_errors.push(msg);
                 }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    if is_current_exe
+        && !process_plan.stopped_specs.iter().any(|s| !s.is_supervised)
+        && !is_windows_service_runner()
+        && !process_plan.stopped_specs.iter().any(|s| s.is_supervised)
+    {
+        match schedule_windows_deferred_restart(None, install_dir, &expected_version) {
+            Ok(_) => {
+                println!("🔄 已排定移交守護進程於更新程序退出後驗證新版執行檔置換並完成提交。");
+                log_update(
+                    "INFO",
+                    "RESTART",
+                    &format!("已排定移交守護進程於更新程序退出後驗證新版執行檔 (目標版本: {expected_version}) 並提交清理備份"),
+                );
+            }
+            Err(err) => {
+                let msg = format!("排定 Windows 移交驗證進程失敗: {err}");
+                eprintln!(
+                    "⚠️ 更新檔案寫入完成，但排定移交驗證進程失敗: {err}；請手動確認新版狀態。"
+                );
+                log_update("ERROR", "RESTART", &msg);
+                restart_errors.push(msg);
             }
         }
     }
@@ -4736,8 +4799,11 @@ pub(crate) fn apply_installation_with_rollback(
                     if is_current_exe {
                         let original_version =
                             fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
-                        let _ =
-                            schedule_windows_deferred_restart(spec, install_dir, &original_version);
+                        let _ = schedule_windows_deferred_restart(
+                            Some(spec),
+                            install_dir,
+                            &original_version,
+                        );
                         continue;
                     }
                     let _ = restart_dashboard_instance(spec, install_dir);
@@ -4791,6 +4857,15 @@ pub(crate) fn apply_installation_with_rollback(
                 if !has_supervised {
                     let _ = fs::remove_file(install_dir.join(".service_restart_pending"));
                 }
+                if is_current_exe
+                    && !process_plan.stopped_specs.iter().any(|s| !s.is_supervised)
+                    && !is_windows_service_runner()
+                    && !process_plan.stopped_specs.iter().any(|s| s.is_supervised)
+                {
+                    let original_version =
+                        fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
+                    let _ = schedule_windows_deferred_restart(None, install_dir, &original_version);
+                }
             }
 
             return Err(UpdateError::Failure(format!(
@@ -4805,7 +4880,7 @@ pub(crate) fn apply_installation_with_rollback(
         {
             is_windows_service_runner()
                 || process_plan.stopped_specs.iter().any(|s| s.is_supervised)
-                || (is_current_exe && process_plan.stopped_specs.iter().any(|s| !s.is_supervised))
+                || is_current_exe
         }
         #[cfg(not(windows))]
         {
@@ -7110,7 +7185,7 @@ update_check_interval: 5 # check every 5 days
             Path::new("C:\\test"),
             Path::new("C:\\test\\bin\\token-usage-insights.exe"),
             "v0.9.6",
-            &spec,
+            Some(&spec),
         )
         .expect("產生移交重啟腳本應成功");
 
@@ -7162,6 +7237,24 @@ update_check_interval: 5 # check every 5 days
         assert!(script.contains("新版看板進程已確認健康就緒"));
         assert!(script.contains("自備份自動回滾"));
         assert!(script.contains(".server.pid"));
+    }
+
+    #[test]
+    fn build_windows_deferred_restart_script_handles_none_spec() {
+        let script = build_windows_deferred_restart_script(
+            8888,
+            Path::new("C:\\install"),
+            Path::new("C:\\install\\token-usage-insights.exe"),
+            "v0.9.6",
+            None,
+        )
+        .expect("產生無服務移交驗證腳本應成功");
+
+        assert!(script.contains("$updaterPid = 8888;"));
+        assert!(script.contains("$restartService = $false;"));
+        assert!(script.contains("$argList = @();"));
+        assert!(script.contains("非服務程序無需重啟進程"));
+        assert!(script.contains("非服務程序無需重啟原版服務"));
     }
 
     #[tokio::test]

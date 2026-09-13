@@ -119,6 +119,12 @@ if [[ "$install_service" == true ]]; then
         printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/%/%%/g'
       }
 
+      # General unit value unescaping (when reading existing Environment values):
+      # Unescapes %%, \", and \\ back to raw shell values
+      systemd_unescape_value() {
+        printf '%s' "$1" | sed -e 's/%%/%/g' -e 's/\\"/"/g' -e 's/\\\\/\\/g'
+      }
+
       # Command-line escaping (for ExecStart):
       # Escapes \, ", %, and $ (which systemd expands in ExecStart command lines)
       systemd_escape_exec() {
@@ -135,27 +141,28 @@ if [[ "$install_service" == true ]]; then
         if [[ -z "${TOKEN_USAGE_INSIGHTS_AUTO_UPDATE+x}" ]]; then
           existing_auto_update="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$existing_auto_update" ]]; then
-            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$existing_auto_update"
+            TOKEN_USAGE_INSIGHTS_AUTO_UPDATE="$(systemd_unescape_value "$existing_auto_update")"
           fi
         fi
         if [[ -z "${TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS+x}" ]]; then
           existing_interval="$(sed -n -E 's/^[[:space:]]*Environment="?TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$existing_interval" ]]; then
-            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$existing_interval"
+            TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS="$(systemd_unescape_value "$existing_interval")"
           fi
         fi
         for var in "${runtime_vars[@]}"; do
           if [[ -z "${!var+x}" ]]; then
             existing_val="$(sed -n -E "s/^[[:space:]]*Environment=\"?${var}=([^\"]*)\"?\$/\\1/p" "$service_file" | tail -n 1)"
             if [[ -n "$existing_val" ]]; then
-              printf -v "$var" '%s' "$existing_val"
+              existing_unescaped="$(systemd_unescape_value "$existing_val")"
+              printf -v "$var" '%s' "$existing_unescaped"
             fi
           fi
         done
         if [[ -z "${CORS_ALLOWED_ORIGINS:-}" && -z "${CORS_ALLOWED_ORIGINS+x}" ]]; then
           legacy_cors="$(sed -n -E 's/^[[:space:]]*Environment="?CORS_ALLOW_ORIGIN=([^"]*)"?$/\1/p' "$service_file" | tail -n 1)"
           if [[ -n "$legacy_cors" ]]; then
-            CORS_ALLOWED_ORIGINS="$legacy_cors"
+            CORS_ALLOWED_ORIGINS="$(systemd_unescape_value "$legacy_cors")"
           fi
         fi
       fi
@@ -194,7 +201,12 @@ WantedBy=default.target
 SERVICE
 
       systemctl --user daemon-reload
-      systemctl --user enable --now "${app_name}.service"
+      systemctl --user enable "${app_name}.service"
+      if systemctl --user is-active --quiet "${app_name}.service"; then
+        systemctl --user restart "${app_name}.service"
+      else
+        systemctl --user start "${app_name}.service"
+      fi
       ;;
     Darwin)
       if ! command -v launchctl >/dev/null 2>&1; then

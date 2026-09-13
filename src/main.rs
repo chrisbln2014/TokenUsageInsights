@@ -499,15 +499,26 @@ async fn main() {
                     updater::log_update(
                         "INFO",
                         "RESTART",
-                        &format!("未執行安裝（其他更新程序已完成或已是最新版本），維持目前版本 v{current} 與服務運作"),
+                        &format!("未執行安裝（其他更新程序已完成或已是最新版本），維持目前版本 v{current} 並重新啟動服務"),
                     );
-                    return;
+                    // 目前伺服器已為自動更新優雅停機：此處必須重新啟動，否則手動啟動且未受監管的安裝會永久停止
+                    updater::restart_current_process(&target_exe, &args);
                 }
                 Ok(_outcome) => {
                     let installed = install_dir
                         .as_deref()
                         .map(updater::get_installed_version)
                         .unwrap_or_else(|| "最新版".to_string());
+                    // 重啟前再次仲裁：若終止訊號在安裝完成後才抵達，應依停機要求停止而非重啟
+                    if signal_received.load(std::sync::atomic::Ordering::SeqCst) {
+                        println!("👋 更新已完成但收到終止信號，依停機要求停止服務。");
+                        updater::log_update(
+                            "INFO",
+                            "RESTART",
+                            "更新已完成但收到終止信號；停止服務且不重啟",
+                        );
+                        return;
+                    }
                     println!("🔄 更新完成，正在自動重啟 Token 戰情室至新版 v{installed}...");
                     updater::log_update(
                         "INFO",

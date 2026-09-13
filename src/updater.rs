@@ -5267,6 +5267,17 @@ fn apply_installation_with_rollback(
     };
 
     if is_async_restart {
+        // 新版看板可能已完成移交提交並清理備份：此時不得重寫移交標記，
+        // 否則 safe_write_file 會重建僅含標記的備份目錄，導致後續更新永遠因備份已存在而拒絕執行
+        if !backup_dir.exists() || backup_dir.join(".committed").exists() {
+            log_update(
+                "INFO",
+                "CLEANUP",
+                "移交交易已由新版看板完成提交與清理；無需重寫移交標記",
+            );
+            return Ok(server_restarted);
+        }
+
         let handoff_marker = backup_dir.join(".handing_off");
         let now_str = Utc::now().to_rfc3339();
         let _ = safe_write_file(&handoff_marker, now_str.as_bytes());
@@ -5665,6 +5676,23 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         let attempt_file = backup_dir.join(".startup_attempt");
         if is_valid {
             if attempt_file.exists() {
+                // 標記存在僅代表新版已開始啟動：若該進程仍在運行，代表其仍處於啟動／健康確認窗口，
+                // 此時不得回滾（否則並行的第二次 update 會把仍在運作的新版降回舊版）
+                let attempt_pid = fs::read_to_string(&attempt_file)
+                    .ok()
+                    .and_then(|content| content.trim().parse::<u32>().ok());
+                if attempt_pid.map(is_process_alive).unwrap_or(false) {
+                    log_update(
+                        "INFO",
+                        "STARTUP_RECOVERY",
+                        &format!(
+                            "偵測到新版進程 (PID: {:?}) 仍在啟動／健康確認中，暫不回滾並等待移交完成",
+                            attempt_pid
+                        ),
+                    );
+                    drop(recovery_lock);
+                    return RecoveryStatus::CleanedOrNoBackup;
+                }
                 log_update(
                     "WARN",
                     "STARTUP_RECOVERY",
@@ -8464,6 +8492,40 @@ update_check_interval: 5 # check every 5 days
             "token-usage-insights".to_string(),
             "--version".to_string()
         ]));
+    }
+
+    #[test]
+    fn attempt_startup_recovery_defers_when_attempting_process_is_alive() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-startup-attempt-alive-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION\n").unwrap();
+        fs::write(backup_dir.join(".handing_off"), Utc::now().to_rfc3339()).unwrap();
+        // 啟動嘗試標記指向仍在運行的進程（此測試行程本身）：代表新版仍處於啟動／健康確認窗口
+        fs::write(
+            backup_dir.join(".startup_attempt"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let args = vec!["token-usage-insights".to_string()];
+        let status = attempt_startup_recovery(&install_dir, &args);
+
+        assert_eq!(status, RecoveryStatus::CleanedOrNoBackup);
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "啟動嘗試所屬進程仍存活時不得回滾（並行的第二次 update 不應把仍在運作的新版降回舊版）"
+        );
+        assert!(backup_dir.exists(), "不得清理仍進行中的移交交易");
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[test]

@@ -255,7 +255,17 @@ async fn main() {
     if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
         updater::detect_environment()
     {
-        updater::complete_handoff_and_commit_if_needed(&install_dir);
+        // Windows 服務 runner 監管模式下，更新提交與備份清理由 runner 於新版進程確認健康就緒後執行；
+        // 此處提早提交會刪除備份而使 runner 失去回滾依據，無法在服務後續啟動失敗時還原舊版
+        if updater::is_windows_service_runner() {
+            updater::log_update(
+                "INFO",
+                "STARTUP",
+                "偵測到 Windows 服務 runner 監管模式；更新提交與備份清理交由 runner 於健康驗證通過後執行",
+            );
+        } else {
+            updater::complete_handoff_and_commit_if_needed(&install_dir);
+        }
     }
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {

@@ -172,6 +172,32 @@ function Exit-WithError {
     exit 1
 }
 
+function Exit-WithRollback {
+    param(
+        [string]$InstallDir,
+        [string]$Message
+    )
+
+    # 啟動驗證失敗時若留存更新備份，先自 .backup 回滾再退出：
+    # 否則備份會殘留並讓後續重試持續撞上同一驗證失敗，服務永遠無法回到可用版本
+    $backupDir = Join-Path $InstallDir ".backup"
+    $lockFile = Join-Path $InstallDir ".update.lock"
+    if (Test-Path -LiteralPath $backupDir) {
+        if (Test-IsUpdateLockHeld -LockFile $lockFile) {
+            Write-Warning "偵測到其他更新程序仍持有更新鎖，保留備份目錄且不執行回滾，避免與進行中的更新互相破壞。"
+        } else {
+            Write-Warning "啟動驗證失敗 ($Message)；正在自備份回滾至先前版本..."
+            if (Restore-ServiceBackup -InstallDir $InstallDir) {
+                Write-Host "已成功自備份回滾至先前版本；服務將於下次啟動時載入原版。"
+            } else {
+                Write-Warning "自備份回滾失敗，已保留備份目錄以供手動修復。"
+            }
+        }
+    }
+
+    Exit-WithError -Message $Message
+}
+
 function Test-IsRollbackFailed {
     param(
         [string]$InstallDir
@@ -284,6 +310,13 @@ function Restore-ServiceBackup {
             ".service.env"
         )
 
+        # 驗證備份清單僅包含受管理項目，防範遭竄改的清單以相對或絕對路徑跳出安裝目錄
+        foreach ($rel in $originalItems) {
+            if ($managedItems -notcontains $rel) {
+                throw "備份清單包含非受管理項目 ($rel)，拒絕還原以防範路徑穿越攻擊。"
+            }
+        }
+
         # 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
         foreach ($m in $managedItems) {
             if ($originalItems -notcontains $m) {
@@ -377,7 +410,7 @@ function Wait-ForExecutableReady {
     }
 
     if (-not $exeReady) {
-        Exit-WithError -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
+        Exit-WithRollback -InstallDir $InstallDir -Message "等待執行檔就緒逾時（15 秒），執行檔仍未就緒或臨時替換檔殘留。已嘗試自備份回滾，保留就緒與重啟標記以利後續復原，保持停止狀態退出。"
     }
 
     # 2.5 驗證執行檔版本是否與 VERSION 檔案一致（若存在 VERSION 檔案），防止載入未完成置換之舊版二進位檔
@@ -399,7 +432,7 @@ function Wait-ForExecutableReady {
                 $exited = $proc.WaitForExit(5000)
                 if (-not $exited) {
                     try { $proc.Kill() } catch {}
-                    Exit-WithError -Message "執行檔版本檢查逾時（5 秒），二進位檔可能異常；中止啟動以確保安全。"
+                    Exit-WithRollback -InstallDir $InstallDir -Message "執行檔版本檢查逾時（5 秒），二進位檔可能異常；已嘗試自備份回滾並中止啟動以確保安全。"
                 }
                 $stdout = $proc.StandardOutput.ReadToEnd()
                 $stderr = $proc.StandardError.ReadToEnd()
@@ -407,10 +440,10 @@ function Wait-ForExecutableReady {
                 $tokens = $verOutput -split '\s+'
                 $actualVer = if ($tokens.Count -gt 0) { $tokens[-1].TrimStart('v').TrimStart('V') } else { '' }
                 if ($actualVer -ne $expectedVer) {
-                    Exit-WithError -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符，中止啟動以確保安全。"
+                    Exit-WithRollback -InstallDir $InstallDir -Message "執行檔版本 ($verOutput) 與 VERSION 檔案 ($expectedVer) 不符；已嘗試自備份回滾並中止啟動以確保安全。"
                 }
             } else {
-                Exit-WithError -Message "無法啟動執行檔進行版本檢查，中止啟動以確保安全。"
+                Exit-WithRollback -InstallDir $InstallDir -Message "無法啟動執行檔進行版本檢查；已嘗試自備份回滾並中止啟動以確保安全。"
             }
         }
     }

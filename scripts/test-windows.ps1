@@ -503,6 +503,30 @@ try {
 
     $psExe = if (Get-Command "powershell.exe" -ErrorAction SilentlyContinue) { "powershell.exe" } else { "pwsh" }
 
+    # 以暫存 .ps1 檔執行測試腳本：多行腳本若以 -Command 傳遞，命令列引號轉義會損毀內容
+    function Invoke-ScopedScript {
+        param(
+            [string]$ScriptText,
+            [string]$Name
+        )
+
+        $scriptPath = Join-Path $Root ("{0}-{1}.ps1" -f $Name, [guid]::NewGuid())
+        [System.IO.File]::WriteAllText($scriptPath, $ScriptText, (New-Object System.Text.UTF8Encoding($true)))
+
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $scriptOutput = & $psExe -NoProfile -File $scriptPath 2>&1
+            $exitCode = $LASTEXITCODE
+            if ($scriptOutput) {
+                $scriptOutput | ForEach-Object { Write-Host $_ }
+            }
+            return $exitCode
+        } finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+    }
+
     foreach ($case in $cases) {
         [Environment]::SetEnvironmentVariable($case.EnvironmentName, $case.Directory)
         $payload = [ordered]@{
@@ -806,7 +830,7 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     Set-Content -LiteralPath $readyExePath -Value "binary"
     Set-Content -LiteralPath $tempExePath -Value "temp"
 
-    $helperFunctions = @("Exit-WithError", "Test-IsRollbackFailed", "Test-IsUpdateLockHeld", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady")
+    $helperFunctions = @("Exit-WithError", "Exit-WithRollback", "Test-IsRollbackFailed", "Test-IsUpdateLockHeld", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady", "Restore-ServiceBackup")
     $fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($args[0].Name -in $helperFunctions) }, $true)
     $funcCode = (($fnDefs | ForEach-Object { $_.Extent.Text }) -join "`n`n").Replace("900", "2").Replace("150", "2")
     $testScript = @"
@@ -814,8 +838,8 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
 $funcCode
 Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
 "@
-    $timeoutProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
-    Assert-Equal 1 $timeoutProc.ExitCode "Wait-ForExecutableReady should exit with code 1 on timeout when temp replacement remains."
+    $timeoutExit = Invoke-ScopedScript -ScriptText $testScript -Name "wait-executable-ready-timeout"
+    Assert-Equal 1 $timeoutExit "Wait-ForExecutableReady should exit with code 1 on timeout when temp replacement remains."
     Assert-True (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should preserve .update_ready marker on timeout."
     Assert-True (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should preserve .service_restart_pending marker on timeout."
 
@@ -824,15 +848,72 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     New-Item -ItemType Directory -Force -Path $testBackupDir | Out-Null
     $testRollbackFailedFile = Join-Path $testBackupDir ".rollback_failed"
     Set-Content -LiteralPath $testRollbackFailedFile -Value "error"
-    $rollbackFailProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
-    Assert-Equal 1 $rollbackFailProc.ExitCode "Wait-ForExecutableReady should exit with code 1 immediately when .rollback_failed exists."
+    $rollbackFailExit = Invoke-ScopedScript -ScriptText $testScript -Name "wait-executable-ready-rollback-failed"
+    Assert-Equal 1 $rollbackFailExit "Wait-ForExecutableReady should exit with code 1 immediately when .rollback_failed exists."
     Remove-Item -LiteralPath $testBackupDir -Recurse -Force
 
     Remove-Item -LiteralPath $tempExePath -Force
-    $successProc = Start-Process -FilePath $psExe -ArgumentList "-NoProfile", "-Command", $testScript -Wait -PassThru
-    Assert-Equal 0 $successProc.ExitCode "Wait-ForExecutableReady should exit with code 0 when executable is ready."
+    $successExit = Invoke-ScopedScript -ScriptText $testScript -Name "wait-executable-ready-success"
+    Assert-Equal 0 $successExit "Wait-ForExecutableReady should exit with code 0 when executable is ready."
     Assert-Equal $false (Test-Path -LiteralPath $readyMarkerFile) "Wait-ForExecutableReady should clean up .update_ready on success."
     Assert-Equal $false (Test-Path -LiteralPath $pendingMarkerFile) "Wait-ForExecutableReady should clean up .service_restart_pending on success."
+
+    # 5a. Exit-WithRollback 必須先自備份回滾再退出，避免備份殘留讓服務永遠無法恢復
+    $rollbackInstallDir = Join-Path $Root "exit-with-rollback-tests"
+    $rollbackBackupDir = Join-Path $rollbackInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $rollbackBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $rollbackInstallDir "VERSION") -Value "v0.9.6-broken"
+    Set-Content -LiteralPath (Join-Path $rollbackBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $rollbackBackupDir ".manifest") -Value "VERSION"
+
+    $rollbackTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+Exit-WithRollback -InstallDir '$rollbackInstallDir' -Message 'startup validation failure'
+"@
+    $rollbackExit = Invoke-ScopedScript -ScriptText $rollbackTestScript -Name "exit-with-rollback"
+    Assert-Equal 1 $rollbackExit "Exit-WithRollback should exit with code 1 after rolling back."
+    Assert-Equal $false (Test-Path -LiteralPath $rollbackBackupDir) "Exit-WithRollback should consume .backup after successful rollback."
+    Assert-Equal "v0.9.5" ((Get-Content -LiteralPath (Join-Path $rollbackInstallDir "VERSION") -Raw).Trim()) "Exit-WithRollback should restore the previous VERSION before exiting."
+
+    # 5a-2. 其他更新程序仍持有更新鎖時不得回滾，避免與進行中的更新互相破壞
+    $lockedInstallDir = Join-Path $Root "exit-with-rollback-locked-tests"
+    $lockedBackupDir = Join-Path $lockedInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $lockedBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $lockedInstallDir "VERSION") -Value "v0.9.6-broken"
+    Set-Content -LiteralPath (Join-Path $lockedBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $lockedBackupDir ".manifest") -Value "VERSION"
+
+    $lockedTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+`$lockStream = [System.IO.File]::Open((Join-Path '$lockedInstallDir' ".update.lock"), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+Exit-WithRollback -InstallDir '$lockedInstallDir' -Message 'startup validation failure'
+"@
+    $lockedExit = Invoke-ScopedScript -ScriptText $lockedTestScript -Name "exit-with-rollback-locked"
+    Assert-Equal 1 $lockedExit "Exit-WithRollback should still exit with code 1 when the update lock is held."
+    Assert-True (Test-Path -LiteralPath $lockedBackupDir) "Exit-WithRollback must keep the backup when another updater holds the update lock."
+    Assert-Equal "v0.9.6-broken" ((Get-Content -LiteralPath (Join-Path $lockedInstallDir "VERSION") -Raw).Trim()) "Exit-WithRollback must not roll back while another updater holds the update lock."
+
+    # 5b. Restore-ServiceBackup 必須拒絕含非受管理項目的備份清單（路徑穿越防護）
+    $traversalRoot = Join-Path $Root "manifest-traversal-tests"
+    $traversalInstallDir = Join-Path $traversalRoot "install"
+    $traversalBackupDir = Join-Path $traversalInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $traversalBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $traversalInstallDir "VERSION") -Value "v0.9.6-broken"
+    Set-Content -LiteralPath (Join-Path $traversalInstallDir "pwned.txt") -Value "payload"
+    Set-Content -LiteralPath (Join-Path $traversalBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $traversalBackupDir ".manifest") -Value "VERSION`n../pwned.txt"
+
+    $traversalTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+if (Restore-ServiceBackup -InstallDir '$traversalInstallDir') { exit 2 } else { exit 0 }
+"@
+    $traversalExit = Invoke-ScopedScript -ScriptText $traversalTestScript -Name "manifest-traversal"
+    Assert-Equal 0 $traversalExit "Restore-ServiceBackup should fail closed on non-managed manifest entries."
+    Assert-Equal $false (Test-Path -LiteralPath (Join-Path $traversalRoot "pwned.txt")) "Restore-ServiceBackup must not write outside the install directory via manifest traversal."
+    Assert-Equal "v0.9.6-broken" ((Get-Content -LiteralPath (Join-Path $traversalInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must abort the whole restore when the manifest contains a non-managed entry."
 
     # 6. Verify run-service.ps1 loop gates launch when update markers exist
     $loopGateAst = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
@@ -887,6 +968,10 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     $fnDefRestore = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Restore-ServiceBackup" }, $true)
     Assert-True ($null -ne $fnDefRestore -and $fnDefRestore.Count -eq 1) "run-service.ps1 should define Restore-ServiceBackup."
 
+    $fnDefExitWithRollback = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Exit-WithRollback" }, $true)
+    Assert-True ($null -ne $fnDefExitWithRollback -and $fnDefExitWithRollback.Count -eq 1) "run-service.ps1 should define Exit-WithRollback."
+    Assert-True ($fnDefExitWithRollback[0].Extent.Text -match '(?s)Restore-ServiceBackup.*Exit-WithError') "Exit-WithRollback must restore the backup before exiting."
+
     Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.sh"') "Restore-ServiceBackup managedItems must contain install.sh."
@@ -894,6 +979,18 @@ Wait-ForExecutableReady -InstallDir '$readyTestDir' -ExePath '$readyExePath'
     Assert-True ($fnDefRestore[0].Extent.Text -match '"\.install_marker"') "Restore-ServiceBackup managedItems must contain .install_marker."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"\.service\.env"') "Restore-ServiceBackup managedItems must contain .service.env."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Remove-Item.*-LiteralPath \$dst.*Copy-Item') "Restore-ServiceBackup must remove destination items before copying to prevent mixed files."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel') "Restore-ServiceBackup must validate manifest entries against managedItems."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must reject non-managed manifest entries before touching the install directory."
+    $readyText = $fnDefReady[0].Extent.Text
+    Assert-Equal 4 ([regex]::Matches($readyText, 'Exit-WithRollback -InstallDir').Count) "Wait-ForExecutableReady must roll back the backup before every post-lock startup validation failure."
+    Assert-Equal 2 ([regex]::Matches($readyText, 'Exit-WithError -Message').Count) "Wait-ForExecutableReady must only exit without rollback for the rollback-failed check and the update lock wait timeout."
+    Assert-True ($readyText -match '(?s)等待執行檔就緒逾時.*Exit-WithRollback') "Wait-ForExecutableReady must roll back the backup before exiting on executable-ready timeout."
+    Assert-True ($readyText -match '(?s)版本檢查逾時.*Exit-WithRollback') "Wait-ForExecutableReady must roll back the backup before exiting on version check timeout."
+    Assert-True ($readyText -match '(?s)與 VERSION 檔案 \(\$expectedVer\) 不符；已嘗試自備份回滾並中止啟動以確保安全') "Wait-ForExecutableReady must roll back the backup when the installed version mismatches VERSION."
+    Assert-True ($readyText -match '(?s)無法啟動執行檔進行版本檢查；已嘗試自備份回滾並中止啟動以確保安全') "Wait-ForExecutableReady must roll back the backup when the version probe cannot start."
+    $lockWaitSegment = $readyText.Substring(0, $readyText.IndexOf('# 2. 等待 self_replace'))
+    Assert-True ($lockWaitSegment -match 'Exit-WithError -Message "等待更新程序釋放更新鎖逾時') "Wait-ForExecutableReady must exit on update lock wait timeout."
+    Assert-True (-not ($lockWaitSegment -match 'Exit-WithRollback')) "Wait-ForExecutableReady must not roll back while another updater may still hold the update lock."
 
     Assert-True ($whileBodyText -match '(?s)Start-Process.*Test-IsProcessHealthy.*Restore-ServiceBackup') "run-service.ps1 main while loop must verify process health before committing backup and restore on failure."
     Assert-True ($whileBodyText -match '(?s)Test-IsProcessHealthy.*\.committed.*Remove-Item') "run-service.ps1 must mark .committed before removing .backup."

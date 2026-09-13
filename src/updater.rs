@@ -2188,6 +2188,15 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 備份目錄中的控制標記檔（非安裝項目），還原時必須略過而非視為還原來源
+const BACKUP_MARKER_FILES: &[&str] = &[
+    ".manifest",
+    ".committed",
+    ".handing_off",
+    ".startup_attempt",
+    ".rollback_failed",
+];
+
 const MANAGED_ITEMS: &[&str] = &[
     APP_NAME,
     #[cfg(windows)]
@@ -2311,6 +2320,15 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         .filter(|s| !s.is_empty())
         .collect();
 
+    // 嚴格驗證備份清單僅包含受管理項目，防範遭竄改的清單以相對路徑或絕對路徑跳出安裝目錄
+    for item in &original_items {
+        if !MANAGED_ITEMS.contains(&item.as_str()) {
+            return Err(format!(
+                "備份清單包含非受管理項目 ({item})，拒絕還原以防範路徑穿越攻擊"
+            ));
+        }
+    }
+
     // 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
     for &item in MANAGED_ITEMS {
         if !original_items.contains(item) {
@@ -2333,8 +2351,16 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
     for entry in fs::read_dir(backup_dir).map_err(|e| format!("讀取備份目錄失敗: {e}"))? {
         let entry = entry.map_err(|e| format!("讀取備份項目失敗: {e}"))?;
         let name = entry.file_name();
-        if name == ".manifest" {
+        let name_str = name.to_str().ok_or_else(|| {
+            format!("備份目錄包含非 UTF-8 檔名之項目 ({name:?})，拒絕還原以防範路徑穿越攻擊")
+        })?;
+        if BACKUP_MARKER_FILES.contains(&name_str) {
             continue;
+        }
+        if !MANAGED_ITEMS.contains(&name_str) {
+            return Err(format!(
+                "備份目錄包含非受管理項目 ({name_str})，拒絕還原以防範路徑穿越攻擊"
+            ));
         }
         let src = entry.path();
         let dst = install_dir.join(&name);
@@ -2735,7 +2761,8 @@ pub(crate) async fn run_update_in_dir(
     options: UpdateOptions,
 ) -> Result<UpdateOutcome, UpdateError> {
     // 若非純檢查，在開始任何更新操作前先取得安裝目錄之獨占鎖
-    let _lock = if !options.check_only {
+    // 鎖會移交給安裝流程，於檔案替換完成後、任何重啟動作前釋放，避免重啟之看板進程等待鎖而無法就緒
+    let update_lock = if !options.check_only {
         Some(match UpdateLock::try_acquire(install_dir) {
             Ok(l) => l,
             Err(e) => {
@@ -2968,8 +2995,12 @@ pub(crate) async fn run_update_in_dir(
             }
 
             let backup_dir = install_dir.join(".backup");
-            let server_restarted =
-                apply_installation_with_rollback(&release_root, &install_dir, &backup_dir)?;
+            let server_restarted = apply_installation_with_rollback(
+                &release_root,
+                &install_dir,
+                &backup_dir,
+                update_lock,
+            )?;
 
             println!("🎉 成功更新至版本 {remote_version}！");
             log_update("INFO", "INSTALL", &format!("成功更新至 {remote_version}"));
@@ -3993,6 +4024,12 @@ if ($startupSuccess) {
         try {
             $originalItems = @(Get-Content -LiteralPath $manifestPath | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             $managedItems = @('token-usage-insights', 'token-usage-insights.exe', 'static', 'pricing.csv', 'shell', 'scripts', 'install.sh', 'install.ps1', 'VERSION', 'README.md', 'LICENSE', '.install_marker', '.service.env')
+            # 驗證備份清單僅包含受管理項目，防範遭竄改的清單以相對或絕對路徑跳出安裝目錄
+            foreach ($rel in $originalItems) {
+                if ($managedItems -notcontains $rel) {
+                    throw "備份清單包含非受管理項目 ($rel)，拒絕還原以防範路徑穿越攻擊"
+                }
+            }
             foreach ($m in $managedItems) {
                 if ($originalItems -notcontains $m) {
                     $p = Join-Path $installDir $m
@@ -4312,11 +4349,16 @@ fn restart_windows_supervised_service(
     restart_dashboard_instance(spec, install_dir).map(Some)
 }
 
-pub(crate) fn apply_installation_with_rollback(
+fn apply_installation_with_rollback(
     release_root: &Path,
     install_dir: &Path,
     backup_dir: &Path,
+    update_lock: Option<UpdateLock>,
 ) -> Result<bool, UpdateError> {
+    // 呼叫端持有之獨占更新鎖；檔案替換完成後、任何重啟動作前必須釋放，
+    // 否則被重啟之看板進程會在啟動救援階段等待鎖而無法於時限內就緒
+    let mut update_lock = update_lock;
+
     println!("💾 正在備份現有安裝...");
     if let Err(e) = backup_installation(install_dir, backup_dir) {
         log_update("ERROR", "BACKUP", &e);
@@ -4480,6 +4522,9 @@ pub(crate) fn apply_installation_with_rollback(
             log_update("INFO", "ROLLBACK", "回滾成功");
             let _ = fs::remove_dir_all(backup_dir);
 
+            // 回滾完成且備份已清理，於重啟原版進程前釋放更新鎖，讓其啟動救援階段可立即取得鎖並完成就緒
+            drop(update_lock.take());
+
             // 逐一處理先前停止之進程，獨立處理監管與非監管進程
             for spec in &process_plan.stopped_specs {
                 if spec.is_supervised {
@@ -4569,6 +4614,21 @@ pub(crate) fn apply_installation_with_rollback(
     };
     let _ = &expected_version;
     let _ = is_current_exe;
+
+    // 檔案已完整替換：先寫入移交標記，再釋放更新鎖，最後才執行重啟。
+    // 被重啟之看板進程會在啟動救援階段嘗試取得更新鎖並檢查移交標記：
+    //   - 若更新鎖仍被持有，其將等待鎖而無法於 5 秒內建立 .server.pid，重啟會被誤判為失敗並觸發回滾；
+    //   - 若缺少移交標記，其將誤判更新尚未完成，反而把剛安裝的新版回滾為舊版。
+    // 因此移交標記必須先於鎖釋放寫入；提交階段會再次寫入以延長健康驗證窗口
+    let handoff_marker = backup_dir.join(".handing_off");
+    if let Err(e) = safe_write_file(&handoff_marker, Utc::now().to_rfc3339().as_bytes()) {
+        log_update(
+            "WARN",
+            "RESTART",
+            &format!("寫入移交標記失敗 ({e})；重啟期間之新版看板可能誤判更新未完成並回滾"),
+        );
+    }
+    drop(update_lock.take());
 
     let mut server_restarted = false;
     let mut restart_errors: Vec<String> = Vec::new();
@@ -4803,6 +4863,18 @@ pub(crate) fn apply_installation_with_rollback(
     // 3. 若重啟失敗，此時備份依然完整留存，執行安全自動回滾恢復原版本並重新啟動原服務
     if !restart_errors.is_empty() {
         let combined = restart_errors.join("; ");
+
+        // 新版看板可能已於移交協定中確認健康並提交（備份已清理），此時無法再回滾；
+        // 必須改以明確錯誤回報並保留已提交之更新，避免誤寫 .rollback_failed 標記而阻斷服務啟動
+        if !backup_dir.exists() {
+            let msg = format!(
+                "重啟部分看板進程失敗 ({combined})，但備份目錄已由新版看板於移交協定中提交並清理；保留已提交之更新，請手動確認服務狀態"
+            );
+            eprintln!("⚠️ {msg}");
+            log_update("WARN", "RESTART", &msg);
+            return Err(UpdateError::Failure(msg));
+        }
+
         eprintln!("❌ 重啟新版看板服務失敗: {combined}，正在自動回滾至先前版本...");
         log_update(
             "ERROR",
@@ -5043,7 +5115,25 @@ pub(crate) fn apply_installation_with_rollback(
         return Ok(server_restarted);
     }
 
+    // 被重啟之新版看板可能已於移交協定中確認健康並完成提交（備份目錄已清理），此時無需重複提交
+    if !backup_dir.exists() {
+        log_update(
+            "INFO",
+            "CLEANUP",
+            "備份目錄已由新版看板於移交協定中提交並清理，視為更新提交完成",
+        );
+        return Ok(server_restarted);
+    }
+
     if let Err(commit_err) = safe_write_file(&backup_dir.join(".committed"), b"committed") {
+        if !backup_dir.exists() {
+            log_update(
+                "INFO",
+                "CLEANUP",
+                "備份目錄於提交期間已由新版看板清理，視為更新提交完成",
+            );
+            return Ok(server_restarted);
+        }
         let msg = format!(
             "寫入提交確認標記失敗 ({commit_err})；為避免啟動復原錯誤回滾，保留備份目錄 {backup_dir:?}"
         );
@@ -5151,8 +5241,8 @@ pub(crate) fn get_target_exe(install_dir: &Path) -> PathBuf {
     install_dir.join(exec_name)
 }
 
-#[allow(dead_code)] // 於 Windows 服務重啟流程使用，並於跨平台單元測試驗證環境變數判定
-fn is_windows_service_runner() -> bool {
+#[allow(dead_code)] // 於 Windows 服務重啟流程、主程序移交提交判定與跨平台單元測試使用
+pub(crate) fn is_windows_service_runner() -> bool {
     if let Ok(val) = std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE") {
         let clean = val.trim();
         if clean == "0" || clean.eq_ignore_ascii_case("false") {
@@ -5572,25 +5662,41 @@ pub fn complete_handoff_and_commit_if_needed(install_dir: &Path) {
         return;
     }
     let handoff_marker = backup_dir.join(".handing_off");
-    if handoff_marker.exists() {
-        log_update(
-            "INFO",
-            "STARTUP",
-            "新版看板服務已確認啟動健康就緒，完成移交握手並提交更新",
-        );
-        let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
-        let _ = fs::remove_file(&handoff_marker);
-        let _ = fs::remove_file(backup_dir.join(".startup_attempt"));
-        if let Err(e) = fs::remove_dir_all(&backup_dir) {
+    if !handoff_marker.exists() {
+        return;
+    }
+
+    // 提交與清理會刪除備份目錄並改寫更新狀態，必須在獨占更新鎖保護下進行；
+    // 若鎖已被其他更新程序持有，交由該程序依其流程處理，避免 TOCTOU 狀態損毀
+    let _lock = match UpdateLock::try_acquire(install_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
             log_update(
                 "WARN",
                 "STARTUP",
-                &format!("清理移交備份目錄失敗: {e}，嘗試改名隔離"),
+                &format!("無法取得更新鎖完成移交提交 ({e})；交由持有鎖之更新程序處理"),
             );
-            let quarantined =
-                install_dir.join(format!(".backup-quarantined-{}", Utc::now().timestamp()));
-            let _ = fs::rename(&backup_dir, &quarantined);
+            return;
         }
+    };
+
+    log_update(
+        "INFO",
+        "STARTUP",
+        "新版看板服務已確認啟動健康就緒，完成移交握手並提交更新",
+    );
+    let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
+    let _ = fs::remove_file(&handoff_marker);
+    let _ = fs::remove_file(backup_dir.join(".startup_attempt"));
+    if let Err(e) = fs::remove_dir_all(&backup_dir) {
+        log_update(
+            "WARN",
+            "STARTUP",
+            &format!("清理移交備份目錄失敗: {e}，嘗試改名隔離"),
+        );
+        let quarantined =
+            install_dir.join(format!(".backup-quarantined-{}", Utc::now().timestamp()));
+        let _ = fs::rename(&backup_dir, &quarantined);
     }
 }
 
@@ -6083,7 +6189,8 @@ update_check_interval: 5 # check every 5 days
         fs::write(release_root.join("install.ps1"), "# powershell v2").unwrap();
 
         // 1. Success case
-        let result = apply_installation_with_rollback(&release_root, &install_dir, &backup_dir);
+        let result =
+            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir, None);
         assert!(
             result.is_ok(),
             "apply_installation_with_rollback failed: {:?}",
@@ -6117,7 +6224,8 @@ update_check_interval: 5 # check every 5 days
         fs::create_dir_all(bad_release.join("static")).unwrap();
         fs::write(bad_release.join("static").join("index.html"), "broken html").unwrap();
 
-        let fail_result = apply_installation_with_rollback(&bad_release, &install_dir, &backup_dir);
+        let fail_result =
+            apply_installation_with_rollback(&bad_release, &install_dir, &backup_dir, None);
         assert!(
             fail_result.is_err(),
             "expected installation to fail with directory as binary"
@@ -6148,6 +6256,54 @@ update_check_interval: 5 # check every 5 days
             !backup_dir.exists(),
             "backup_dir should be removed after successful rollback"
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn apply_installation_with_rollback_releases_update_lock_before_restart() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-install-lock-release-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let release_root = temp.join("release");
+        let backup_dir = install_dir.join(".backup");
+
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&release_root).unwrap();
+
+        let exec_name = if cfg!(windows) {
+            format!("{APP_NAME}.exe")
+        } else {
+            APP_NAME.to_string()
+        };
+
+        for (root, version) in [(&install_dir, "v0.9.5"), (&release_root, "v0.9.6")] {
+            fs::write(root.join(&exec_name), "binary").unwrap();
+            fs::write(root.join("VERSION"), version).unwrap();
+            fs::write(root.join("pricing.csv"), "pricing").unwrap();
+            fs::create_dir_all(root.join("static")).unwrap();
+            fs::create_dir_all(root.join("scripts")).unwrap();
+            fs::create_dir_all(root.join("shell")).unwrap();
+            fs::write(root.join("install.sh"), "#!/bin/sh").unwrap();
+            fs::write(root.join("install.ps1"), "# powershell").unwrap();
+        }
+
+        let lock = UpdateLock::try_acquire(&install_dir).expect("測試用更新鎖應可取得");
+        assert!(
+            UpdateLock::is_locked(&install_dir),
+            "測試前置條件：更新鎖應處於持有狀態"
+        );
+
+        let result =
+            apply_installation_with_rollback(&release_root, &install_dir, &backup_dir, Some(lock));
+        assert!(result.is_ok(), "安裝應成功: {result:?}");
+        assert!(
+            !UpdateLock::is_locked(&install_dir),
+            "檔案替換完成後於重啟前必須釋放更新鎖，否則被重啟之看板進程將在啟動救援階段等待鎖而無法就緒並誤觸回滾"
+        );
+        assert!(!backup_dir.exists(), "成功更新後備份目錄應已清理");
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -6276,16 +6432,21 @@ update_check_interval: 5 # check every 5 days
 
         let outside_secret = outside_dir.join("secret.txt");
         fs::write(&outside_secret, "sensitive data").unwrap();
-        fs::write(backup_dir.join(".manifest"), "secret.txt").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
 
-        let symlink_entry = backup_dir.join("secret.txt");
+        let symlink_entry = backup_dir.join("VERSION");
         std::os::unix::fs::symlink(&outside_secret, &symlink_entry).unwrap();
 
         let res = restore_from_backup(&backup_dir, &install_dir);
         assert!(res.is_err(), "應拒絕還原備份目錄中的符號連結項目");
         let err = res.unwrap_err();
         assert!(err.contains("符號連結項目"));
-        assert!(!install_dir.join("secret.txt").exists());
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "符號連結項目被拒絕時不得覆寫安裝目錄中的任何檔案"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -6323,6 +6484,104 @@ update_check_interval: 5 # check every 5 days
         assert!(res.is_err(), "備份清單不存在時應報告錯誤以阻斷不安全啟動");
         let err = res.unwrap_err();
         assert!(err.contains("備份清單檔案不存在"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_rejects_manifest_path_traversal() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-manifest-traversal-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        // 遭竄改的清單以相對路徑試圖於安裝目錄之外寫入檔案
+        fs::write(backup_dir.join(".manifest"), "VERSION\n../pwned.txt").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        // ../pwned.txt 由 backup_dir 解析後即為此檔，若未驗證將被複製到 temp/pwned.txt
+        fs::write(install_dir.join("pwned.txt"), "payload").unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "應拒絕含非受管理項目的備份清單");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("非受管理項目"),
+            "錯誤訊息應指出非受管理項目: {err}"
+        );
+        assert!(
+            !temp.join("pwned.txt").exists(),
+            "不得經由清單相對路徑於安裝目錄之外寫入檔案"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "清單驗證失敗時不得還原任何項目"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_rejects_unmanaged_directory_entries() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-unmanaged-entry-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join("evil.sh"), "rm -rf /").unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "應拒絕備份目錄中的非受管理項目");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("非受管理項目"),
+            "錯誤訊息應指出非受管理項目: {err}"
+        );
+        assert!(!install_dir.join("evil.sh").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_skips_control_marker_files() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-markers-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".handing_off"), "handing_off").unwrap();
+        fs::write(backup_dir.join(".committed"), "committed").unwrap();
+        fs::write(backup_dir.join(".startup_attempt"), "1234").unwrap();
+        fs::write(backup_dir.join(".rollback_failed"), "failed").unwrap();
+
+        restore_from_backup(&backup_dir, &install_dir).expect("控制標記檔應被略過而非視為還原項目");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.5"
+        );
+        assert!(
+            !install_dir.join(".handing_off").exists()
+                && !install_dir.join(".committed").exists()
+                && !install_dir.join(".startup_attempt").exists()
+                && !install_dir.join(".rollback_failed").exists(),
+            "控制標記檔不得被複製到安裝目錄"
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }
@@ -7538,6 +7797,67 @@ update_check_interval: 5 # check every 5 days
         complete_handoff_and_commit_if_needed(&install_dir);
 
         assert!(!backup_dir.exists(), "備份目錄應已被清理或更名隔離");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn complete_handoff_and_commit_skips_when_update_lock_held() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-handoff-lock-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join(".handing_off"), "handing_off").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        let lock = UpdateLock::try_acquire(&install_dir).expect("測試用更新鎖應可取得");
+        complete_handoff_and_commit_if_needed(&install_dir);
+
+        assert!(
+            backup_dir.join(".handing_off").exists(),
+            "更新鎖由其他更新程序持有時不得提交與清理備份"
+        );
+        assert!(
+            !backup_dir.join(".committed").exists(),
+            "更新鎖未取得時不得寫入提交標記"
+        );
+
+        drop(lock);
+        complete_handoff_and_commit_if_needed(&install_dir);
+        assert!(!backup_dir.exists(), "釋放鎖後應可完成提交並清理備份");
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn attempt_startup_recovery_defers_to_holder_of_update_lock() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-startup-lock-contended-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION\n").unwrap();
+
+        let args = vec!["token-usage-insights".to_string()];
+
+        // 更新程序仍持有更新鎖時，啟動救援必須暫緩且絕不可回滾剛安裝的新版
+        let lock = UpdateLock::try_acquire(&install_dir).expect("測試用更新鎖應可取得");
+        let status = attempt_startup_recovery(&install_dir, &args);
+        assert_eq!(status, RecoveryStatus::LockContended);
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "更新鎖被持有時不得回滾新版"
+        );
+        assert!(backup_dir.exists(), "更新鎖被持有時不得清理備份");
+
+        drop(lock);
         let _ = fs::remove_dir_all(&temp);
     }
 

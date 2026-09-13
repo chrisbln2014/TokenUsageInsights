@@ -4,7 +4,7 @@
 
 ## [未發行]
 
-## [0.9.6] - 2026-09-14
+## [0.9.7] - 2026-09-14
 
 ### 新增與改善
 
@@ -19,6 +19,7 @@
 - 修復 Codex 工作階段耗時永遠顯示為「-」的問題（[#43](https://github.com/doggy8088/TokenUsageInsights/issues/43)、[#48](https://github.com/doggy8088/TokenUsageInsights/pull/48)）。解析 Codex transcript 中的 `event_msg/task_complete` 事件並累加已完成 task 的 `payload.duration_ms`，寫入資料庫的 `duration_ms` 欄位；更新 parser migration marker 至 `migration:codex_session_identity_v7`，觸發既有 Codex transcript 重新同步以補齊耗時資訊。
 - 補充 DeepSeek V4.1-Flash（`deepseek-v4.1-flash`）定價規則，依 DeepSeek API 官方尖峰費率設定輸入 0.30、快取輸入 0.006、輸出 1.20 美元／每百萬 Token，修復該模型工作階段無法估算成本的問題。
 - 修正更新流程多項韌性問題：非同步移交與延遲重啟的備份提交時機、已提交備份不再被誤回滾、服務重啟與停機的訊號協商、Windows 服務重裝時的設定與捷徑繼承，以及資料庫初始化異常時終止啟動並回滾。
+- 修正 Windows 目標（`x86_64-pc-windows-msvc`）編譯失敗：回退重啟路徑改以 `Some(spec)` 傳遞已停止行程規格，回滾清單於非 Unix 平台改用不可變綁定，並補強 Windows 端命令列測試，使 Windows 建置與測試恢復零警告。
 
 ### 安全性
 
@@ -623,8 +624,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.6...HEAD
-[0.9.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.6
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.7
 [0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.2...v0.9.3

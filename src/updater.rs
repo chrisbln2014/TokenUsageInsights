@@ -2181,11 +2181,25 @@ const MANAGED_ITEMS: &[&str] = &[
 
 fn backup_installation(install_dir: &Path, backup_dir: &Path) -> Result<(), String> {
     if backup_dir.exists() {
-        let err = format!(
-            "偵測到備份目錄已存在 ({backup_dir:?})；疑似先前更新中斷或失敗留存之救援狀態。為保護歷史版本不被覆蓋，已中止本次更新。請先手動確認還原舊版或清除該目錄後再更新。"
-        );
-        log_update("ERROR", "BACKUP", &err);
-        return Err(err);
+        if backup_dir.join(".committed").exists() {
+            log_update(
+                "INFO",
+                "BACKUP",
+                "偵測到先前已提交更新殘留之備份目錄，執行安全清理與更名隔離",
+            );
+            let _ = fs::remove_dir_all(backup_dir);
+            if backup_dir.exists() {
+                let fallback = install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
+                let _ = fs::rename(backup_dir, &fallback);
+            }
+        }
+        if backup_dir.exists() {
+            let err = format!(
+                "偵測到備份目錄已存在 ({backup_dir:?})；疑似先前更新中斷或失敗留存之救援狀態。為保護歷史版本不被覆蓋，已中止本次更新。請先手動確認還原舊版或清除該目錄後再更新。"
+            );
+            log_update("ERROR", "BACKUP", &err);
+            return Err(err);
+        }
     }
     let staging_dir = install_dir.join(format!(".backup-staging-{}", std::process::id()));
     if staging_dir.exists() {
@@ -3820,10 +3834,40 @@ if ($startupSuccess) {
             Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
         }
         if (Test-Path -LiteralPath $backupDir) {
-            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+            try {
+                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+            } catch {
+                $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [WARN] [RESTART] 清理備份目錄失敗: $_，嘗試改名隔離..."
+            }
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            $quarantineName = '.backup-quarantined-' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $quarantineDir = Join-Path $installDir $quarantineName
+            try {
+                Move-Item -LiteralPath $backupDir -Destination $quarantineDir -Force -ErrorAction Stop
+                $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 備份目錄已成功改名隔離至 $quarantineName"
+            } catch {
+                $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 備份目錄隔離失敗: $_"
+            }
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+            Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 備份目錄無法清理或隔離 ($backupDir)，將阻擋後續原地更新；終止並進入診斷失敗狀態。"
+            if ($childProc -and -not $childProc.HasExited) {
+                try { Stop-Process -Id $childProc.Id -Force } catch {}
+            }
+            exit 1
         }
     } else {
-        Add-Content -LiteralPath $logFile -Value "[$logTime] [WARN] [RESTART] 寫入提交標記失敗；保留備份目錄以供手動清理或後續救援安全處理。"
+        $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 寫入提交標記失敗；終止進程並保留備份目錄以供救援安全處置。"
+        if ($childProc -and -not $childProc.HasExited) {
+            try { Stop-Process -Id $childProc.Id -Force } catch {}
+        }
+        exit 1
     }
 } else {
     $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -3899,7 +3943,41 @@ if ($startupSuccess) {
                     $commitSuccess = $false
                 }
                 if ($commitSuccess) {
-                    Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+                    if (Test-Path -LiteralPath $backupDir) {
+                        try {
+                            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+                        } catch {
+                            $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                            Add-Content -LiteralPath $logFile -Value "[$logTime] [WARN] [RESTART] 清理已還原備份目錄失敗: $_，嘗試改名隔離..."
+                        }
+                    }
+                    if (Test-Path -LiteralPath $backupDir) {
+                        $restoredName = '.backup-restored-' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                        $restoredDir = Join-Path $installDir $restoredName
+                        try {
+                            Move-Item -LiteralPath $backupDir -Destination $restoredDir -Force -ErrorAction Stop
+                            $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                            Add-Content -LiteralPath $logFile -Value "[$logTime] [INFO] [RESTART] 備份目錄已成功改名隔離至 $restoredName"
+                        } catch {
+                            $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                            Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 備份目錄隔離失敗: $_"
+                        }
+                    }
+                    if (Test-Path -LiteralPath $backupDir) {
+                        $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                        Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 備份目錄無法清理或隔離 ($backupDir)，終止進程進入可診斷狀態。"
+                        if ($restoredProc -and -not $restoredProc.HasExited) {
+                            try { Stop-Process -Id $restoredProc.Id -Force } catch {}
+                        }
+                        exit 1
+                    }
+                } else {
+                    $logTime = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    Add-Content -LiteralPath $logFile -Value "[$logTime] [ERROR] [RESTART] 寫入原版提交標記失敗；終止進程進入可診斷狀態。"
+                    if ($restoredProc -and -not $restoredProc.HasExited) {
+                        try { Stop-Process -Id $restoredProc.Id -Force } catch {}
+                    }
+                    exit 1
                 }
             } else {
                 $failedMarker = Join-Path $backupDir '.rollback_failed'
@@ -4763,9 +4841,11 @@ pub(crate) fn apply_installation_with_rollback(
                 install_dir.join(format!(".backup-old-{}", Utc::now().timestamp()));
             if let Err(re) = fs::rename(backup_dir, &fallback_backup) {
                 log_update("WARN", "CLEANUP", &format!("備份目錄換名失敗: {re}"));
-                eprintln!(
-                    "⚠️ 更新已安裝完成，但備份目錄無法清理或換名 ({backup_dir:?}): {re}；請稍後手動移除。"
+                let err_msg = format!(
+                    "更新已安裝但備份目錄無法清理或更名 ({backup_dir:?}): {re}；已進入錯誤狀態以防阻擋後續原地更新"
                 );
+                eprintln!("⚠️ {err_msg}");
+                return Err(UpdateError::Failure(err_msg));
             } else {
                 log_update(
                     "INFO",
@@ -5051,6 +5131,17 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         if backup_dir.exists() {
             let cleanup_name = format!(".backup-cleaned-{}", Utc::now().timestamp());
             let _ = fs::rename(&backup_dir, install_dir.join(&cleanup_name));
+        }
+        if backup_dir.exists() {
+            eprintln!(
+                "❌ 先前更新已提交，但無法清理或更名殘留之備份目錄 ({backup_dir:?})；程序終止以防阻擋後續更新。"
+            );
+            log_update(
+                "ERROR",
+                "STARTUP_FATAL",
+                &format!("先前已提交備份目錄無法清理或更名: {backup_dir:?}"),
+            );
+            std::process::exit(1);
         }
         drop(recovery_lock);
         return RecoveryStatus::CleanedOrNoBackup;
@@ -5503,6 +5594,34 @@ update_check_interval: 5 # check every 5 days
         assert!(install_dir.join("pricing.csv").exists());
         // The newly added install.sh was not in the backup manifest and should be removed
         assert!(!install_dir.join("install.sh").exists());
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn backup_installation_cleans_committed_backup_dir() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-backup-committed-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".committed"), "committed").unwrap();
+
+        // 由於存在 .committed，backup_installation 應自動清理已提交的備份並成功建立新備份
+        assert!(backup_installation(&install_dir, &backup_dir).is_ok());
+        assert!(backup_dir.exists());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+        // 新建立的備份未提交，不應含有 .committed
+        assert!(!backup_dir.join(".committed").exists());
 
         let _ = fs::remove_dir_all(&temp);
     }

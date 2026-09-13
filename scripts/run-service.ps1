@@ -309,7 +309,26 @@ function Restore-ServiceBackup {
                 Copy-Item -LiteralPath $src -Destination $dst -Force -Recurse -ErrorAction Stop
             }
         }
-        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $backupDir) {
+            try {
+                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "清理已還原備份目錄失敗: $($_.Exception.Message)，嘗試改名隔離..."
+            }
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            $restoredName = ".backup-restored-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            $restoredDir = Join-Path $InstallDir $restoredName
+            try {
+                Move-Item -LiteralPath $backupDir -Destination $restoredDir -Force -ErrorAction Stop
+                Write-Host "已將未清理之備份目錄隔離至: $restoredName"
+            } catch {
+                Write-Warning "備份目錄改名隔離失敗: $($_.Exception.Message)"
+            }
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            return $false
+        }
         return $true
     } catch {
         $marker = Join-Path $backupDir ".rollback_failed"
@@ -481,9 +500,36 @@ while ($true) {
                 if (Test-Path -LiteralPath $handoffMarker) {
                     Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
                 }
-                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $backupDir) {
+                    try {
+                        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+                    } catch {
+                        Write-Warning "清理備份目錄失敗: $($_.Exception.Message)，嘗試改名隔離..."
+                    }
+                }
+                if (Test-Path -LiteralPath $backupDir) {
+                    $quarantineName = ".backup-quarantined-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                    $quarantineDir = Join-Path $InstallDir $quarantineName
+                    try {
+                        Move-Item -LiteralPath $backupDir -Destination $quarantineDir -Force -ErrorAction Stop
+                        Write-Host "已將未清理之備份目錄隔離至: $quarantineName"
+                    } catch {
+                        Write-Warning "備份目錄改名隔離失敗: $($_.Exception.Message)"
+                    }
+                }
+                if (Test-Path -LiteralPath $backupDir) {
+                    if ($Process -and -not $Process.HasExited) {
+                        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                        try { $null = $Process.WaitForExit(5000) } catch {}
+                    }
+                    Exit-WithError -Message "新版服務進程已就緒但備份目錄無法清理或隔離 ($backupDir)，將阻擋後續原地更新；已終止進程進入可診斷之失敗狀態。"
+                }
             } else {
-                Write-Warning "標記更新提交失敗；保留備份目錄以供手動清理或後續救援處理。"
+                if ($Process -and -not $Process.HasExited) {
+                    Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                    try { $null = $Process.WaitForExit(5000) } catch {}
+                }
+                Exit-WithError -Message "標記更新提交失敗；無法安全提交更新，已終止服務進程並保留備份以供手動救援。"
             }
         } else {
             Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."

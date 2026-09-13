@@ -1084,6 +1084,7 @@ fn is_cli_subcommand(arg: &str) -> bool {
             | "-h"
             | "--help"
             | "help"
+            | "version"
             | "-V"
             | "--version"
     )
@@ -3373,9 +3374,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                 );
 
                 let wait_start = Instant::now();
-                let sup_timeout = Duration::from_secs(6);
-                let sup_escalation = Duration::from_millis(2500);
-                let mut sup_escalated = false;
+                let sup_timeout = Duration::from_secs(30);
                 let mut remaining_sup = supervised_pids;
 
                 while !remaining_sup.is_empty() {
@@ -3384,31 +3383,16 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                         break;
                     }
 
-                    let elapsed = wait_start.elapsed();
-                    if elapsed >= sup_timeout {
+                    if wait_start.elapsed() >= sup_timeout {
+                        // 同樣不強制終止：監管進程可能仍在等待資料庫寫入結束，強制終止會破壞資料完整性
                         let err = format!(
-                            "等待 Windows 監管服務進程 (PID: {remaining_sup:?}) 停止逾時，更新中止以保護檔案安全"
+                            "等待 Windows 監管服務進程 (PID: {remaining_sup:?}) 完成優雅停機逾時（{} 秒），未強制終止以避免中斷進行中的資料庫寫入；更新中止以保護資料完整性",
+                            sup_timeout.as_secs()
                         );
                         log_update("ERROR", "STOP_SERVICE", &err);
                         let _ = fs::remove_file(&restart_pending_file);
                         rollback_stopped_dashboard_instances(&stopped_specs, install_dir);
                         return Err(err);
-                    }
-
-                    if elapsed >= sup_escalation && !sup_escalated {
-                        sup_escalated = true;
-                        log_update(
-                            "WARN",
-                            "STOP_SERVICE",
-                            &format!(
-                                "監管進程未於 2.5 秒內退出，升級強制終止 (PID: {remaining_sup:?})"
-                            ),
-                        );
-                        for &pid in &remaining_sup {
-                            let _ = std::process::Command::new("taskkill")
-                                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                                .output();
-                        }
                     }
 
                     std::thread::sleep(Duration::from_millis(100));
@@ -3451,12 +3435,12 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
         }
     }
 
-    // 5. 積極輪詢並在逾時 2.5 秒後升級強制終止
+    // 5. 等待服務進程完成優雅停機（含等待進行中的資料庫寫入結束）後自然退出。
+    // 逾時時不再強制終止：強制終止會中斷 spawn_blocking 中的 SQLite 寫入，反而破壞資料完整性；
+    // 因此改以「保留備份、復原已停止之進程並中止本次更新」的 fail closed 方式處理
     let start_time = Instant::now();
-    let timeout = Duration::from_secs(5);
-    let escalation_delay = Duration::from_millis(2500);
+    let timeout = Duration::from_secs(30);
     let poll_interval = Duration::from_millis(100);
-    let mut escalated = false;
 
     loop {
         pids_to_stop.retain(|&pid| is_process_alive(pid));
@@ -3464,36 +3448,15 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
             break;
         }
 
-        let elapsed = start_time.elapsed();
-        if elapsed >= timeout {
+        if start_time.elapsed() >= timeout {
             let err = format!(
-                "等待執行中之服務進程 (PID: {pids_to_stop:?}) 停止超時，更新中止以保護檔案安全"
+                "等待執行中之服務進程 (PID: {pids_to_stop:?}) 完成優雅停機逾時（{} 秒），未強制終止以避免中斷進行中的資料庫寫入；更新中止以保護資料完整性",
+                timeout.as_secs()
             );
             log_update("ERROR", "STOP_SERVICE", &err);
             let _ = fs::remove_file(&restart_pending_file);
             rollback_stopped_dashboard_instances(&stopped_specs, install_dir);
             return Err(err);
-        }
-
-        if elapsed >= escalation_delay && !escalated {
-            escalated = true;
-            log_update(
-                "WARN",
-                "STOP_SERVICE",
-                &format!("服務進程未於 2.5 秒內正常退出，升級強制終止 (PID: {pids_to_stop:?})"),
-            );
-            for &pid in &pids_to_stop {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-                #[cfg(windows)]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .output();
-                }
-            }
         }
 
         std::thread::sleep(poll_interval);
@@ -7053,6 +7016,7 @@ update_check_interval: 5 # check every 5 days
         assert!(is_cli_subcommand("-h"));
         assert!(is_cli_subcommand("--version"));
         assert!(is_cli_subcommand("-V"));
+        assert!(is_cli_subcommand("version"));
         assert!(is_cli_subcommand("completion"));
 
         assert!(!is_cli_subcommand("--no-auto-update"));

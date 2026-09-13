@@ -179,18 +179,24 @@ function Exit-WithRollback {
     )
 
     # 啟動驗證失敗時若留存更新備份，先自 .backup 回滾再退出：
-    # 否則備份會殘留並讓後續重試持續撞上同一驗證失敗，服務永遠無法回到可用版本
+    # 否則備份會殘留並讓後續重試持續撞上同一驗證失敗，服務永遠無法回到可用版本。
+    # 回滾期間必須獨占更新鎖，避免其他更新程序同時更動同一份備份交易
     $backupDir = Join-Path $InstallDir ".backup"
     $lockFile = Join-Path $InstallDir ".update.lock"
     if (Test-Path -LiteralPath $backupDir) {
-        if (Test-IsUpdateLockHeld -LockFile $lockFile) {
-            Write-Warning "偵測到其他更新程序仍持有更新鎖，保留備份目錄且不執行回滾，避免與進行中的更新互相破壞。"
+        $lockStream = Enter-UpdateLock -LockFile $lockFile
+        if (-not $lockStream) {
+            Write-Warning "無法取得更新鎖（其他更新程序可能正在進行），保留備份目錄且不執行回滾，避免與進行中的更新互相破壞。"
         } else {
-            Write-Warning "啟動驗證失敗 ($Message)；正在自備份回滾至先前版本..."
-            if (Restore-ServiceBackup -InstallDir $InstallDir) {
-                Write-Host "已成功自備份回滾至先前版本；服務將於下次啟動時載入原版。"
-            } else {
-                Write-Warning "自備份回滾失敗，已保留備份目錄以供手動修復。"
+            try {
+                Write-Warning "啟動驗證失敗 ($Message)；正在自備份回滾至先前版本..."
+                if (Restore-ServiceBackup -InstallDir $InstallDir) {
+                    Write-Host "已成功自備份回滾至先前版本；服務將於下次啟動時載入原版。"
+                } else {
+                    Write-Warning "自備份回滾失敗，已保留備份目錄以供手動修復。"
+                }
+            } finally {
+                $lockStream.Dispose()
             }
         }
     }
@@ -230,6 +236,20 @@ function Test-IsUpdateLockHeld {
         }
     } catch {
         return $true
+    }
+}
+
+function Enter-UpdateLock {
+    param(
+        [string]$LockFile
+    )
+
+    # 以獨占檔案共用模式開啟更新鎖檔：與 Rust 更新程序使用的 OS 檔案鎖互斥，
+    # 讓呼叫端能在整個回滾／提交流程期間獨占更新權，避免「先檢查後使用」的 TOCTOU 競態
+    try {
+        return [System.IO.File]::Open($LockFile, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    } catch {
+        return $null
     }
 }
 
@@ -543,51 +563,63 @@ while ($true) {
     $backupDir = Join-Path $InstallDir ".backup"
     if (Test-Path -LiteralPath $backupDir) {
         $isHealthy = Test-IsProcessHealthy -Process $Process -InstallDir $InstallDir -TimeoutSeconds 5
+
         if ($isHealthy) {
-            Write-Host "新版服務進程已確認健康就緒，標記更新提交並清理備份目錄..."
-            $committedMarker = Join-Path $backupDir ".committed"
-            $commitSuccess = $false
-            try {
-                Set-Content -LiteralPath $committedMarker -Value "committed" -Force
-                $commitSuccess = (Test-Path -LiteralPath $committedMarker)
-            } catch {
-                $commitSuccess = $false
-            }
-            if ($commitSuccess) {
-                $handoffMarker = Join-Path $backupDir ".handing_off"
-                if (Test-Path -LiteralPath $handoffMarker) {
-                    Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
-                }
-                if (Test-Path -LiteralPath $backupDir) {
-                    try {
-                        Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
-                    } catch {
-                        Write-Warning "清理備份目錄失敗: $($_.Exception.Message)，嘗試改名隔離..."
-                    }
-                }
-                if (Test-Path -LiteralPath $backupDir) {
-                    $quarantineName = ".backup-quarantined-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-                    $quarantineDir = Join-Path $InstallDir $quarantineName
-                    try {
-                        Move-Item -LiteralPath $backupDir -Destination $quarantineDir -Force -ErrorAction Stop
-                        Write-Host "已將未清理之備份目錄隔離至: $quarantineName"
-                    } catch {
-                        Write-Warning "備份目錄改名隔離失敗: $($_.Exception.Message)"
-                    }
-                }
-                if (Test-Path -LiteralPath $backupDir) {
-                    if ($Process -and -not $Process.HasExited) {
-                        Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-                        try { $null = $Process.WaitForExit(5000) } catch {}
-                    }
-                    Exit-WithError -Message "新版服務進程已就緒但備份目錄無法清理或隔離 ($backupDir)，將阻擋後續原地更新；已終止進程進入可診斷之失敗狀態。"
-                }
+            # 提交流程（標記 .committed、移除移交標記、清理備份）必須在獨占更新鎖保護下完成，
+            # 且必須於健康驗證之後才取得鎖：新版看板在啟動救援階段同樣需要更新鎖才能完成就緒
+            $commitLock = Enter-UpdateLock -LockFile (Join-Path $InstallDir ".update.lock")
+            if (-not $commitLock) {
+                Write-Warning "無法取得更新鎖（其他更新程序可能正在進行）；本次不提交更新並保留備份目錄與移交標記。"
             } else {
-                if ($Process -and -not $Process.HasExited) {
-                    Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-                    try { $null = $Process.WaitForExit(5000) } catch {}
+                try {
+                    Write-Host "新版服務進程已確認健康就緒，標記更新提交並清理備份目錄..."
+                    $committedMarker = Join-Path $backupDir ".committed"
+                    $commitSuccess = $false
+                    try {
+                        Set-Content -LiteralPath $committedMarker -Value "committed" -Force
+                        $commitSuccess = (Test-Path -LiteralPath $committedMarker)
+                    } catch {
+                        $commitSuccess = $false
+                    }
+                    if ($commitSuccess) {
+                        $handoffMarker = Join-Path $backupDir ".handing_off"
+                        if (Test-Path -LiteralPath $handoffMarker) {
+                            Remove-Item -LiteralPath $handoffMarker -Force -ErrorAction SilentlyContinue
+                        }
+                        if (Test-Path -LiteralPath $backupDir) {
+                            try {
+                                Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+                            } catch {
+                                Write-Warning "清理備份目錄失敗: $($_.Exception.Message)，嘗試改名隔離..."
+                            }
+                        }
+                        if (Test-Path -LiteralPath $backupDir) {
+                            $quarantineName = ".backup-quarantined-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+                            $quarantineDir = Join-Path $InstallDir $quarantineName
+                            try {
+                                Move-Item -LiteralPath $backupDir -Destination $quarantineDir -Force -ErrorAction Stop
+                                Write-Host "已將未清理之備份目錄隔離至: $quarantineName"
+                            } catch {
+                                Write-Warning "備份目錄改名隔離失敗: $($_.Exception.Message)"
+                            }
+                        }
+                        if (Test-Path -LiteralPath $backupDir) {
+                            if ($Process -and -not $Process.HasExited) {
+                                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                                try { $null = $Process.WaitForExit(5000) } catch {}
+                            }
+                            Exit-WithError -Message "新版服務進程已就緒但備份目錄無法清理或隔離 ($backupDir)，將阻擋後續原地更新；已終止進程進入可診斷之失敗狀態。"
+                        }
+                    } else {
+                        if ($Process -and -not $Process.HasExited) {
+                            Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
+                            try { $null = $Process.WaitForExit(5000) } catch {}
+                        }
+                        Exit-WithError -Message "標記更新提交失敗；無法安全提交更新，已終止服務進程並保留備份以供手動救援。"
+                    }
+                } finally {
+                    $commitLock.Dispose()
                 }
-                Exit-WithError -Message "標記更新提交失敗；無法安全提交更新，已終止服務進程並保留備份以供手動救援。"
             }
         } else {
             Write-Warning "新版服務進程啟動後異常或未能及時就緒，執行自備份自動回滾至先前版本..."
@@ -595,7 +627,17 @@ while ($true) {
                 Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
                 try { $null = $Process.WaitForExit(5000) } catch {}
             }
-            $restored = Restore-ServiceBackup -InstallDir $InstallDir
+
+            # 回滾期間獨占更新鎖，避免其他更新程序同時更動同一份備份交易
+            $rollbackLock = Enter-UpdateLock -LockFile (Join-Path $InstallDir ".update.lock")
+            if (-not $rollbackLock) {
+                Exit-WithError -Message "新版服務進程啟動失敗且無法取得更新鎖執行回滾（其他更新程序可能正在進行）；已保留備份目錄以供手動修復。"
+            }
+            try {
+                $restored = Restore-ServiceBackup -InstallDir $InstallDir
+            } finally {
+                $rollbackLock.Dispose()
+            }
             if ($restored) {
                 Write-Host "已成功自備份回滾至先前版本，重新啟動原版服務..."
                 continue

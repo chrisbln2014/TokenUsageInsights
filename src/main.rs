@@ -112,6 +112,14 @@ struct UsageSyncTask {
 /// 等待背景日誌同步結束時，每次檢查間隔同時也是警告輸出的節奏
 const SYNC_JOIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 新版看板確認健康後延後提交移交交易的時間：讓 axum::serve 的立即失敗得以先反映，
+/// 避免在服務確實可用之前就提交並刪除唯一的回滾備份
+const HANDOFF_COMMIT_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 自動更新請求與終止訊號可能幾乎同時抵達時的仲裁窗口；
+/// 訊號處理任務為非同步執行，需保留短暫時間讓稍後抵達的終止訊號得以優先處理
+const SIGNAL_ARBITRATION_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
 impl UsageSyncTask {
     /// 通知同步迴圈停止，並等待進行中的同步（含 spawn_blocking 的 SQLite 寫入）確實結束後才返回。
     ///
@@ -360,7 +368,13 @@ async fn main() {
                 "偵測到 Windows 服務 runner 監管模式；更新提交與備份清理交由 runner 於健康驗證通過後執行",
             );
         } else {
-            updater::complete_handoff_and_commit_if_needed(&install_dir);
+            // 移交提交會刪除唯一的回滾備份，因此延後到服務確實開始提供後才執行：
+            // 若 axum::serve 立即失敗或程序在就緒前退出，本任務會隨程序結束而不會誤提交
+            let commit_install_dir = install_dir.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(HANDOFF_COMMIT_DELAY).await;
+                updater::complete_handoff_and_commit_if_needed(&commit_install_dir);
+            });
         }
     }
     axum::serve(listener, app)
@@ -370,11 +384,12 @@ async fn main() {
         .await
         .unwrap();
 
-    drop(pid_guard);
-
     // HTTP 伺服器已停止服務，但背景日誌同步（含 spawn_blocking 中的 SQLite 寫入）可能仍在進行；
-    // 必須等待其確實結束後才繼續停機或更新流程，否則可能在資料庫寫入途中終止程序
+    // 必須等待其確實結束後才繼續停機或更新流程。`.server.pid` 刻意保留到此時才移除，
+    // 讓更新程序與服務 runner 能以 PID 檔消失作為「停機與資料庫寫入皆已完成」的可觀察訊號
     usage_sync_task.shutdown().await;
+
+    drop(pid_guard);
 
     let shutdown_reason = shutdown_reason_task
         .await
@@ -399,7 +414,10 @@ async fn main() {
             let args: Vec<String> = std::env::args().collect();
 
             // 一般終止訊號優先於自動更新：背景更新檢查可能先送出更新請求，若使用者隨後要求停止服務，
-            // 該訊號會排在更新請求之後而被忽略；此時必須改以停機處理，避免停止服務反而觸發檔案替換與重啟
+            // 該訊號會排在更新請求之後；訊號處理任務為非同步執行，因此保留短暫仲裁窗口後再次確認
+            if !signal_received.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(SIGNAL_ARBITRATION_WINDOW).await;
+            }
             if signal_received.load(std::sync::atomic::Ordering::SeqCst) {
                 println!("👋 接收到終止信號（優先於自動更新），Token 戰情室已安全停止。");
                 updater::log_update(

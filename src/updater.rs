@@ -1198,6 +1198,8 @@ pub struct UpdateOptions {
     pub force: bool,
     pub target_version: Option<String>,
     pub prefetched_release: Option<GitHubRelease>,
+    /// 取消旗標：看板主程序收到終止訊號時設定，讓更新流程在開始檔案替換前中止並保留既有安裝
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2555,6 +2557,15 @@ fn build_secure_http_client(timeout_secs: u64) -> Result<reqwest::Client, String
         .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))
 }
 
+/// 檢查更新是否已被終止訊號取消（由看板主程序設定）；取消後不得再進行任何檔案替換
+fn is_update_cancelled(options: &UpdateOptions) -> bool {
+    options
+        .cancel_flag
+        .as_ref()
+        .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
 pub fn validate_release_tag(tag: &str) -> Result<String, String> {
     let trimmed = tag.trim();
     if trimmed.is_empty() {
@@ -2872,6 +2883,12 @@ pub(crate) async fn run_update_in_dir(
         None
     };
 
+    if is_update_cancelled(&options) {
+        let msg = "更新已取消（收到終止訊號），未進行任何變更".to_string();
+        log_update("WARN", "CANCEL", &msg);
+        return Err(UpdateError::Failure(msg));
+    }
+
     // 取得更新鎖後，重新讀取安裝目錄目前實際之版本，防範排隊等待鎖期間已被其他更新程序完成升級
     let current_version_str = get_installed_version(install_dir);
     let current_version = current_version_str.as_str();
@@ -3031,6 +3048,7 @@ pub(crate) async fn run_update_in_dir(
         let extract_dir = extract_dir.clone();
         let install_dir = install_dir.to_path_buf();
         let remote_version = remote_version.to_string();
+        let cancel_flag = options.cancel_flag.clone();
         move || -> Result<bool, UpdateError> {
             if let Err(e) = extract_archive(&archive_path, &extract_dir, is_zip) {
                 log_update("ERROR", "EXTRACT", &e);
@@ -3090,6 +3108,17 @@ pub(crate) async fn run_update_in_dir(
                     log_update("ERROR", "VERIFY", &err);
                     return Err(UpdateError::Failure(err));
                 }
+            }
+
+            // 進入檔案替換前的最後仲裁：下載與校驗期間若收到終止訊號，必須中止並保留既有安裝
+            if cancel_flag
+                .as_ref()
+                .map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+                .unwrap_or(false)
+            {
+                let msg = "更新已取消（下載或校驗期間收到終止訊號），未替換任何檔案".to_string();
+                log_update("WARN", "CANCEL", &msg);
+                return Err(UpdateError::Failure(msg));
             }
 
             let backup_dir = install_dir.join(".backup");
@@ -5927,6 +5956,7 @@ async fn run_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<Shutd
         force: false,
         target_version: None,
         prefetched_release: Some(release.clone()),
+        cancel_flag: None,
     };
 
     let _ = shutdown_tx
@@ -7817,6 +7847,7 @@ update_check_interval: 5 # check every 5 days
             force: true,
             target_version: Some(new_version.to_string()),
             prefetched_release: Some(release),
+            cancel_flag: None,
         };
 
         let res = run_update_in_dir(&install_dir, options).await;
@@ -7889,6 +7920,7 @@ update_check_interval: 5 # check every 5 days
             force: true,
             target_version: Some(new_version.to_string()),
             prefetched_release: Some(release),
+            cancel_flag: None,
         };
 
         let res = run_update_in_dir(&install_dir, options).await;
@@ -7931,6 +7963,7 @@ update_check_interval: 5 # check every 5 days
             force: true,
             target_version: Some("0.9.1".to_string()),
             prefetched_release: None,
+            cancel_flag: None,
         };
 
         let res = run_update_in_dir(&install_dir, options).await;
@@ -7987,6 +8020,7 @@ update_check_interval: 5 # check every 5 days
             force: true,
             target_version: Some(new_version.to_string()),
             prefetched_release: Some(release),
+            cancel_flag: None,
         };
 
         let res = run_update_in_dir(&install_dir, options).await;
@@ -8252,6 +8286,33 @@ update_check_interval: 5 # check every 5 days
         );
 
         let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn is_update_cancelled_reads_cancel_flag() {
+        let base = UpdateOptions {
+            check_only: false,
+            force: false,
+            target_version: None,
+            prefetched_release: None,
+            cancel_flag: None,
+        };
+        assert!(
+            !is_update_cancelled(&base),
+            "未提供取消旗標時不得視為已取消"
+        );
+
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let with_flag = UpdateOptions {
+            cancel_flag: Some(flag.clone()),
+            ..base.clone()
+        };
+        assert!(!is_update_cancelled(&with_flag));
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            is_update_cancelled(&with_flag),
+            "收到終止訊號後更新流程必須視為已取消並在替換檔案前中止"
+        );
     }
 
     #[test]

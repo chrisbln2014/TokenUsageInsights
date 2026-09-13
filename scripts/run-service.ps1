@@ -191,7 +191,7 @@ function Exit-WithRollback {
             try {
                 Write-Warning "啟動驗證失敗 ($Message)；正在自備份回滾至先前版本..."
                 if (Restore-ServiceBackup -InstallDir $InstallDir) {
-                    Write-Host "已成功自備份回滾至先前版本；服務將於下次啟動時載入原版。"
+                    Write-Host "已成功完成備份交易處理（回滾或清理已提交備份）；服務將於下次啟動時載入對應版本。"
                 } else {
                     Write-Warning "自備份回滾失敗，已保留備份目錄以供手動修復。"
                 }
@@ -271,11 +271,48 @@ function Wait-ForUpdateLockRelease {
     return (-not (Test-IsUpdateLockHeld -LockFile $LockFile))
 }
 
+function Test-ServicePortResponding {
+    param(
+        [string]$HostAddress = $null,
+        [int]$Port = 0,
+        [int]$TimeoutMs = 1000
+    )
+
+    # 確認看板連接埠確實可連線：PID 檔僅代表已建立 PID 守衛，不足以證明服務可提供服務
+    if ($Port -le 0) {
+        return $false
+    }
+
+    $target = $HostAddress
+    if ((-not $target) -or $target -eq "0.0.0.0" -or $target -eq "::" -or $target -eq "*") {
+        $target = "127.0.0.1"
+    }
+
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        try {
+            $iar = $client.BeginConnect($target, $Port, $null, $null)
+            if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+                return $false
+            }
+            $client.EndConnect($iar)
+            return $true
+        } finally {
+            $client.Close()
+        }
+    } catch {
+        return $false
+    }
+}
+
 function Test-IsProcessHealthy {
     param(
         [System.Diagnostics.Process]$Process,
         [string]$InstallDir,
-        [int]$TimeoutSeconds = 5
+        [int]$TimeoutSeconds = 5,
+        [string]$BindHostAddress = $script:HostAddress,
+        [int]$BindPortAddress = $script:Port,
+        [int]$HealthDwellMilliseconds = 1500
     )
 
     if (-not $Process) {
@@ -292,7 +329,18 @@ function Test-IsProcessHealthy {
             try {
                 $pidContent = (Get-Content -LiteralPath $pidFile -Raw).Trim()
                 if ($pidContent -eq "$($Process.Id)") {
-                    return (-not $Process.HasExited)
+                    # PID 相符後仍需通過兩項健康證據：連接埠可連線，且程序於觀察窗口內持續存活；
+                    # 否則主迴圈會立即標記 .committed 並刪除唯一備份，使後續啟動失敗無法回滾
+                    if (($BindPortAddress -le 0) -or (Test-ServicePortResponding -HostAddress $BindHostAddress -Port $BindPortAddress)) {
+                        $dwellDeadline = (Get-Date).AddMilliseconds($HealthDwellMilliseconds)
+                        while ((Get-Date) -lt $dwellDeadline) {
+                            if ($Process.HasExited) {
+                                return $false
+                            }
+                            Start-Sleep -Milliseconds 100
+                        }
+                        return (-not $Process.HasExited)
+                    }
                 }
             } catch {}
         }
@@ -318,6 +366,27 @@ function Restore-ServiceBackup {
         Set-Content -LiteralPath (Join-Path $InstallDir ".rollback_failed") -Value "unsafe backup directory (symbolic link, reparse point or non-directory): $backupDir" -Force -ErrorAction SilentlyContinue
         Write-Error -Message "備份目錄為符號連結、重剖析點或非正規目錄 ($backupDir)；拒絕還原以確保安全。" -ErrorAction Continue
         return $false
+    }
+
+    # .committed 代表新版已通過健康驗證、僅清理備份時被中斷：此時絕不可回滾，
+    # 應保留目前版本並清理或隔離殘留備份目錄（與啟動救援協定一致）
+    if (Test-Path -LiteralPath (Join-Path $backupDir ".committed")) {
+        Write-Host "偵測到已提交的更新備份（.committed），保留目前版本並清理殘留備份目錄..."
+        try {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+        } catch {
+            Write-Warning "清理已提交備份失敗: $($_.Exception.Message)，嘗試改名隔離..."
+        }
+        if (Test-Path -LiteralPath $backupDir) {
+            $committedName = ".backup-committed-" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+            try {
+                Move-Item -LiteralPath $backupDir -Destination (Join-Path $InstallDir $committedName) -Force -ErrorAction Stop
+                Write-Host "已將殘留之已提交備份目錄隔離至: $committedName"
+            } catch {
+                Write-Warning "已提交備份目錄改名隔離失敗: $($_.Exception.Message)"
+            }
+        }
+        return (-not (Test-Path -LiteralPath $backupDir))
     }
 
     $manifest = Join-Path $backupDir ".manifest"
@@ -569,7 +638,7 @@ while ($true) {
     # 若存在更新備份目錄 (.backup)，監控新版服務進程是否確認健康就緒；若確認健康始清理備份，若啟動失敗則自備份自動回滾
     $backupDir = Join-Path $InstallDir ".backup"
     if (Test-Path -LiteralPath $backupDir) {
-        $isHealthy = Test-IsProcessHealthy -Process $Process -InstallDir $InstallDir -TimeoutSeconds 5
+        $isHealthy = Test-IsProcessHealthy -Process $Process -InstallDir $InstallDir -TimeoutSeconds 5 -BindHostAddress $HostAddress -BindPortAddress $Port
 
         if ($isHealthy) {
             # 提交流程（標記 .committed、移除移交標記、清理備份）必須在獨占更新鎖保護下完成，

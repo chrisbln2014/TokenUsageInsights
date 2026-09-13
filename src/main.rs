@@ -249,6 +249,8 @@ async fn main() {
     }
 
     // 建立協調式優雅停機通知通道，供系統終止信號與背景自動更新任務協同使用
+    // 移交提交閘門：收到更新請求或進入更新流程時必須關閉，避免本世代（舊版）的延遲任務在更新期間誤提交並刪除唯一的回滾備份
+    let handoff_commit_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (shutdown_reason_tx, mut shutdown_reason_rx) =
         tokio::sync::mpsc::channel::<updater::ShutdownReason>(1);
     let (graceful_tx, graceful_rx) = tokio::sync::oneshot::channel::<()>();
@@ -264,13 +266,20 @@ async fn main() {
         shutdown_signal(signal_tx, signal_received_watcher).await;
     });
 
-    let shutdown_reason_task = tokio::spawn(async move {
-        let reason = shutdown_reason_rx
-            .recv()
-            .await
-            .unwrap_or(updater::ShutdownReason::Signal);
-        let _ = graceful_tx.send(());
-        reason
+    let shutdown_reason_task = tokio::spawn({
+        let commit_gate = handoff_commit_allowed.clone();
+        async move {
+            let reason = shutdown_reason_rx
+                .recv()
+                .await
+                .unwrap_or(updater::ShutdownReason::Signal);
+            // 一收到更新請求即關閉本世代的移交提交閘門：延遲提交任務不得在更新交接期間刪除回滾備份
+            if matches!(reason, updater::ShutdownReason::AutoUpdate(_)) {
+                commit_gate.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = graceful_tx.send(());
+            reason
+        }
     });
 
     let static_dir = get_static_dir();
@@ -356,8 +365,6 @@ async fn main() {
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     let usage_sync_task = spawn_usage_sync_task();
     let pid_guard = updater::create_server_pid_guard();
-    // 移交提交閘門：進入更新流程前必須關閉，避免本世代（舊版）的延遲任務在更新期間誤提交並刪除唯一的回滾備份
-    let handoff_commit_allowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
         updater::detect_environment()
     {
@@ -411,7 +418,9 @@ async fn main() {
         updater::ShutdownReason::Signal => {
             println!("👋 接收到終止信號，Token 戰情室已安全停止。");
         }
-        updater::ShutdownReason::AutoUpdate(opts) => {
+        updater::ShutdownReason::AutoUpdate(mut opts) => {
+            // 終止訊號即為本次更新的取消旗標：更新流程會在開始檔案替換前重新仲裁並中止
+            opts.cancel_flag = Some(signal_received.clone());
             let (target_exe, backup_dir, install_dir) = match updater::detect_environment() {
                 updater::EnvironmentKind::StandardInstalled { install_dir, .. } => (
                     updater::get_target_exe(&install_dir),
@@ -489,6 +498,15 @@ async fn main() {
                             "更新失敗且回滾失敗，中止重啟以保留備份狀態",
                         );
                         std::process::exit(1);
+                    }
+                    if signal_received.load(std::sync::atomic::Ordering::SeqCst) {
+                        println!("👋 更新已依終止信號取消，Token 戰情室已安全停止。");
+                        updater::log_update(
+                            "INFO",
+                            "RESTART",
+                            &format!("更新已依終止信號取消 ({err})；停止服務且不重啟"),
+                        );
+                        return;
                     }
                     eprintln!("❌ 自動更新失敗: {err}；正在重啟以維持服務運作...");
                     updater::log_update(

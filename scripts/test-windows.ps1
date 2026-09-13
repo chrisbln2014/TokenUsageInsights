@@ -830,7 +830,7 @@ if ($env:TOKEN_USAGE_INSIGHTS_UPDATE_INTERVAL_HOURS -ne "24") { throw "TOKEN_USA
     Set-Content -LiteralPath $readyExePath -Value "binary"
     Set-Content -LiteralPath $tempExePath -Value "temp"
 
-    $helperFunctions = @("Exit-WithError", "Exit-WithRollback", "Test-IsRollbackFailed", "Test-IsUpdateLockHeld", "Enter-UpdateLock", "Wait-ForUpdateLockRelease", "Wait-ForExecutableReady", "Restore-ServiceBackup")
+    $helperFunctions = @("Exit-WithError", "Exit-WithRollback", "Test-IsRollbackFailed", "Test-IsUpdateLockHeld", "Enter-UpdateLock", "Wait-ForUpdateLockRelease", "Test-ServicePortResponding", "Wait-ForExecutableReady", "Restore-ServiceBackup")
     $fnDefs = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and ($args[0].Name -in $helperFunctions) }, $true)
     $funcCode = (($fnDefs | ForEach-Object { $_.Extent.Text }) -join "`n`n").Replace("900", "2").Replace("150", "2")
     $testScript = @"
@@ -960,6 +960,30 @@ if (Restore-ServiceBackup -InstallDir '$baselineInstallDir') { exit 2 } else { e
     Assert-True (Test-Path -LiteralPath (Join-Path $baselineInstallDir "token-usage-insights.exe")) "Restore-ServiceBackup must not remove the installed executable for an incomplete manifest."
     Assert-True (Test-Path -LiteralPath (Join-Path $baselineInstallDir "static")) "Restore-ServiceBackup must not remove static assets for an incomplete manifest."
 
+    # 5c-3. Restore-ServiceBackup 對已提交的備份（.committed）必須保留目前版本並清理殘留備份，不得回滾
+    $committedRoot = Join-Path $Root "committed-backup-tests"
+    $committedInstallDir = Join-Path $committedRoot "install"
+    $committedBackupDir = Join-Path $committedInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $committedBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $committedInstallDir "token-usage-insights.exe") -Value "new binary"
+    New-Item -ItemType Directory -Force -Path (Join-Path $committedInstallDir "static") | Out-Null
+    Set-Content -LiteralPath (Join-Path $committedInstallDir "VERSION") -Value "v0.9.6"
+    Set-Content -LiteralPath (Join-Path $committedBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $committedBackupDir "token-usage-insights.exe") -Value "old binary"
+    New-Item -ItemType Directory -Force -Path (Join-Path $committedBackupDir "static") | Out-Null
+    Set-Content -LiteralPath (Join-Path $committedBackupDir ".manifest") -Value "token-usage-insights.exe`nstatic`nVERSION"
+    Set-Content -LiteralPath (Join-Path $committedBackupDir ".committed") -Value "committed"
+
+    $committedTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+if (Restore-ServiceBackup -InstallDir '$committedInstallDir') { exit 2 } else { exit 0 }
+"@
+    $committedExit = Invoke-ScopedScript -ScriptText $committedTestScript -Name "committed-backup"
+    Assert-Equal 2 $committedExit "Restore-ServiceBackup should succeed (treat as handled) for an already committed backup."
+    Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $committedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not downgrade a committed update."
+    Assert-Equal $false (Test-Path -LiteralPath $committedBackupDir) "Restore-ServiceBackup must clean up the leftover committed backup."
+
     # 5d. Restore-ServiceBackup 必須拒絕符號連結或重剖析點的備份根目錄
     $linkedRoot = Join-Path $Root "backup-root-link-tests"
     $linkedInstallDir = Join-Path $linkedRoot "install"
@@ -1056,6 +1080,9 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True ($whileBodyText -match '(?s)Enter-UpdateLock.*Restore-ServiceBackup') "run-service.ps1 must acquire the update lock before rolling back."
 
     Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."
+    Assert-True ($fnDefHealth[0].Extent.Text -match 'Test-ServicePortResponding') "Test-IsProcessHealthy must verify the service port accepts connections."
+    Assert-True ($fnDefHealth[0].Extent.Text -match 'HealthDwellMilliseconds') "Test-IsProcessHealthy must require a liveness dwell window."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)\.committed.*保留目前版本') "Restore-ServiceBackup must not roll back an already committed backup."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.sh"') "Restore-ServiceBackup managedItems must contain install.sh."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.ps1"') "Restore-ServiceBackup managedItems must contain install.ps1."

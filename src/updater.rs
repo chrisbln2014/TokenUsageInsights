@@ -1967,8 +1967,15 @@ fn safe_replace_file(src: &Path, dst: &Path) -> Result<(), String> {
     }
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
-    fs::copy(src, &tmp).map_err(|e| format!("複製暫存檔失敗 ({tmp:?}): {e}"))?;
-    atomic_rename_overwrite(&tmp, dst).map_err(|e| format!("替換檔案失敗 ({dst:?}): {e}"))
+    if let Err(e) = fs::copy(src, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("複製暫存檔失敗 ({tmp:?}): {e}"));
+    }
+    if let Err(e) = atomic_rename_overwrite(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("替換檔案失敗 ({dst:?}): {e}"));
+    }
+    Ok(())
 }
 
 fn safe_write_file(dst: &Path, content: &[u8]) -> Result<(), String> {
@@ -1986,8 +1993,16 @@ fn safe_write_file(dst: &Path, content: &[u8]) -> Result<(), String> {
     }
     let tmp = dst.with_extension(format!("tmp.{}", std::process::id()));
     let _ = fs::remove_file(&tmp);
-    fs::write(&tmp, content).map_err(|e| format!("寫入暫存檔失敗 ({tmp:?}): {e}"))?;
-    atomic_rename_overwrite(&tmp, dst).map_err(|e| format!("替換標記檔失敗 ({dst:?}): {e}"))
+    // 暫存檔殘留會使 .backup 內出現未受管理項目而讓後續回滾被拒絕，因此兩個失敗分支都必須清除暫存檔
+    if let Err(e) = fs::write(&tmp, content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("寫入暫存檔失敗 ({tmp:?}): {e}"));
+    }
+    if let Err(e) = atomic_rename_overwrite(&tmp, dst) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("替換標記檔失敗 ({dst:?}): {e}"));
+    }
+    Ok(())
 }
 
 fn extract_archive(archive_path: &Path, dest_dir: &Path, is_zip: bool) -> Result<(), String> {
@@ -2197,6 +2212,20 @@ const BACKUP_MARKER_FILES: &[&str] = &[
     ".rollback_failed",
 ];
 
+/// 判斷是否為安全寫入流程中途被終止所遺留的暫存檔（`<受管理項目或控制標記>.tmp.<pid>`）；
+/// 此類殘留並非備份內容，還原時應略過而非視為未受管理項目而拒絕整個回滾
+fn is_stale_temp_artifact(name: &str) -> bool {
+    let Some(idx) = name.rfind(".tmp.") else {
+        return false;
+    };
+    let (prefix, suffix) = name.split_at(idx);
+    let pid_part = &suffix[".tmp.".len()..];
+    if pid_part.is_empty() || !pid_part.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    MANAGED_ITEMS.contains(&prefix) || BACKUP_MARKER_FILES.contains(&prefix)
+}
+
 const MANAGED_ITEMS: &[&str] = &[
     APP_NAME,
     #[cfg(windows)]
@@ -2329,6 +2358,31 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
         }
     }
 
+    // 驗證清單中每個項目皆確實存在於備份目錄且為正規檔案或目錄；
+    // 截斷或遭竄改的備份若缺少列舉項目，逐檔還原會靜默略過而造成混合版本安裝
+    for item in &original_items {
+        let src = backup_dir.join(item);
+        match fs::symlink_metadata(&src) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "備份清單之符號連結項目 ({src:?})，拒絕還原以防範路徑穿越攻擊"
+                    ));
+                }
+                if !meta.is_dir() && !meta.is_file() {
+                    return Err(format!(
+                        "備份清單項目並非正規檔案或目錄 ({src:?})，拒絕還原以確保安全"
+                    ));
+                }
+            }
+            Err(e) => {
+                return Err(format!(
+                    "備份清單項目不存在於備份目錄 ({src:?}): {e}；拒絕還原以避免留下混合版本安裝"
+                ));
+            }
+        }
+    }
+
     // 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
     for &item in MANAGED_ITEMS {
         if !original_items.contains(item) {
@@ -2355,6 +2409,14 @@ fn restore_from_backup(backup_dir: &Path, install_dir: &Path) -> Result<(), Stri
             format!("備份目錄包含非 UTF-8 檔名之項目 ({name:?})，拒絕還原以防範路徑穿越攻擊")
         })?;
         if BACKUP_MARKER_FILES.contains(&name_str) {
+            continue;
+        }
+        if is_stale_temp_artifact(name_str) {
+            log_update(
+                "WARN",
+                "ROLLBACK",
+                &format!("略過安全寫入中途中斷所遺留之暫存檔 ({name_str})"),
+            );
             continue;
         }
         if !MANAGED_ITEMS.contains(&name_str) {
@@ -4030,6 +4092,17 @@ if ($startupSuccess) {
                     throw "備份清單包含非受管理項目 ($rel)，拒絕還原以防範路徑穿越攻擊"
                 }
             }
+            # 驗證清單項目皆確實存在於備份目錄，避免截斷或遭竄改的備份被誤判為還原成功而留下混合版本
+            foreach ($rel in $originalItems) {
+                $relSrcPath = Join-Path $backupDir $rel
+                if (-not (Test-Path -LiteralPath $relSrcPath)) {
+                    throw "備份清單項目不存在於備份目錄 ($rel)，拒絕還原以避免留下混合版本安裝"
+                }
+                $relSrcItem = Get-Item -LiteralPath $relSrcPath -Force
+                if ($relSrcItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "備份清單項目為符號連結或重剖析點 ($rel)，拒絕還原以確保安全"
+                }
+            }
             foreach ($m in $managedItems) {
                 if ($originalItems -notcontains $m) {
                     $p = Join-Path $installDir $m
@@ -5502,14 +5575,25 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
         let attempt_file = backup_dir.join(".startup_attempt");
         if is_valid {
             if !attempt_file.exists() {
-                let _ = safe_write_file(&attempt_file, std::process::id().to_string().as_bytes());
-                log_update(
-                    "INFO",
-                    "STARTUP_RECOVERY",
-                    "偵測到非同步重啟移交標記 (.handing_off)，記錄啟動嘗試並略過回滾以利新版執行健康啟動",
-                );
-                drop(recovery_lock);
-                return RecoveryStatus::CleanedOrNoBackup;
+                match safe_write_file(&attempt_file, std::process::id().to_string().as_bytes()) {
+                    Ok(()) => {
+                        log_update(
+                            "INFO",
+                            "STARTUP_RECOVERY",
+                            "偵測到非同步重啟移交標記 (.handing_off)，記錄啟動嘗試並略過回滾以利新版執行健康啟動",
+                        );
+                        drop(recovery_lock);
+                        return RecoveryStatus::CleanedOrNoBackup;
+                    }
+                    Err(e) => {
+                        // 無法記錄啟動嘗試時必須 fail closed：否則新版會在 60 秒移交窗口內無限次略過回滾而持續以損毀狀態啟動
+                        log_update(
+                            "ERROR",
+                            "STARTUP_RECOVERY",
+                            &format!("無法記錄啟動嘗試標記 ({e})；改以安全救援回滾至健全版本"),
+                        );
+                    }
+                }
             } else {
                 log_update(
                     "WARN",
@@ -6582,6 +6666,126 @@ update_check_interval: 5 # check every 5 days
                 && !install_dir.join(".rollback_failed").exists(),
             "控制標記檔不得被複製到安裝目錄"
         );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_rejects_truncated_backup() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-truncated-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(install_dir.join("pricing.csv"), "new pricing").unwrap();
+
+        // 清單列舉 VERSION 與 pricing.csv，但備份目錄僅有 VERSION：若逐檔還原將靜默略過而留下混合版本
+        fs::write(backup_dir.join(".manifest"), "VERSION\npricing.csv").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+
+        let res = restore_from_backup(&backup_dir, &install_dir);
+        assert!(res.is_err(), "備份項目缺漏時應拒絕還原");
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("不存在於備份目錄"),
+            "錯誤訊息應指出缺漏的備份項目: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6",
+            "驗證失敗時不得還原任何項目"
+        );
+        assert_eq!(
+            fs::read_to_string(install_dir.join("pricing.csv")).unwrap(),
+            "new pricing",
+            "驗證失敗時不得移除或改寫安裝目錄內容"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn restore_from_backup_skips_stale_temporary_artifacts() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-restore-temp-artifact-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+
+        fs::write(backup_dir.join(".manifest"), "VERSION").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        // 安全寫入流程中途被終止時可能遺留的暫存檔
+        fs::write(backup_dir.join(".committed.tmp.4242"), "committed").unwrap();
+        fs::write(backup_dir.join("VERSION.tmp.4242"), "v0.9.5").unwrap();
+
+        restore_from_backup(&backup_dir, &install_dir)
+            .expect("已知項目之暫存殘留應被略過，而非拒絕整個回滾");
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.5"
+        );
+        assert!(
+            !install_dir.join(".committed.tmp.4242").exists()
+                && !install_dir.join("VERSION.tmp.4242").exists(),
+            "暫存殘留不得被複製到安裝目錄"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn is_stale_temp_artifact_matches_only_known_prefixes() {
+        assert!(is_stale_temp_artifact("VERSION.tmp.1234"));
+        assert!(is_stale_temp_artifact(".handing_off.tmp.42"));
+        assert!(is_stale_temp_artifact("token-usage-insights.tmp.7"));
+
+        assert!(!is_stale_temp_artifact("VERSION"));
+        assert!(!is_stale_temp_artifact(".committed"));
+        assert!(!is_stale_temp_artifact("evil.txt.tmp.1234"));
+        assert!(!is_stale_temp_artifact("VERSION.tmp.abc"));
+        assert!(!is_stale_temp_artifact("VERSION.tmp."));
+        assert!(!is_stale_temp_artifact("../VERSION.tmp.1234"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn safe_write_file_leaves_no_temporary_artifacts_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "test-safe-write-temp-cleanup-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let readonly_dir = temp.join("readonly");
+        fs::create_dir_all(&readonly_dir).unwrap();
+        let dst = readonly_dir.join(".committed");
+        fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let res = safe_write_file(&dst, b"committed");
+
+        fs::set_permissions(&readonly_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let leftovers: Vec<String> = fs::read_dir(&readonly_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "寫入失敗後不得殘留任何暫存檔: {leftovers:?}"
+        );
+
+        // 以 root 執行時權限限制無效，此時僅驗證成功路徑同樣不殘留暫存檔
+        if let Err(err) = res {
+            assert!(
+                err.contains("寫入暫存檔失敗"),
+                "錯誤訊息應指出寫入失敗: {err}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&temp);
     }

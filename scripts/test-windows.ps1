@@ -915,6 +915,26 @@ if (Restore-ServiceBackup -InstallDir '$traversalInstallDir') { exit 2 } else { 
     Assert-Equal $false (Test-Path -LiteralPath (Join-Path $traversalRoot "pwned.txt")) "Restore-ServiceBackup must not write outside the install directory via manifest traversal."
     Assert-Equal "v0.9.6-broken" ((Get-Content -LiteralPath (Join-Path $traversalInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must abort the whole restore when the manifest contains a non-managed entry."
 
+    # 5c. Restore-ServiceBackup 必須拒絕清單項目缺漏的截斷備份，且不得部分還原
+    $truncatedRoot = Join-Path $Root "manifest-truncated-tests"
+    $truncatedInstallDir = Join-Path $truncatedRoot "install"
+    $truncatedBackupDir = Join-Path $truncatedInstallDir ".backup"
+    New-Item -ItemType Directory -Force -Path $truncatedBackupDir | Out-Null
+    Set-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Value "v0.9.6"
+    Set-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Value "new pricing"
+    Set-Content -LiteralPath (Join-Path $truncatedBackupDir "VERSION") -Value "v0.9.5"
+    Set-Content -LiteralPath (Join-Path $truncatedBackupDir ".manifest") -Value "VERSION`npricing.csv"
+
+    $truncatedTestScript = @"
+`$ErrorActionPreference = 'SilentlyContinue'
+$funcCode
+if (Restore-ServiceBackup -InstallDir '$truncatedInstallDir') { exit 2 } else { exit 0 }
+"@
+    $truncatedExit = Invoke-ScopedScript -ScriptText $truncatedTestScript -Name "manifest-truncated"
+    Assert-Equal 0 $truncatedExit "Restore-ServiceBackup should fail closed when a manifest entry is missing from the backup."
+    Assert-Equal "v0.9.6" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "VERSION") -Raw).Trim()) "Restore-ServiceBackup must not partially restore a truncated backup."
+    Assert-Equal "new pricing" ((Get-Content -LiteralPath (Join-Path $truncatedInstallDir "pricing.csv") -Raw).Trim()) "Restore-ServiceBackup must not touch the install directory when the backup is truncated."
+
     # 6. Verify run-service.ps1 loop gates launch when update markers exist
     $loopGateAst = [System.Management.Automation.Language.Parser]::ParseInput($runServiceContent, [ref]$null, [ref]$null)
     $allWhileLoops = $loopGateAst.FindAll({ $args[0] -is [System.Management.Automation.Language.WhileStatementAst] }, $true)
@@ -981,6 +1001,9 @@ if (Restore-ServiceBackup -InstallDir '$traversalInstallDir') { exit 2 } else { 
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Remove-Item.*-LiteralPath \$dst.*Copy-Item') "Restore-ServiceBackup must remove destination items before copying to prevent mixed files."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel') "Restore-ServiceBackup must validate manifest entries against managedItems."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems -notcontains \$rel.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must reject non-managed manifest entries before touching the install directory."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)Test-Path -LiteralPath \$relSrcPath') "Restore-ServiceBackup must verify every manifest entry exists in the backup directory."
+    Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)不存在於備份目錄.*foreach \(\$m in \$managedItems\)') "Restore-ServiceBackup must fail closed on truncated backups before touching the install directory."
+    Assert-True ($fnDefRestore[0].Extent.Text -match 'ReparsePoint') "Restore-ServiceBackup must reject symlinked manifest entries."
     $readyText = $fnDefReady[0].Extent.Text
     Assert-Equal 4 ([regex]::Matches($readyText, 'Exit-WithRollback -InstallDir').Count) "Wait-ForExecutableReady must roll back the backup before every post-lock startup validation failure."
     Assert-Equal 2 ([regex]::Matches($readyText, 'Exit-WithError -Message').Count) "Wait-ForExecutableReady must only exit without rollback for the rollback-failed check and the update lock wait timeout."

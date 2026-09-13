@@ -317,6 +317,18 @@ function Restore-ServiceBackup {
             }
         }
 
+        # 驗證清單項目皆確實存在於備份目錄，避免截斷或遭竄改的備份被誤判為還原成功而留下混合版本
+        foreach ($rel in $originalItems) {
+            $relSrcPath = Join-Path $backupDir $rel
+            if (-not (Test-Path -LiteralPath $relSrcPath)) {
+                throw "備份清單項目不存在於備份目錄 ($rel)，拒絕還原以避免留下混合版本安裝。"
+            }
+            $relSrcItem = Get-Item -LiteralPath $relSrcPath -Force
+            if ($relSrcItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "備份清單項目為符號連結或重剖析點 ($rel)，拒絕還原以確保安全。"
+            }
+        }
+
         # 1. 移除更新期間新增、但原始安裝中並不存在的受管理項目
         foreach ($m in $managedItems) {
             if ($originalItems -notcontains $m) {

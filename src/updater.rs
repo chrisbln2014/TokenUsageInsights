@@ -1145,8 +1145,23 @@ pub struct ServerPidGuard {
 
 impl Drop for ServerPidGuard {
     fn drop(&mut self) {
+        let my_pid = std::process::id().to_string();
         for path in &self.paths {
-            let _ = fs::remove_file(path);
+            // 僅在標記仍屬於本行程時移除：避免不同連接埠的第二個實例接手標記後，
+            // 被前一個實例結束時刪除，導致服務 runner 與重啟健康檢查找不到現行看板
+            match fs::read_to_string(path) {
+                Ok(content) if content.trim() == my_pid => {
+                    let _ = fs::remove_file(path);
+                }
+                Ok(_) => {
+                    log_update(
+                        "INFO",
+                        "STARTUP",
+                        &format!("PID 標記已由其他看板實例接手 ({path:?})；保留該標記不予刪除"),
+                    );
+                }
+                Err(_) => {}
+            }
         }
     }
 }

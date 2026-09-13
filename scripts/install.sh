@@ -179,6 +179,11 @@ if [[ "$install_service" == true ]]; then
             host="$(systemd_unescape_value "$existing_host")"
           fi
         fi
+
+        # 繼承既有設定後重新計算轉義值，確保產生的單元檔使用最終綁定設定
+        host_systemd="$(systemd_escape_value "$host")"
+        port_systemd="$(systemd_escape_value "$port")"
+
       fi
 
       extra_env_systemd=""
@@ -290,6 +295,11 @@ SERVICE
             host="$existing_host"
           fi
         fi
+
+        # 繼承既有設定後重新計算轉義值，確保產生的 plist 使用最終綁定設定
+        host_plist="$(plist_escape "$host")"
+        port_plist="$(plist_escape "$port")"
+
       fi
 
       extra_env_plist=""

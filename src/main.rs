@@ -302,10 +302,9 @@ async fn main() {
                 .recv()
                 .await
                 .unwrap_or(updater::ShutdownReason::Signal);
-            // 一收到更新請求即關閉本世代的移交提交閘門：延遲提交任務不得在更新交接期間刪除回滾備份
-            if matches!(reason, updater::ShutdownReason::AutoUpdate(_)) {
-                commit_gate.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
+            // 收到任何停機原因即關閉本世代的移交提交閘門：
+            // 程序在完成自身健康確認前即要停止時，延遲提交任務不得刪除唯一的回滾備份
+            commit_gate.store(false, std::sync::atomic::Ordering::SeqCst);
             let _ = graceful_tx.send(());
             reason
         }

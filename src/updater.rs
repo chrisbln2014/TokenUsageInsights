@@ -2226,6 +2226,16 @@ fn is_stale_temp_artifact(name: &str) -> bool {
     MANAGED_ITEMS.contains(&prefix) || BACKUP_MARKER_FILES.contains(&prefix)
 }
 
+/// 寫入更新移交標記（`.backup/.handing_off`）。
+///
+/// 必須在釋放更新鎖與任何重啟動作之前完成：被重啟的新版看板若看到仍含 `.manifest` 卻無移交標記的備份，
+/// 會將其視為未完成的更新交易而回滾，導致呼叫端回報更新成功、實際卻退回舊版
+fn write_handoff_marker(backup_dir: &Path) -> Result<(), String> {
+    let handoff_marker = backup_dir.join(".handing_off");
+    safe_write_file(&handoff_marker, Utc::now().to_rfc3339().as_bytes())
+        .map_err(|e| format!("寫入移交標記失敗 ({handoff_marker:?}): {e}"))
+}
+
 const MANAGED_ITEMS: &[&str] = &[
     APP_NAME,
     #[cfg(windows)]
@@ -4584,6 +4594,10 @@ fn apply_installation_with_rollback(
         // 寫入更新就緒標記，供 Windows 服務守護進程確認新執行檔已完全寫入就緒
         safe_write_file(&install_dir.join(".update_ready"), b"ready")?;
 
+        // 寫入移交標記：必須早於釋放更新鎖與任何重啟動作。寫入失敗時由下方的安裝失敗路徑
+        // 執行完整回滾，避免留下「新版已安裝但無法辨識交易狀態」的半套安裝
+        write_handoff_marker(backup_dir)?;
+
         Ok(())
     })();
 
@@ -4700,19 +4714,8 @@ fn apply_installation_with_rollback(
     let _ = &expected_version;
     let _ = is_current_exe;
 
-    // 檔案已完整替換：先寫入移交標記，再釋放更新鎖，最後才執行重啟。
-    // 被重啟之看板進程會在啟動救援階段嘗試取得更新鎖並檢查移交標記：
-    //   - 若更新鎖仍被持有，其將等待鎖而無法於 5 秒內建立 .server.pid，重啟會被誤判為失敗並觸發回滾；
-    //   - 若缺少移交標記，其將誤判更新尚未完成，反而把剛安裝的新版回滾為舊版。
-    // 因此移交標記必須先於鎖釋放寫入；提交階段會再次寫入以延長健康驗證窗口
-    let handoff_marker = backup_dir.join(".handing_off");
-    if let Err(e) = safe_write_file(&handoff_marker, Utc::now().to_rfc3339().as_bytes()) {
-        log_update(
-            "WARN",
-            "RESTART",
-            &format!("寫入移交標記失敗 ({e})；重啟期間之新版看板可能誤判更新未完成並回滾"),
-        );
-    }
+    // 檔案已完整替換，且移交標記已於安裝階段寫入成功：於任何重啟動作前釋放更新鎖，
+    // 讓被重啟之看板進程能於啟動救援階段取得鎖並依移交標記略過回滾（若仍持鎖，其將等待鎖而無法於時限內就緒）
     drop(update_lock.take());
 
     let mut server_restarted = false;
@@ -6777,6 +6780,49 @@ update_check_interval: 5 # check every 5 days
         assert!(!is_stale_temp_artifact("VERSION.tmp.abc"));
         assert!(!is_stale_temp_artifact("VERSION.tmp."));
         assert!(!is_stale_temp_artifact("../VERSION.tmp.1234"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_handoff_marker_reports_failure_without_leaving_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root 身分下目錄權限限制不生效，無法重現寫入失敗情境
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let temp = std::env::temp_dir().join(format!(
+            "test-handoff-marker-write-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let backup_dir = temp.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let res = write_handoff_marker(&backup_dir);
+
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            res.is_err(),
+            "無法寫入移交標記時必須回報錯誤，讓安裝流程改走完整回滾而非靜默略過"
+        );
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("寫入移交標記失敗"),
+            "錯誤訊息應說明移交標記寫入失敗: {err}"
+        );
+
+        let leftovers: Vec<String> = fs::read_dir(&backup_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "移交標記寫入失敗後不得殘留暫存檔: {leftovers:?}"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[cfg(unix)]

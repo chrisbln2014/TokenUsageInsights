@@ -109,28 +109,33 @@ struct UsageSyncTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
-/// 等待背景日誌同步結束的上限；逾時代表 SQLite 寫入仍在進行中
-const SYNC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// 等待背景日誌同步結束時，每次檢查間隔同時也是警告輸出的節奏
+const SYNC_JOIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl UsageSyncTask {
-    /// 通知同步迴圈停止，並等待進行中的同步與資料庫寫入完成後才返回。
-    /// 回傳 true 表示已確認同步結束；false 表示逾時後仍無法確認（spawn_blocking 無法被取消）
-    async fn shutdown(self) -> bool {
-        self.shutdown_with_timeout(SYNC_SHUTDOWN_TIMEOUT).await
+    /// 通知同步迴圈停止，並等待進行中的同步（含 spawn_blocking 的 SQLite 寫入）確實結束後才返回。
+    ///
+    /// spawn_blocking 無法被取消，逾時也不會中斷既有的寫入，因此這裡不設總逾時而改為定期輸出警示並持續等待：
+    /// 程序絕不在資料庫寫入途中被本流程終止（服務管理器的 TimeoutStopSec 仍是最終防線）
+    async fn shutdown(self) {
+        let _ = self.shutdown_tx.send(true);
+        let mut handle = self.handle;
+        let mut waited = std::time::Duration::ZERO;
+        while !Self::wait_for_completion(&mut handle, SYNC_JOIN_POLL_INTERVAL).await {
+            waited += SYNC_JOIN_POLL_INTERVAL;
+            eprintln!(
+                "⏳ 背景日誌同步仍在進行中（已等待 {} 秒）；將持續等待 SQLite 寫入結束後才繼續停機或更新流程...",
+                waited.as_secs()
+            );
+        }
     }
 
-    async fn shutdown_with_timeout(self, timeout: std::time::Duration) -> bool {
-        let _ = self.shutdown_tx.send(true);
-        match tokio::time::timeout(timeout, self.handle).await {
-            Ok(_) => true,
-            Err(_) => {
-                eprintln!(
-                    "⚠️ 等待背景日誌同步結束逾時（{} 秒），無法確認 SQLite 寫入已完成。",
-                    timeout.as_secs()
-                );
-                false
-            }
-        }
+    /// 等待同步任務結束；回傳 false 代表在指定時間內仍未結束，但任務本身持續執行、不會被取消
+    async fn wait_for_completion(
+        handle: &mut tokio::task::JoinHandle<()>,
+        timeout: std::time::Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, handle).await.is_ok()
     }
 }
 
@@ -201,26 +206,38 @@ async fn main() {
         }
     };
 
-    // 資料庫結構初始化失敗代表新版無法健康服務。若本次啟動帶著尚未提交的更新交易（.backup/.handing_off），
-    // 繼續提供服務會讓服務管理器判定健康而提交更新並刪除唯一的回滾備份；
-    // 因此必須在建立 PID 與綁定連接埠之前終止啟動，讓服務管理器重啟後於啟動救援階段自動回滾至先前版本
+    // 資料庫結構初始化失敗代表所有資料庫相關 API 皆無法服務：一律以錯誤碼終止啟動，交由服務管理器重啟與復原。
+    // 若本次啟動帶著尚未提交的更新交易（.backup/.handing_off），繼續提供服務還會讓服務管理器判定健康而提交更新
+    // 並刪除唯一的回滾備份；因此必須在建立 PID 與綁定連接埠之前終止，讓重啟後的啟動救援自動回滾至先前版本
     if !database_ready {
-        if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
-            updater::detect_environment()
-        {
-            if updater::has_pending_handoff_transaction(&install_dir) {
-                eprintln!(
-                    "❌ SQLite 資料庫結構初始化失敗且存在未提交的更新交易；保留更新備份 (.backup) 並終止本次啟動，下次啟動將自動回滾至先前版本。"
-                );
-                updater::log_update(
-                    "ERROR",
-                    "STARTUP",
-                    "資料庫結構初始化失敗；保留備份目錄並終止啟動以觸發自動回滾",
-                );
-                std::process::exit(1);
+        let has_pending_handoff = match updater::detect_environment() {
+            updater::EnvironmentKind::StandardInstalled { install_dir, .. } => {
+                updater::has_pending_handoff_transaction(&install_dir)
             }
+            _ => false,
+        };
+
+        if has_pending_handoff {
+            eprintln!(
+                "❌ SQLite 資料庫結構初始化失敗且存在未提交的更新交易；保留更新備份 (.backup) 並終止本次啟動，下次啟動將自動回滾至先前版本。"
+            );
+            updater::log_update(
+                "ERROR",
+                "STARTUP",
+                "資料庫結構初始化失敗；保留備份目錄並終止啟動以觸發自動回滾",
+            );
+        } else {
+            eprintln!(
+                "❌ SQLite 資料庫結構初始化失敗；資料庫相關 API 無法服務，終止本次啟動以交由服務管理器重啟與復原。"
+            );
+            updater::log_update(
+                "ERROR",
+                "STARTUP",
+                "資料庫結構初始化失敗；終止啟動以避免對外提供無法服務的看板",
+            );
         }
-        eprintln!("⚠️ SQLite 資料庫結構初始化失敗，將以錯誤狀態繼續提供服務。");
+
+        std::process::exit(1);
     }
 
     // 建立協調式優雅停機通知通道，供系統終止信號與背景自動更新任務協同使用
@@ -232,8 +249,11 @@ async fn main() {
     updater::spawn_background_auto_update(shutdown_reason_tx.clone());
 
     let signal_tx = shutdown_reason_tx.clone();
+    // 記錄終止訊號是否已抵達：自動更新路徑需要據此讓訊號優先於更新請求
+    let signal_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal_received_watcher = signal_received.clone();
     tokio::spawn(async move {
-        shutdown_signal(signal_tx).await;
+        shutdown_signal(signal_tx, signal_received_watcher).await;
     });
 
     let shutdown_reason_task = tokio::spawn(async move {
@@ -339,7 +359,7 @@ async fn main() {
                 "STARTUP",
                 "偵測到 Windows 服務 runner 監管模式；更新提交與備份清理交由 runner 於健康驗證通過後執行",
             );
-        } else if database_ready {
+        } else {
             updater::complete_handoff_and_commit_if_needed(&install_dir);
         }
     }
@@ -353,8 +373,8 @@ async fn main() {
     drop(pid_guard);
 
     // HTTP 伺服器已停止服務，但背景日誌同步（含 spawn_blocking 中的 SQLite 寫入）可能仍在進行；
-    // 必須先等待其結束再決定套用更新或結束程序，否則更新流程可能在資料庫寫入中途終止程序
-    let sync_completed = usage_sync_task.shutdown().await;
+    // 必須等待其確實結束後才繼續停機或更新流程，否則可能在資料庫寫入途中終止程序
+    usage_sync_task.shutdown().await;
 
     let shutdown_reason = shutdown_reason_task
         .await
@@ -378,18 +398,16 @@ async fn main() {
             };
             let args: Vec<String> = std::env::args().collect();
 
-            // spawn_blocking 無法被取消：若無法確認 SQLite 寫入已結束，就不可在寫入途中替換檔案與重啟程序，
-            // 否則本次更新的交接將失去完整性保證。改為延後更新並重啟目前版本，待下一輪更新週期再處理
-            if !sync_completed {
-                eprintln!(
-                    "⚠️ 無法確認背景日誌同步已結束；為避免在 SQLite 寫入途中替換檔案，本次自動更新已延後，正在重啟目前版本以維持服務運作..."
-                );
+            // 一般終止訊號優先於自動更新：背景更新檢查可能先送出更新請求，若使用者隨後要求停止服務，
+            // 該訊號會排在更新請求之後而被忽略；此時必須改以停機處理，避免停止服務反而觸發檔案替換與重啟
+            if signal_received.load(std::sync::atomic::Ordering::SeqCst) {
+                println!("👋 接收到終止信號（優先於自動更新），Token 戰情室已安全停止。");
                 updater::log_update(
-                    "WARN",
+                    "INFO",
                     "RESTART",
-                    "背景日誌同步未於時限內結束，延後本次自動更新並重啟目前版本",
+                    "終止信號優先於自動更新；取消本次更新並停止服務",
                 );
-                updater::restart_current_process(&target_exe, &args);
+                return;
             }
 
             println!("🔄 看板服務已完成優雅停機，正在執行自動更新並套用新版本...");
@@ -449,7 +467,10 @@ async fn main() {
     }
 }
 
-async fn shutdown_signal(shutdown_tx: tokio::sync::mpsc::Sender<updater::ShutdownReason>) {
+async fn shutdown_signal(
+    shutdown_tx: tokio::sync::mpsc::Sender<updater::ShutdownReason>,
+    signal_received: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
     };
@@ -473,6 +494,8 @@ async fn shutdown_signal(shutdown_tx: tokio::sync::mpsc::Sender<updater::Shutdow
         _ = terminate => {},
     }
 
+    // 先記錄訊號已抵達，再送出停機原因，確保自動更新路徑讀取旗標時訊號已確實發生
+    signal_received.store(true, std::sync::atomic::Ordering::SeqCst);
     let _ = shutdown_tx.send(updater::ShutdownReason::Signal).await;
 }
 
@@ -517,9 +540,8 @@ mod tests {
             shutdown_tx,
             handle,
         };
-        let completed = task.shutdown().await;
+        task.shutdown().await;
 
-        assert!(completed, "同步正常結束時 shutdown 應回報已完成");
         assert!(
             finished.load(std::sync::atomic::Ordering::SeqCst),
             "shutdown 必須等待進行中的同步結束後才返回，避免更新流程在 SQLite 寫入中途終止程序"
@@ -527,35 +549,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_sync_task_shutdown_reports_timeout_when_sync_still_running() {
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    async fn usage_sync_wait_for_completion_keeps_running_blocking_task() {
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let release = std::sync::Arc::new(tokio::sync::Notify::new());
-        let release_handle = release.clone();
+        let release_watcher = release.clone();
 
-        let handle = tokio::spawn(async move {
-            // 模擬無法取消的 spawn_blocking 同步：收到通知後仍需時間完成，遠超過測試逾時
+        let mut handle = tokio::spawn(async move {
+            // 模擬無法取消的 spawn_blocking 同步：收到通知後仍需時間完成
             while !*shutdown_rx.borrow_and_update() {
                 if shutdown_rx.changed().await.is_err() {
                     break;
                 }
             }
-            release_handle.notified().await;
+            release_watcher.notified().await;
         });
 
-        let task = UsageSyncTask {
-            shutdown_tx,
-            handle,
-        };
-        let completed = task
-            .shutdown_with_timeout(std::time::Duration::from_millis(50))
-            .await;
+        let completed =
+            UsageSyncTask::wait_for_completion(&mut handle, std::time::Duration::from_millis(50))
+                .await;
 
+        assert!(!completed, "同步仍在進行時應回報未完成");
         assert!(
-            !completed,
-            "同步仍在進行時 shutdown 必須回報未完成，讓呼叫端延後更新而非在 SQLite 寫入途中替換檔案"
+            !handle.is_finished(),
+            "等待逾時不得取消或丟棄仍在執行的同步任務（spawn_blocking 無法被取消）"
         );
 
+        // 送出停機通知並讓模擬中的同步完成，驗證任務仍可正常結束
+        let _ = _shutdown_tx.send(true);
         release.notify_one();
+        handle.await.unwrap();
     }
 
     #[test]

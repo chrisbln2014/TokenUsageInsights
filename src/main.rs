@@ -252,6 +252,11 @@ async fn main() {
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     spawn_usage_sync_task();
     let pid_guard = updater::create_server_pid_guard();
+    if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
+        updater::detect_environment()
+    {
+        updater::complete_handoff_and_commit_if_needed(&install_dir);
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = graceful_rx.await;

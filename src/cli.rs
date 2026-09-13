@@ -581,6 +581,10 @@ async fn run_update_cli(args: &[String]) -> i32 {
             }
             "-v" | "--target-version" => {
                 let val = next_update_flag_value(args, &mut i, "target-version");
+                if let Err(err) = crate::updater::validate_release_tag(&val) {
+                    eprintln!("❌ {err}");
+                    return 2;
+                }
                 target_version = Some(val);
             }
             arg => {

@@ -552,7 +552,7 @@ cargo build --release --bin token-usage-insights
 
 ### 配置文件 (config.yaml)
 
-除环境变量与命令行标志（如 `--no-auto-update`）外，亦可在 `~/.token-usage-insights/config.yaml`（Windows 为 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`）中设置更新行为：
+除环境变量与命令行标志（如 `--no-auto-update`）外，亦可在数据目录中的 `config.yaml`（预设为 `~/.token-usage-insights/config.yaml`，Windows 为 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`；若设定 `INSIGHTS_DIR` 环境变量则优先读取该目录下的 `config.yaml`，且支援预设路径作为备援）中设置更新行为：
 
 ```yaml
 # ~/.token-usage-insights/config.yaml

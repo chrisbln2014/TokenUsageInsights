@@ -1089,6 +1089,14 @@ fn is_cli_subcommand(arg: &str) -> bool {
     )
 }
 
+fn is_current_process_server() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() <= 1 {
+        return true;
+    }
+    !args[1..].iter().any(|arg| is_cli_subcommand(arg))
+}
+
 fn get_process_cmdline_with_retry(pid: u32) -> Option<Vec<String>> {
     for attempt in 0..3 {
         if let Some(cmd) = get_process_cmdline(pid) {
@@ -1492,10 +1500,28 @@ pub fn parse_config_yaml(content: &str) -> (Option<bool>, Option<i64>) {
 }
 
 pub fn load_update_config() -> (Option<bool>, Option<i64>) {
-    let candidates = [
-        crate::db::get_insights_dir().join("config.yaml"),
-        PathBuf::from("config.yaml"),
-    ];
+    let mut candidates = vec![crate::db::get_insights_dir().join("config.yaml")];
+
+    #[cfg(windows)]
+    if let Some(data_dir) = dirs::data_local_dir() {
+        let def = data_dir.join("TokenUsageInsights").join("config.yaml");
+        if !candidates.contains(&def) {
+            candidates.push(def);
+        }
+    }
+    #[cfg(not(windows))]
+    if let Some(home) = dirs::home_dir() {
+        let def = home.join(".token-usage-insights").join("config.yaml");
+        if !candidates.contains(&def) {
+            candidates.push(def);
+        }
+    }
+
+    let local_cfg = PathBuf::from("config.yaml");
+    if !candidates.contains(&local_cfg) {
+        candidates.push(local_cfg);
+    }
+
     for path in candidates {
         if let Ok(content) = fs::read_to_string(&path) {
             return parse_config_yaml(&content);
@@ -2405,16 +2431,42 @@ fn build_secure_http_client(timeout_secs: u64) -> Result<reqwest::Client, String
         .map_err(|e| format!("建立 HTTP 用戶端失敗: {e}"))
 }
 
+pub fn validate_release_tag(tag: &str) -> Result<String, String> {
+    let trimmed = tag.trim();
+    if trimmed.is_empty() {
+        return Err("版本標籤不可為空".to_string());
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || trimmed.contains('%')
+        || trimmed.contains('?')
+        || trimmed.contains('#')
+    {
+        return Err(format!("無效的版本標籤名稱 (包含非法路徑字符): {trimmed}"));
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '+')
+    {
+        return Err(format!(
+            "無效的版本標籤名稱 (僅支援英數字、點、破折號與加號): {trimmed}"
+        ));
+    }
+    let clean_tag = if trimmed.starts_with('v') || trimmed.starts_with('V') {
+        trimmed.to_string()
+    } else {
+        format!("v{trimmed}")
+    };
+    Ok(clean_tag)
+}
+
 async fn fetch_release(tag_opt: Option<&str>, timeout_secs: u64) -> Result<GitHubRelease, String> {
     let client = build_secure_http_client(timeout_secs)?;
 
     let url = match tag_opt {
         Some(tag) => {
-            let clean_tag = if tag.starts_with('v') || tag.starts_with('V') {
-                tag.to_string()
-            } else {
-                format!("v{tag}")
-            };
+            let clean_tag = validate_release_tag(tag)?;
             format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/tags/{clean_tag}")
         }
         None => {
@@ -2574,6 +2626,13 @@ pub(crate) fn get_installed_version(install_dir: &Path) -> String {
 }
 
 pub async fn run_update(options: UpdateOptions) -> Result<UpdateOutcome, UpdateError> {
+    if let Some(ref tag) = options.target_version {
+        if let Err(err) = validate_release_tag(tag) {
+            log_update("ERROR", "CHECK", &err);
+            return Err(UpdateError::Failure(err));
+        }
+    }
+
     let env_kind = detect_environment();
 
     match &env_kind {
@@ -3229,6 +3288,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
                         );
                         log_update("ERROR", "STOP_SERVICE", &err);
                         let _ = fs::remove_file(&restart_pending_file);
+                        rollback_stopped_dashboard_instances(&stopped_specs, install_dir);
                         return Err(err);
                     }
 
@@ -3308,6 +3368,7 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
             );
             log_update("ERROR", "STOP_SERVICE", &err);
             let _ = fs::remove_file(&restart_pending_file);
+            rollback_stopped_dashboard_instances(&stopped_specs, install_dir);
             return Err(err);
         }
 
@@ -3352,6 +3413,40 @@ fn stop_running_dashboard_instances(install_dir: &Path) -> Result<DashboardProce
         #[cfg(unix)]
         supervised_unix_pids,
     })
+}
+
+fn rollback_stopped_dashboard_instances(specs: &[StoppedProcessSpec], install_dir: &Path) {
+    for spec in specs {
+        if !spec.is_supervised && !is_process_alive(spec.pid) {
+            log_update(
+                "WARN",
+                "STOP_SERVICE",
+                &format!(
+                    "協調停止進程超時或失敗，正在恢復已停止之服務進程 (原 PID: {})",
+                    spec.pid
+                ),
+            );
+            match restart_dashboard_instance(spec, install_dir) {
+                Ok(new_pid) => {
+                    log_update(
+                        "INFO",
+                        "STOP_SERVICE",
+                        &format!(
+                            "已成功恢復服務進程 (原 PID: {}, 新 PID: {new_pid})",
+                            spec.pid
+                        ),
+                    );
+                }
+                Err(err) => {
+                    log_update(
+                        "ERROR",
+                        "STOP_SERVICE",
+                        &format!("恢復服務進程失敗 (原 PID: {}): {err}", spec.pid),
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn restart_dashboard_instance(
@@ -4238,7 +4333,7 @@ pub(crate) fn apply_installation_with_rollback(
             log_update(
                 "ERROR",
                 "STOP_SERVICE",
-                &format!("停止服務進程失敗，已清理備份目錄: {err}"),
+                &format!("停止服務進程失敗，已清理備份目錄並恢復已停止之服務進程: {err}"),
             );
             return Err(UpdateError::Failure(err));
         }
@@ -4647,14 +4742,44 @@ pub(crate) fn apply_installation_with_rollback(
         && !is_windows_service_runner()
         && !process_plan.stopped_specs.iter().any(|s| s.is_supervised)
     {
-        match schedule_windows_deferred_restart(None, install_dir, &expected_version) {
+        let current_spec = if is_current_process_server() {
+            Some(StoppedProcessSpec {
+                pid: std::process::id(),
+                is_supervised: false,
+                supervisor_pid: None,
+                is_server: true,
+                exe_path: target_exe.clone(),
+                args: Some(std::env::args().collect()),
+                envs: std::env::vars().collect(),
+                cwd: std::env::current_dir().ok(),
+            })
+        } else {
+            None
+        };
+        match schedule_windows_deferred_restart(
+            current_spec.as_ref(),
+            install_dir,
+            &expected_version,
+        ) {
             Ok(_) => {
-                println!("🔄 已排定移交守護進程於更新程序退出後驗證新版執行檔置換並完成提交。");
-                log_update(
-                    "INFO",
-                    "RESTART",
-                    &format!("已排定移交守護進程於更新程序退出後驗證新版執行檔 (目標版本: {expected_version}) 並提交清理備份"),
-                );
+                if current_spec.is_some() {
+                    server_restarted = true;
+                    println!(
+                        "🔄 已排定移交守護進程於更新程序退出後重新啟動新版看板服務並驗證健康就緒。"
+                    );
+                    log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!("已排定移交守護進程於更新程序退出後重啟新版看板 (目標版本: {expected_version}) 並驗證健康就緒後清理備份"),
+                    );
+                } else {
+                    println!("🔄 已排定移交守護進程於更新程序退出後驗證新版執行檔置換並完成提交。");
+                    log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!("已排定移交守護進程於更新程序退出後驗證新版執行檔 (目標版本: {expected_version}) 並提交清理備份"),
+                    );
+                }
             }
             Err(err) => {
                 let msg = format!("排定 Windows 移交驗證進程失敗: {err}");
@@ -4864,7 +4989,25 @@ pub(crate) fn apply_installation_with_rollback(
                 {
                     let original_version =
                         fs::read_to_string(install_dir.join("VERSION")).unwrap_or_default();
-                    let _ = schedule_windows_deferred_restart(None, install_dir, &original_version);
+                    let current_spec = if is_current_process_server() {
+                        Some(StoppedProcessSpec {
+                            pid: std::process::id(),
+                            is_supervised: false,
+                            supervisor_pid: None,
+                            is_server: true,
+                            exe_path: target_exe.clone(),
+                            args: Some(std::env::args().collect()),
+                            envs: std::env::vars().collect(),
+                            cwd: std::env::current_dir().ok(),
+                        })
+                    } else {
+                        None
+                    };
+                    let _ = schedule_windows_deferred_restart(
+                        current_spec.as_ref(),
+                        install_dir,
+                        &original_version,
+                    );
                 }
             }
 
@@ -4884,7 +5027,7 @@ pub(crate) fn apply_installation_with_rollback(
         }
         #[cfg(not(windows))]
         {
-            false
+            is_current_exe && is_current_process_server()
         }
     };
 
@@ -4895,7 +5038,7 @@ pub(crate) fn apply_installation_with_rollback(
         log_update(
             "INFO",
             "CLEANUP",
-            "Windows 非同步/監管重啟已就緒；寫入移交標記 (.handing_off) 並保留備份目錄直至服務管理器或移交守護進程驗證新版就緒後清理",
+            "非同步/移交重啟已就緒；寫入移交標記 (.handing_off) 並保留備份目錄直至新版進程或服務管理器驗證健康就緒後清理",
         );
         return Ok(server_restarted);
     }
@@ -5038,18 +5181,31 @@ pub(crate) fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let mut cmd = std::process::Command::new(exe);
+        let mut cmd = std::process::Command::new(&exe);
         if args.len() > 1 {
             cmd.args(&args[1..]);
         }
         cmd.env("_TOKEN_USAGE_INSIGHTS_RESTARTED", "1");
         let err = cmd.exec();
-        eprintln!("❌ 自動重啟進程失敗: {err}；請手動重新啟動程序。");
+        eprintln!("❌ 自動重啟進程失敗: {err}；正在從備份自動回滾...");
         log_update(
             "ERROR",
             "STARTUP_RESTART",
-            &format!("自動重啟進程失敗: {err}"),
+            &format!("自動重啟進程失敗: {err}；正在從備份自動回滾"),
         );
+        if let Some(parent) = exe.parent() {
+            let backup_dir = parent.join(".backup");
+            if backup_dir.exists() {
+                if let Err(e) = restore_from_backup(&backup_dir, parent) {
+                    eprintln!("❌ 回滾失敗: {e}；備份已保留於 {backup_dir:?}");
+                    log_update("ERROR", "STARTUP_RESTART", &format!("回滾失敗: {e}"));
+                } else {
+                    eprintln!("✅ 已成功回滾至先前版本。");
+                    log_update("INFO", "STARTUP_RESTART", "已成功回滾至先前版本");
+                    let _ = fs::remove_dir_all(&backup_dir);
+                }
+            }
+        }
         std::process::exit(1);
     }
 
@@ -5067,6 +5223,18 @@ pub(crate) fn restart_current_process(exe_path: &Path, args: &[String]) -> ! {
             );
             std::process::exit(75);
         } else {
+            // 檢查是否已有移交守護進程排定接手重啟；若已有排定，退出目前進程由移交守護進程負責啟動與驗證健康
+            if let Some(parent) = exe.parent() {
+                let handoff_marker = parent.join(".backup").join(".handing_off");
+                if handoff_marker.exists() && is_current_process_server() {
+                    log_update(
+                        "INFO",
+                        "STARTUP_RESTART",
+                        "移交守護進程已排定接手新版進程啟動與健康驗證，目前進程安全退出以釋放資源",
+                    );
+                    std::process::exit(0);
+                }
+            }
             let mut cmd = std::process::Command::new(exe);
             if args.len() > 1 {
                 cmd.args(&args[1..]);
@@ -5241,14 +5409,24 @@ fn attempt_startup_recovery(install_dir: &Path, args: &[String]) -> RecoveryStat
             },
             Err(_) => false,
         };
+        let attempt_file = backup_dir.join(".startup_attempt");
         if is_valid {
-            log_update(
-                "INFO",
-                "STARTUP_RECOVERY",
-                "偵測到非同步重啟移交標記 (.handing_off) 且處於驗證窗口內，略過自動回滾以利守護進程執行健康驗證",
-            );
-            drop(recovery_lock);
-            return RecoveryStatus::CleanedOrNoBackup;
+            if !attempt_file.exists() {
+                let _ = safe_write_file(&attempt_file, std::process::id().to_string().as_bytes());
+                log_update(
+                    "INFO",
+                    "STARTUP_RECOVERY",
+                    "偵測到非同步重啟移交標記 (.handing_off)，記錄啟動嘗試並略過回滾以利新版執行健康啟動",
+                );
+                drop(recovery_lock);
+                return RecoveryStatus::CleanedOrNoBackup;
+            } else {
+                log_update(
+                    "WARN",
+                    "STARTUP_RECOVERY",
+                    "偵測到新版服務先前啟動嘗試未確認健康即異常終止，執行自動救援回滾至健全版本",
+                );
+            }
         } else {
             log_update(
                 "WARN",
@@ -5388,6 +5566,34 @@ pub async fn perform_startup_recovery() {
     }
 }
 
+pub fn complete_handoff_and_commit_if_needed(install_dir: &Path) {
+    let backup_dir = install_dir.join(".backup");
+    if !backup_dir.exists() {
+        return;
+    }
+    let handoff_marker = backup_dir.join(".handing_off");
+    if handoff_marker.exists() {
+        log_update(
+            "INFO",
+            "STARTUP",
+            "新版看板服務已確認啟動健康就緒，完成移交握手並提交更新",
+        );
+        let _ = safe_write_file(&backup_dir.join(".committed"), b"committed");
+        let _ = fs::remove_file(&handoff_marker);
+        let _ = fs::remove_file(backup_dir.join(".startup_attempt"));
+        if let Err(e) = fs::remove_dir_all(&backup_dir) {
+            log_update(
+                "WARN",
+                "STARTUP",
+                &format!("清理移交備份目錄失敗: {e}，嘗試改名隔離"),
+            );
+            let quarantined =
+                install_dir.join(format!(".backup-quarantined-{}", Utc::now().timestamp()));
+            let _ = fs::rename(&backup_dir, &quarantined);
+        }
+    }
+}
+
 pub fn spawn_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<ShutdownReason>) {
     tokio::spawn(async move {
         // 延遲 1 秒執行，確保主服務監聽與 TCP 綁定先行就緒，離線或慢速網路零阻塞
@@ -5489,6 +5695,8 @@ async fn run_background_auto_update(shutdown_tx: tokio::sync::mpsc::Sender<Shutd
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[test]
     fn semver_parsing_and_newer_comparison() {
@@ -5707,8 +5915,11 @@ update_check_interval: 5 # check every 5 days
         assert!(is_process_alive(current_pid));
     }
 
-    #[test]
-    fn is_windows_service_runner_checks_truthy_values() {
+    #[tokio::test]
+    async fn is_windows_service_runner_checks_truthy_values() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let original_env = std::env::var("TOKEN_USAGE_INSIGHTS_SERVICE").ok();
+
         std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", "1");
         assert!(is_windows_service_runner());
 
@@ -5726,6 +5937,12 @@ update_check_interval: 5 # check every 5 days
 
         std::env::remove_var("TOKEN_USAGE_INSIGHTS_SERVICE");
         assert!(!is_windows_service_runner());
+
+        if let Some(orig) = original_env {
+            std::env::set_var("TOKEN_USAGE_INSIGHTS_SERVICE", orig);
+        } else {
+            std::env::remove_var("TOKEN_USAGE_INSIGHTS_SERVICE");
+        }
     }
 
     #[test]
@@ -6628,8 +6845,6 @@ update_check_interval: 5 # check every 5 days
         let _ = fs::remove_dir_all(&temp);
     }
 
-    static ENV_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     #[tokio::test]
     async fn wait_for_parent_exit_returns_immediately_when_no_env() {
         let _guard = ENV_TEST_MUTEX.lock().await;
@@ -7275,5 +7490,83 @@ update_check_interval: 5 # check every 5 days
         // 確保救援與損毀檢查（如 .rollback_failed）不會被跳過。在正常環境下應安全完成。
         perform_startup_recovery().await;
         std::env::remove_var("_TOKEN_USAGE_INSIGHTS_RESTARTED");
+    }
+
+    #[test]
+    fn validate_release_tag_accepts_valid_and_rejects_malicious() {
+        // 合法標籤
+        assert_eq!(validate_release_tag("v0.9.6").unwrap(), "v0.9.6");
+        assert_eq!(validate_release_tag("0.9.6").unwrap(), "v0.9.6");
+        assert_eq!(validate_release_tag("V1.0.0").unwrap(), "V1.0.0");
+        assert_eq!(validate_release_tag("v1.2.3-rc.1").unwrap(), "v1.2.3-rc.1");
+        assert_eq!(
+            validate_release_tag("1.2.3+build42").unwrap(),
+            "v1.2.3+build42"
+        );
+
+        // 空值或全空白
+        assert!(validate_release_tag("").is_err());
+        assert!(validate_release_tag("   ").is_err());
+
+        // 路徑穿越與跳脫字元
+        assert!(validate_release_tag("../latest").is_err());
+        assert!(validate_release_tag("..").is_err());
+        assert!(validate_release_tag("v1..0").is_err());
+        assert!(validate_release_tag("/api/v1").is_err());
+        assert!(validate_release_tag("v1/2").is_err());
+        assert!(validate_release_tag("v1\\2").is_err());
+        assert!(validate_release_tag("v1%20foo").is_err());
+        assert!(validate_release_tag("v1?foo=bar").is_err());
+        assert!(validate_release_tag("v1#section").is_err());
+        assert!(validate_release_tag("v1*").is_err());
+        assert!(validate_release_tag("v1 0").is_err());
+    }
+
+    #[test]
+    fn complete_handoff_and_commit_cleans_backup() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-handoff-commit-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join(".handing_off"), "handing_off").unwrap();
+        fs::write(backup_dir.join(".startup_attempt"), "1234").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+
+        complete_handoff_and_commit_if_needed(&install_dir);
+
+        assert!(!backup_dir.exists(), "備份目錄應已被清理或更名隔離");
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn attempt_startup_recovery_tracks_startup_attempt() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-startup-attempt-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        let backup_dir = install_dir.join(".backup");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "v0.9.6").unwrap();
+        fs::write(backup_dir.join("VERSION"), "v0.9.5").unwrap();
+        fs::write(backup_dir.join(".manifest"), "VERSION\n").unwrap();
+        fs::write(backup_dir.join(".handing_off"), Utc::now().to_rfc3339()).unwrap();
+
+        let args = vec!["token-usage-insights".to_string()];
+
+        // 第一次嘗試：無 .startup_attempt，應記錄 .startup_attempt 並略過回滾 (CleanedOrNoBackup)
+        let status1 = attempt_startup_recovery(&install_dir, &args);
+        assert_eq!(status1, RecoveryStatus::CleanedOrNoBackup);
+        assert!(backup_dir.join(".startup_attempt").exists());
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "v0.9.6"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 }

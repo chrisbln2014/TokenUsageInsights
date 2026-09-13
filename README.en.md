@@ -552,7 +552,7 @@ Paths specified by environment variables are authoritative and do not need to be
 
 ### Configuration file (config.yaml)
 
-In addition to environment variables and command-line flags (such as `--no-auto-update`), update behavior can also be configured in `~/.token-usage-insights/config.yaml` (`%LOCALAPPDATA%\TokenUsageInsights\config.yaml` on Windows):
+In addition to environment variables and command-line flags (such as `--no-auto-update`), update behavior can also be configured in `config.yaml` located in the insights data directory (`~/.token-usage-insights/config.yaml` by default, or `%LOCALAPPDATA%\TokenUsageInsights\config.yaml` on Windows; if `INSIGHTS_DIR` is set, `config.yaml` in that directory takes precedence, with the default path supported as a fallback):
 
 ```yaml
 # ~/.token-usage-insights/config.yaml

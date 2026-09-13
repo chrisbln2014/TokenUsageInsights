@@ -552,7 +552,7 @@ cargo build --release --bin token-usage-insights
 
 ### 설정 파일 (config.yaml)
 
-환경 변수 및 명령줄 플래그(`--no-auto-update` 등) 외에도 `~/.token-usage-insights/config.yaml`(Windows의 경우 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`)에서 업데이트 동작을 설정할 수 있습니다:
+환경 변수 및 명령줄 플래그(`--no-auto-update` 등) 외에도 데이터 디렉터리의 `config.yaml`(기본값은 `~/.token-usage-insights/config.yaml`, Windows의 경우 `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`; `INSIGHTS_DIR` 환경 변수가 설정된 경우 해당 디렉터리의 `config.yaml`이 우선 적용되며 기본 경로도 대체 경로로 지원됨)에서 업데이트 동작을 설정할 수 있습니다:
 
 ```yaml
 # ~/.token-usage-insights/config.yaml

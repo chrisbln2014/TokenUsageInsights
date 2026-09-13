@@ -4485,7 +4485,7 @@ fn restart_windows_supervised_service(
     // 2c. 若以上皆未成功，回退直接以 restart_dashboard_instance 或移交守護啟動看板進程
     if !started {
         if is_current_exe {
-            schedule_windows_deferred_restart(spec, install_dir, expected_version)?;
+            schedule_windows_deferred_restart(Some(spec), install_dir, expected_version)?;
             return Ok(None);
         }
         return restart_dashboard_instance(spec, install_dir).map(Some);
@@ -5058,7 +5058,11 @@ fn apply_installation_with_rollback(
         );
 
         // 回滾前先終止本輪重啟已成功啟動之新版子進程及可能已由 Unix 監管者重啟之新版進程，避免新舊進程同時存活導致連接埠衝突或重複執行
+        // 僅 Unix 需追加監管進程 PID（讀取 .server.pid 並確認監管者），Windows 端僅停止 spawned_pids，故不需要可變綁定
+        #[cfg(unix)]
         let mut rollback_stop_pids = spawned_pids.clone();
+        #[cfg(not(unix))]
+        let rollback_stop_pids = spawned_pids.clone();
         #[cfg(unix)]
         {
             for &sup_pid in &process_plan.supervised_unix_pids {
@@ -6323,6 +6327,13 @@ update_check_interval: 5 # check every 5 days
             assert!(!args.is_empty(), "cmdline should have at least argv[0]");
             let expected_args: Vec<String> = std::env::args().collect();
             assert_eq!(args, expected_args, "cmdline should match std::env::args()");
+        }
+        #[cfg(windows)]
+        {
+            // Windows 端需具備讀取自身行程 PEB 的權限，讀取失敗時回傳 None 屬合理結果
+            if let Some(args) = cmdline {
+                assert!(!args.is_empty(), "cmdline should have at least argv[0]");
+            }
         }
     }
 

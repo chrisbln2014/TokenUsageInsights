@@ -1082,6 +1082,14 @@ if (Restore-ServiceBackup -InstallDir '$linkedInstallDir') { exit 2 } else { exi
     Assert-True ($fnDefHealth[0].Extent.Text -match '(?s)return \$false\s*\}') "Test-IsProcessHealthy must return false on timeout."
     Assert-True ($fnDefHealth[0].Extent.Text -match 'Test-ServicePortResponding') "Test-IsProcessHealthy must verify the service port accepts connections."
     Assert-True ($fnDefHealth[0].Extent.Text -match 'HealthDwellMilliseconds') "Test-IsProcessHealthy must require a liveness dwell window."
+    $fnDefGracefulStop = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Stop-ServiceProcessGracefully" }, $true)
+    Assert-True ($null -ne $fnDefGracefulStop -and $fnDefGracefulStop.Count -eq 1) "run-service.ps1 should define Stop-ServiceProcessGracefully."
+    Assert-True ($fnDefGracefulStop[0].Extent.Text -match '\.service_stop_requested') "Stop-ServiceProcessGracefully must request a graceful stop through .service_stop_requested."
+    Assert-True (-not ($fnDefGracefulStop[0].Extent.Text -match 'Stop-Process')) "Stop-ServiceProcessGracefully must not force-terminate the dashboard."
+    $restartPendingSegment = [regex]::Match($whileBodyText, '(?s)if \(Test-Path -LiteralPath \$restartPendingFile\) \{(.{0,900}?)break')
+    Assert-True $restartPendingSegment.Success "run-service.ps1 should handle the pending restart marker inside the wait loop."
+    Assert-True (-not ($restartPendingSegment.Value -match 'Stop-Process')) "run-service.ps1 must not force-terminate the dashboard when an update is pending."
+    Assert-True ($restartPendingSegment.Value -match 'Stop-ServiceProcessGracefully') "run-service.ps1 must coordinate a graceful stop when an update is pending."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)\.committed.*保留目前版本') "Restore-ServiceBackup must not roll back an already committed backup."
     Assert-True ($fnDefRestore[0].Extent.Text -match '(?s)managedItems.*Remove-Item') "Restore-ServiceBackup must clean unmanifested managed items."
     Assert-True ($fnDefRestore[0].Extent.Text -match '"install\.sh"') "Restore-ServiceBackup managedItems must contain install.sh."

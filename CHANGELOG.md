@@ -4,6 +4,12 @@
 
 ## [未發行]
 
+### 新增與改善
+
+- 新增原地自動更新功能：`update`／`--update` CLI 子命令可檢查並安裝最新版本，看板啟動後亦會依設定的間隔自動檢查更新；更新流程以 `.backup` 備份交易搭配 `.update.lock` 更新鎖執行，並在檔案替換前完成下載與 SHA256 校驗。
+- 新增雙平台重啟移交協定：更新完成後由新版看板（Unix 由 systemd／launchd 監管重啟，Windows 由 `run-service.ps1` 或延遲重啟守護進程接手）完成健康確認，健康就緒即標記 `.committed` 並清理備份，啟動失敗則自備份自動回滾至先前版本；服務 runner 於健康驗證通過後才提交更新，並以 `.service_stop_requested` 要求看板優雅停機。
+- 更新流程支援終止訊號取消（下載與校驗期間收到 SIGTERM／CTRL+C 即中止且不變更任何檔案），並於停機時等待背景日誌同步（含 SQLite 寫入）完成後才結束程序。
+
 ### 修正
 
 - 修復 Codex 工作階段耗時永遠顯示為「-」的問題（[#43](https://github.com/doggy8088/TokenUsageInsights/issues/43)、[#48](https://github.com/doggy8088/TokenUsageInsights/pull/48)）。解析 Codex transcript 中的 `event_msg/task_complete` 事件並累加已完成 task 的 `payload.duration_ms`，寫入資料庫的 `duration_ms` 欄位；更新 parser migration marker 至 `migration:codex_session_identity_v7`，觸發既有 Codex transcript 重新同步以補齊耗時資訊。

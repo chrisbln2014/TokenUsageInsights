@@ -271,6 +271,31 @@ function Wait-ForUpdateLockRelease {
     return (-not (Test-IsUpdateLockHeld -LockFile $LockFile))
 }
 
+function Stop-ServiceProcessGracefully {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$InstallDir,
+        [int]$TimeoutSeconds = 30
+    )
+
+    # 透過協商標記要求看板進程優雅停機（完成進行中的資料庫寫入後自行退出），
+    # 逾時不強制終止：強制終止會中斷 spawn_blocking 中的 SQLite 寫入，由呼叫端 fail closed 處理
+    $stopRequestFile = Join-Path $InstallDir ".service_stop_requested"
+    Set-Content -LiteralPath $stopRequestFile -Value "stop" -Force -ErrorAction SilentlyContinue
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while (((Get-Date) -lt $deadline) -and (-not $Process.HasExited)) {
+        Start-Sleep -Milliseconds 200
+    }
+    Remove-Item -LiteralPath $stopRequestFile -Force -ErrorAction SilentlyContinue
+    if (-not $Process.HasExited) {
+        return $false
+    }
+    try {
+        $null = $Process.WaitForExit(5000)
+    } catch {}
+    return $true
+}
+
 function Test-ServicePortResponding {
     param(
         [string]$HostAddress = $null,
@@ -737,11 +762,10 @@ while ($true) {
     try {
         while (-not $Process.WaitForExit(1000)) {
             if (Test-Path -LiteralPath $restartPendingFile) {
-                Write-Host "偵測到更新程序已啟動並設定重啟協商標記，正在協調停止目前服務進程..."
-                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-                try {
-                    $null = $Process.WaitForExit(5000)
-                } catch {}
+                Write-Host "偵測到更新程序已啟動並設定重啟協商標記，正在協調服務進程優雅停機..."
+                if (-not (Stop-ServiceProcessGracefully -Process $Process -InstallDir $InstallDir)) {
+                    Exit-WithError -Message "等待看板進程完成優雅停機逾時（30 秒）；為避免中斷進行中的資料庫寫入，已保留更新備份並保持停止狀態，請確認進程狀態後重試。"
+                }
                 break
             }
 
@@ -750,10 +774,9 @@ while ($true) {
             if (($outItem -and $outItem.Length -ge $MaxActiveLogBytes) -or ($errItem -and $errItem.Length -ge $MaxActiveLogBytes)) {
                 Write-Warning "Active log size exceeded ${MaxActiveLogBytes} bytes. Restarting service to rotate logs..."
                 $restartForLogRotation = $true
-                Stop-Process -Id $Process.Id -Force -ErrorAction SilentlyContinue
-                try {
-                    $null = $Process.WaitForExit(5000)
-                } catch {}
+                if (-not (Stop-ServiceProcessGracefully -Process $Process -InstallDir $InstallDir)) {
+                    Exit-WithError -Message "等待看板進程完成優雅停機逾時（30 秒）；為避免中斷進行中的資料庫寫入，日誌輪轉將於下次啟動時重試。"
+                }
                 break
             }
         }

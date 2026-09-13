@@ -23,6 +23,9 @@ const MAX_EXTRACTED_ENTRIES: usize = 10_000; // 最多 10,000 個檔案/目錄
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub server_restarted: bool,
+    /// 是否確實完成檔案安裝；若其他更新程序已搶先完成升級或已是最新版本則為 false，
+    /// 呼叫端不得僅因 Ok 就重啟服務
+    pub installed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2784,6 +2787,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<UpdateOutcome, UpdateE
                 );
                 return Ok(UpdateOutcome {
                     server_restarted: false,
+                    installed: false,
                 });
             }
             let msg = r#"⚠️ 偵測到目前透過 npm / npx 執行，不支援直接原地自我更新。
@@ -2810,6 +2814,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<UpdateOutcome, UpdateE
                 );
                 return Ok(UpdateOutcome {
                     server_restarted: false,
+                    installed: false,
                 });
             }
             let msg = format!(
@@ -2834,6 +2839,7 @@ pub async fn run_update(options: UpdateOptions) -> Result<UpdateOutcome, UpdateE
                 );
                 return Ok(UpdateOutcome {
                     server_restarted: false,
+                    installed: false,
                 });
             }
             let msg = format!(
@@ -2913,6 +2919,7 @@ pub(crate) async fn run_update_in_dir(
         print_and_log_check_result(remote_version, current_version, hint);
         return Ok(UpdateOutcome {
             server_restarted: false,
+            installed: false,
         });
     }
 
@@ -2925,6 +2932,7 @@ pub(crate) async fn run_update_in_dir(
         log_update("INFO", "CHECK", "已是最新版本，略過更新");
         return Ok(UpdateOutcome {
             server_restarted: false,
+            installed: false,
         });
     }
 
@@ -3149,7 +3157,10 @@ pub(crate) async fn run_update_in_dir(
 
     let _ = tmp_guard.cleanup();
 
-    Ok(UpdateOutcome { server_restarted })
+    Ok(UpdateOutcome {
+        server_restarted,
+        installed: true,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5054,20 +5065,28 @@ fn apply_installation_with_rollback(
             }
         }
 
-        let stop_deadline = Instant::now() + Duration::from_secs(3);
+        // 等待本輪已啟動之新版進程完成優雅停機（含進行中的資料庫寫入）。
+        // 逾時時不再強制終止：SIGKILL 會中斷 spawn_blocking 中的 SQLite 寫入，
+        // 故改為保留備份與目前狀態並中止回滾，交由維運或服務管理器處理
+        let stop_deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < stop_deadline
             && rollback_stop_pids.iter().any(|&p| is_process_alive(p))
         {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        #[cfg(unix)]
-        for &stop_pid in &rollback_stop_pids {
-            if is_process_alive(stop_pid) {
-                unsafe {
-                    libc::kill(stop_pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
+        let still_running: Vec<u32> = rollback_stop_pids
+            .iter()
+            .copied()
+            .filter(|&pid| is_process_alive(pid))
+            .collect();
+        if !still_running.is_empty() {
+            let msg = format!(
+                "本輪已啟動之新版進程 (PID: {still_running:?}) 未於 30 秒內完成優雅停機；為避免中斷進行中的資料庫寫入，已保留備份 ({backup_dir:?}) 並中止回滾，請確認進程狀態後重試"
+            );
+            eprintln!("❌ {msg}");
+            log_update("ERROR", "ROLLBACK", &msg);
+            return Err(UpdateError::RollbackFailed(msg));
         }
 
         if let Err(rollback_err) = restore_from_backup(backup_dir, install_dir) {
@@ -7795,6 +7814,50 @@ update_check_interval: 5 # check every 5 days
             let bytes = gz.finish().unwrap();
             (archive_name, bytes)
         }
+    }
+
+    #[tokio::test]
+    async fn run_update_in_dir_reports_no_install_when_already_current() {
+        let temp = std::env::temp_dir().join(format!(
+            "test-noop-update-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let install_dir = temp.join("install");
+        fs::create_dir_all(&install_dir).unwrap();
+        fs::write(install_dir.join("VERSION"), "0.9.5\n").unwrap();
+        fs::write(
+            install_dir.join(".install_marker"),
+            "token-usage-insights:installed",
+        )
+        .unwrap();
+
+        // 目標版本與現行版本相同：更新流程應視為無需安裝並回報 installed = false，呼叫端不得因此重啟服務
+        let release = GitHubRelease {
+            tag_name: "v0.9.5".to_string(),
+            assets: Vec::new(),
+        };
+        let options = UpdateOptions {
+            check_only: false,
+            force: false,
+            target_version: None,
+            prefetched_release: Some(release),
+            cancel_flag: None,
+        };
+
+        let outcome = run_update_in_dir(&install_dir, options)
+            .await
+            .expect("已是最新版本時應正常結束");
+        assert!(
+            !outcome.installed,
+            "未執行任何安裝時 installed 必須為 false，避免自動更新流程進行不必要的重啟"
+        );
+        assert!(!outcome.server_restarted);
+        assert_eq!(
+            fs::read_to_string(install_dir.join("VERSION")).unwrap(),
+            "0.9.5\n"
+        );
+
+        let _ = fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]

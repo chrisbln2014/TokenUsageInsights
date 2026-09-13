@@ -258,6 +258,31 @@ async fn main() {
     // 啟動背景非阻塞自動更新檢查（若非標準安裝或檢查間隔未滿將自動略過）
     updater::spawn_background_auto_update(shutdown_reason_tx.clone());
 
+    // 服務 runner 可透過 .service_stop_requested 要求看板優雅停機：
+    // 讓進程完成進行中的資料庫寫入後自行退出，避免以強制終止中斷 SQLite 寫入
+    if let updater::EnvironmentKind::StandardInstalled { install_dir, .. } =
+        updater::detect_environment()
+    {
+        let stop_watch_tx = shutdown_reason_tx.clone();
+        tokio::spawn(async move {
+            let stop_request = install_dir.join(".service_stop_requested");
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if stop_request.exists() {
+                    let _ = std::fs::remove_file(&stop_request);
+                    println!("👋 收到服務 runner 之優雅停機要求，開始結束服務...");
+                    updater::log_update(
+                        "INFO",
+                        "SHUTDOWN",
+                        "收到服務 runner 之優雅停機要求 (.service_stop_requested)",
+                    );
+                    let _ = stop_watch_tx.send(updater::ShutdownReason::Signal).await;
+                    return;
+                }
+            }
+        });
+    }
+
     let signal_tx = shutdown_reason_tx.clone();
     // 記錄終止訊號是否已抵達：自動更新路徑需要據此讓訊號優先於更新請求
     let signal_received = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -458,6 +483,22 @@ async fn main() {
             handoff_commit_allowed.store(false, std::sync::atomic::Ordering::SeqCst);
 
             match updater::run_update(opts).await {
+                Ok(outcome) if !outcome.installed => {
+                    // 另一個更新程序已搶先完成升級，或已是最新版本而無需安裝：此時不得重啟服務
+                    let current = install_dir
+                        .as_deref()
+                        .map(updater::get_installed_version)
+                        .unwrap_or_else(|| "最新版".to_string());
+                    println!(
+                        "✅ 無需變更安裝（其他更新程序已完成或已是最新版本），目前版本 v{current}；維持服務運作。"
+                    );
+                    updater::log_update(
+                        "INFO",
+                        "RESTART",
+                        &format!("未執行安裝（其他更新程序已完成或已是最新版本），維持目前版本 v{current} 與服務運作"),
+                    );
+                    return;
+                }
                 Ok(_outcome) => {
                     let installed = install_dir
                         .as_deref()

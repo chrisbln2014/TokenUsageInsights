@@ -4,6 +4,21 @@
 
 ## [未發行]
 
+## [0.9.9] - 2026-09-14
+
+### 新增與改善
+
+- 強化看板啟動訊息：在互動式終端機以醒目的粗體亮色分隔橫幅顯示實際看板網址；非互動輸出維持純文字，不會在服務日誌中寫入 ANSI 控制碼。
+- 手動於互動式終端機啟動時，連接埠監聽成功後會自動使用平台預設瀏覽器開啟看板。macOS 使用 `open`，Linux 依序使用 `xdg-open` 與 `gio open`，Windows 使用 `cmd.exe start`，WSL 則優先交由 Windows 預設瀏覽器處理並提供 `wslview`、`xdg-open` 後援；瀏覽器啟動失敗只會提示手動網址，不影響看板服務。
+
+### 變更
+
+- Linux systemd、macOS launchd 與 Windows 背景 runner 會明確設定內部服務模式標記 `TOKEN_USAGE_INSIGHTS_SERVICE=1`；程式同時要求標準輸入與標準輸出皆連接終端機，只有非服務的手動互動模式才會自動開啟瀏覽器。
+
+### 相容性
+
+- 本次不涉及資料庫結構、HTTP API、既有資料來源或公開設定介面的變更。手動互動式啟動新增自動開啟瀏覽器行為；背景服務與非互動模式維持不開啟瀏覽器。
+
 ## [0.9.8] - 2026-09-14
 
 ### 新增與改善
@@ -625,7 +640,8 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...HEAD
+[0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.8
 [0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.3...v0.9.4

@@ -5581,7 +5581,14 @@ fn is_auto_update_cli_flag_present(args: &[String]) -> bool {
     false
 }
 
+/// 本 fork 一律不自動更新：更新來源是 doggy8088 官方 Release，會覆蓋 fork 的自訂功能；
+/// upstream 改由維護者手動合併
+const FORK_AUTO_UPDATE_DISABLED: bool = true;
+
 fn is_auto_update_disabled(args: &[String]) -> bool {
+    if FORK_AUTO_UPDATE_DISABLED {
+        return true;
+    }
     if is_auto_update_cli_flag_present(args) {
         return true;
     }
@@ -7297,6 +7304,23 @@ update_check_interval: 5 # check every 5 days
         assert!(!is_cli_subcommand("--no-auto-update"));
         assert!(!is_cli_subcommand("--port"));
         assert!(!is_cli_subcommand("3003"));
+    }
+
+    #[tokio::test]
+    async fn fork_never_auto_updates_even_when_explicitly_enabled() {
+        let _guard = ENV_TEST_MUTEX.lock().await;
+        let previous = std::env::var_os("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE");
+        std::env::set_var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE", "1");
+        let disabled = is_auto_update_disabled(&["token-usage-insights".to_string()]);
+        match previous {
+            Some(value) => std::env::set_var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE", value),
+            None => std::env::remove_var("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE"),
+        }
+
+        assert!(
+            disabled,
+            "fork 版不可自動更新（官方 Release 會覆蓋 fork 功能），即使明確設定 TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=1"
+        );
     }
 
     #[test]

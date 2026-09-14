@@ -34,9 +34,9 @@ Windows PowerShell：
 irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex; & "$HOME\bin\token-usage-insights.cmd"
 ```
 
-`npx` 與安裝腳本都會下載目前平台的已編譯版本，不需要 Rust、Cargo、WSL 或手動解壓縮。指令執行後，看板會在本機執行。
+`npx` 與安裝腳本都會下載目前平台的已編譯版本，不需要 Rust、Cargo、WSL 或手動解壓縮。指令執行後，看板會在本機執行。從互動式終端機手動啟動時，程式會在連接埠監聽成功後，自動使用作業系統的預設瀏覽器開啟看板；以 systemd、launchd 或 Windows 背景 runner 執行服務時不會開啟瀏覽器。
 
-開啟：
+非互動模式下可手動開啟：
 
 ```text
 http://localhost:3003

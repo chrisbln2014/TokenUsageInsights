@@ -30,12 +30,13 @@ Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.tran
 
 Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、模型 Session 明細、單日匯出／匯入、匯入批次查詢與回滾。
 
-## 與 upstream 自動更新的關係（v0.9.8 起）
+## 自動更新：本 fork 已永久停用
 
-upstream v0.9.8 起看板預設會自動更新，下載來源固定是 `doggy8088/TokenUsageInsights` 的官方 Release（不含本 fork 的 snapshot 功能）。
+upstream v0.9.8 起看板預設會自動更新，下載來源固定是 `doggy8088/TokenUsageInsights` 的官方 Release（不含本 fork 的 snapshot 功能）。本 fork 雲端與地端都**一律不自動更新**，upstream 的新版本改由維護者手動合併程式碼。
 
-- Cloud Run：snapshot 模式在啟動時就跳過更新流程，`Dockerfile` 另設 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0` 作為雙重保險。
-- 本機：若把本 fork 建置的執行檔安裝到 `%LOCALAPPDATA%\TokenUsageInsights`（upstream 判定為「標準安裝」的位置），自動更新會把它換成官方版，`--export-snapshot` 隨之消失。請在啟動看板的環境設 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`，或啟動時加 `--no-auto-update`。
+- 地端：`src/updater.rs` 的 `FORK_AUTO_UPDATE_DISABLED` 讓背景自動更新永遠停用；`TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=1`、`config.yaml` 的 `auto_update: true` 都無效（`tests/auto_update_disabled.rs` 以模擬標準安裝驗證）。
+- Cloud Run：snapshot 模式在啟動時就跳過更新流程，`Dockerfile` 也設 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`。
+- ⚠️ 手動 `token-usage-insights update` 子命令仍在，執行後會下載官方版覆蓋本 fork，不要使用。
 
 ## 本機匯出
 

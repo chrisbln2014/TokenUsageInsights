@@ -6,6 +6,12 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-09-14 - fork 版永久停用自動更新
+- **決策**：upstream 自動更新會下載 doggy8088 官方 Release 覆蓋 fork 功能；雲端與地端都關閉，upstream 新版改為手動合併程式碼。
+- **修法**：`src/updater.rs` 以 `FORK_AUTO_UPDATE_DISABLED` 讓 `is_auto_update_disabled` 永遠回傳 true（這是背景自動更新唯一閘門，opus 審查查無其他自動下載路徑）；環境變數與 `config.yaml` 開啟皆無效。Cloud Run 另有 snapshot 模式早退與 `Dockerfile` 的 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`。
+- **未改**：手動 `update` 子命令仍會下載官方版，文件已標註不要使用。
+- **驗證**：單元測試（明確開啟仍判停用）先紅後綠；`tests/auto_update_disabled.rs` 複製執行檔模擬標準安裝、代理指向關閉的埠，拿掉閘門接線即紅（日誌顯示請求被攔下）。另手動 `update --check` 查到 upstream 已發布 v0.9.9（未合併）。
+
 ### 2026-09-14 - 整合 upstream v0.9.8（v0.2.2 起 291 commits）
 - **背景**：upstream 已改為單一執行檔 CLI（`export`/`import`/`update` 子命令）、內建自動更新器、新增 grok/pi/omp/muse 助理；fork 的 Cloud Run snapshot 功能與新架構在三處衝突。
 - **合併方式**：先 `improve` ← upstream（解 app.js/index.html），再 `feature/cloud-run-drive-snapshot` ← `improve`；README.md 依指示保留 fork 版本。合併前標籤 `backup/improve-pre-v0.9.8`、`backup/feature-pre-v0.9.8`。

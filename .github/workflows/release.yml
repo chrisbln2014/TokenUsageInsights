@@ -12,6 +12,9 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Enforce the zero-warnings build policy documented in AGENTS.md.
+      RUSTFLAGS: "-D warnings"
     strategy:
       fail-fast: false
       matrix:
@@ -37,10 +40,54 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Verify release tag matches Cargo.toml version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_NAME" != v* ]]; then
+            echo "::error::Release tag ($GITHUB_REF_NAME) must start with 'v'"
+            exit 1
+          fi
+          cargo_version="$(grep '^version' Cargo.toml | head -n1 | cut -d'"' -f2)"
+          if [[ "$GITHUB_REF_NAME" != "v$cargo_version" ]]; then
+            echo "::error::Tag ($GITHUB_REF_NAME) does not match Cargo.toml version (v$cargo_version)"
+            exit 1
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Run Rust tests
+        run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Test native Windows collectors
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\scripts\test-windows.ps1
+
+      - name: Lint installer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/install.sh
+          bash -n scripts/get.sh
+          if command -v pwsh >/dev/null 2>&1; then
+            # This is PowerShell source; Bash must not expand its variables.
+            # shellcheck disable=SC2016
+            pwsh -NoProfile -Command '
+              $ErrorActionPreference = "Stop"
+              foreach ($f in @("scripts/install.ps1", "scripts/get.ps1", "scripts/run-service.ps1")) {
+                $errors = $null
+                [void][System.Management.Automation.Language.Parser]::ParseFile($f, [ref]$null, [ref]$errors)
+                if ($errors.Count -gt 0) {
+                  $errors | ForEach-Object { Write-Error $_ }
+                  exit 1
+                }
+              }
+            '
+          fi
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -59,7 +106,7 @@ jobs:
 
           if [[ "${{ runner.os }}" != "Windows" ]] && command -v strip >/dev/null 2>&1; then
             strip "$stage/${{ matrix.executable }}" || true
-          fi
+           fi
 
           cp -R static "$stage/static"
           cp -R shell "$stage/shell"
@@ -80,7 +127,118 @@ jobs:
             powershell -NoProfile -Command "Compress-Archive -Path 'dist/${package}' -DestinationPath 'dist/${package}.zip' -Force"
           else
             tar -czf "dist/${package}.tar.gz" -C dist "$package"
+           fi
+
+      - name: Smoke test install.sh (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          package="token-usage-insights-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          stage="dist/${package}"
+
+          test_root="$(mktemp -d)"
+          install_dir="${test_root}/app"
+          bin_dir="${test_root}/bin"
+          insights_dir="${test_root}/insights"
+
+          cleanup() {
+            if [[ -n "${server_pid:-}" ]] && kill -0 "$server_pid" 2>/dev/null; then
+              kill "$server_pid" 2>/dev/null || true
+              wait "$server_pid" 2>/dev/null || true
+            fi
+            rm -rf "$test_root"
+          }
+          trap cleanup EXIT
+
+          TOKEN_USAGE_INSIGHTS_INSTALL_DIR="$install_dir" \
+          TOKEN_USAGE_INSIGHTS_BIN_DIR="$bin_dir" \
+          PORT=39103 \
+            "${stage}/install.sh"
+
+          if [[ ! -x "${bin_dir}/token-usage-insights" ]]; then
+            echo "install.sh did not create the executable symlink at ${bin_dir}/token-usage-insights" >&2
+            exit 1
           fi
+
+          "${bin_dir}/token-usage-insights" --help | grep -Fq 'export-all'
+
+          PORT=39103 INSIGHTS_DIR="$insights_dir" TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0 "${bin_dir}/token-usage-insights" --no-auto-update &
+          server_pid=$!
+
+          response=""
+          for _ in $(seq 1 30); do
+            if response="$(curl -fsS 'http://127.0.0.1:39103/api/codex/pricing' 2>/dev/null)"; then
+              break
+            fi
+            sleep 0.5
+          done
+
+          if [[ -z "$response" ]]; then
+            echo "Installed release did not serve the pricing API." >&2
+            exit 1
+          fi
+
+          entry_count="$(printf '%s' "$response" | grep -o '"model_name"' | wc -l | tr -d ' ')"
+          if [[ "$entry_count" -le 4 ]]; then
+            echo "Installed release did not load the packaged pricing.csv (got ${entry_count} entries)." >&2
+            exit 1
+          fi
+
+          if [[ ! -f "${insights_dir}/token_usage_insights.db" ]]; then
+            echo "Installed release did not create a fresh INSIGHTS_DIR." >&2
+            exit 1
+          fi
+
+      - name: Smoke test native Windows release
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $package = "token-usage-insights-${env:GITHUB_REF_NAME}-${{ matrix.target }}"
+          $stage = Join-Path $PWD "dist\$package"
+          $testRoot = Join-Path $env:RUNNER_TEMP "Token Usage Insights 測試"
+          $installDir = Join-Path $testRoot "App Files"
+          $binDir = Join-Path $testRoot "Command Files"
+          $env:INSIGHTS_DIR = Join-Path $testRoot "資料庫"
+          $env:PORT = '39103'
+          $env:TOKEN_USAGE_INSIGHTS_AUTO_UPDATE = '0'
+
+          try {
+            & (Join-Path $stage 'install.ps1') -InstallDir $installDir -BinDir $binDir -Port 39103
+            $help = & (Join-Path $installDir 'token-usage-insights.exe') --help
+            if ($LASTEXITCODE -ne 0 -or !($help -match 'export-all')) {
+              throw 'Installed Windows release did not expose the unified CLI help.'
+            }
+            $process = Start-Process -FilePath (Join-Path $installDir 'token-usage-insights.exe') -ArgumentList '--no-auto-update' -WorkingDirectory $env:RUNNER_TEMP -WindowStyle Hidden -PassThru
+            try {
+              $response = $null
+              foreach ($attempt in 1..30) {
+                try {
+                  $response = Invoke-WebRequest 'http://127.0.0.1:39103/api/codex/pricing' -UseBasicParsing
+                  break
+                } catch {
+                  Start-Sleep -Milliseconds 500
+                }
+              }
+              if ($null -eq $response -or $response.StatusCode -ne 200) {
+                throw 'Installed Windows release did not serve the pricing API.'
+              }
+              if (@(($response.Content | ConvertFrom-Json)).Count -le 4) {
+                throw 'Installed Windows release did not load the packaged pricing.csv.'
+              }
+              if (!(Test-Path (Join-Path $env:INSIGHTS_DIR 'token_usage_insights.db'))) {
+                throw 'Installed Windows release did not create a fresh INSIGHTS_DIR.'
+              }
+            } finally {
+              if ($process -and !$process.HasExited) { Stop-Process -Id $process.Id -Force }
+            }
+          } finally {
+            Remove-Item Env:INSIGHTS_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:PORT -ErrorAction SilentlyContinue
+            if (Test-Path $testRoot) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
+          }
 
       - name: Upload release asset artifact
         uses: actions/upload-artifact@v7
@@ -137,6 +295,12 @@ jobs:
 
           ### 安裝方式
 
+          已安裝 Node.js 18.18 或更新版本時，可直接執行：
+
+          \`\`\`bash
+          npx --yes token-usage-insights
+          \`\`\`
+
           Linux 或 macOS：
 
           \`\`\`bash
@@ -188,3 +352,73 @@ jobs:
               --notes-file release-notes.md \
               --verify-tag
           fi
+
+  publish-npm:
+    name: Publish npm package with trusted publishing
+    if: vars.NPM_TRUSTED_PUBLISHING_ENABLED == 'true' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    needs: release
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/token-usage-insights
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRIES: "12"
+      TOKEN_USAGE_INSIGHTS_RELEASE_ASSET_RETRY_DELAY_MS: "10000"
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js for npm trusted publishing
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Install current npm CLI
+        run: npm install --global npm@latest
+
+      - name: Install package development dependencies without lifecycle scripts
+        run: npm ci --ignore-scripts
+
+      - name: Align npm package version with release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$version" == "$GITHUB_REF_NAME" ]]; then
+            echo "npm publishing requires a v-prefixed release tag." >&2
+            exit 1
+          fi
+          npm version "$version" --no-git-tag-version --allow-same-version
+
+      - name: Publish to npm through OIDC
+        run: npm publish --access public
+
+      - name: Verify the published package through npx
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          test_root="$(mktemp -d)"
+          trap 'rm -rf "$test_root"' EXIT
+          cd "$test_root"
+          for attempt in $(seq 1 12); do
+            if npm exec --yes --package="token-usage-insights@${version}" \
+              -- token-usage-insights --help > npx-output.txt 2>&1 \
+              && grep -Fq 'export-all' npx-output.txt; then
+              cat npx-output.txt
+              exit 0
+            fi
+            cat npx-output.txt
+            if [[ "$attempt" -lt 12 ]]; then
+              echo "npm Registry 尚未提供 v${version}，10 秒後重試（${attempt}/12）。"
+              sleep 10
+            fi
+          done
+          echo "無法透過 npm Registry 執行 token-usage-insights v${version}。" >&2
+          exit 1

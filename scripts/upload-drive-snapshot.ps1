@@ -22,7 +22,7 @@ $ErrorActionPreference = "Stop"
 
 $DriveScope = "https://www.googleapis.com/auth/drive.file"
 $CloudScope = "https://www.googleapis.com/auth/cloud-platform"
-$Assistants = @("antigravity", "copilot", "codex", "claude", "cursor")
+$Assistants = @("antigravity", "copilot", "codex", "claude", "cursor", "grok", "pi", "omp", "muse")
 $script:AccessToken = $null
 $script:AccessTokenAcquiredAt = $null
 $script:AccessTokenTtlMinutes = 45

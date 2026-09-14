@@ -24,6 +24,19 @@ Snapshot 預先產生前端看板需要的每日、每月、每年 API response�
 
 Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.transcript_path` 也會被清空，避免把本機日誌路徑放到雲端。
 
+涵蓋的助理：antigravity、copilot、codex、claude、cursor、grok、pi、omp、muse（`src/snapshot.rs` 的 `ASSISTANTS`，由測試釘住必須與 `handlers::is_supported_assistant` 一致）。`--export-snapshot` 直接呼叫本機看板的 handler 產生 response，內容與本機 API 完全一致。
+
+`--export-snapshot <path>` 必須是第一個參數（不可與 `export`／`import`／`update` 等子命令混用）；`TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT` 環境變數只在不帶任何參數執行時生效。匯出會先增量同步本機日誌，但不做舊版資料庫遷移（由看板啟動時處理）。每日回應包含 `home_dir` 與各 session 的 `cwd`、`session_name`（前端用來分組與縮寫路徑），只有 `transcript_path` 會被清空。
+
+Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、模型 Session 明細、單日匯出／匯入、匯入批次查詢與回滾。
+
+## 與 upstream 自動更新的關係（v0.9.8 起）
+
+upstream v0.9.8 起看板預設會自動更新，下載來源固定是 `doggy8088/TokenUsageInsights` 的官方 Release（不含本 fork 的 snapshot 功能）。
+
+- Cloud Run：snapshot 模式在啟動時就跳過更新流程，`Dockerfile` 另設 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0` 作為雙重保險。
+- 本機：若把本 fork 建置的執行檔安裝到 `%LOCALAPPDATA%\TokenUsageInsights`（upstream 判定為「標準安裝」的位置），自動更新會把它換成官方版，`--export-snapshot` 隨之消失。請在啟動看板的環境設 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`，或啟動時加 `--no-auto-update`。
+
 ## 本機匯出
 
 ```powershell

@@ -1,10 +1,10 @@
 use axum::{extract::Path as AxumPath, http::StatusCode, response::IntoResponse, Json};
-use rusqlite::Connection;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, OnceLock},
@@ -12,18 +12,23 @@ use std::{
 };
 use tokio::sync::Mutex;
 
-use crate::db::{self, UsageEntry};
 use crate::handlers::{
-    normalize_assistant_name, AgentBreakdown, DateListResponse, DaySummary,
-    MonthlyDailyBreakdown, MonthlyDetailsResponse, MonthlyModelSummary, MonthlyProjectSummary,
-    MonthListResponse, SessionSummary, UsageDetailsResponse, YearListResponse,
-    YearlyDetailsResponse, YearlyMonthlyBreakdown,
+    self, normalize_assistant_name, DateListResponse, MonthListResponse, YearListResponse,
 };
-use crate::pricing::{calculate_cost, load_pricing_rules};
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_REFRESH_SECONDS: u64 = 300;
-const ASSISTANTS: [&str; 5] = ["antigravity", "copilot", "codex", "claude", "cursor"];
+const ASSISTANTS: [&str; 9] = [
+    "antigravity",
+    "copilot",
+    "codex",
+    "claude",
+    "cursor",
+    "grok",
+    "pi",
+    "omp",
+    "muse",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
@@ -78,7 +83,9 @@ impl DashboardSnapshot {
         assistant: &str,
         session_id: &str,
     ) -> Option<&SessionEventRef> {
-        self.lookup_assistant(assistant)?.session_events.get(session_id)
+        self.lookup_assistant(assistant)?
+            .session_events
+            .get(session_id)
     }
 }
 
@@ -124,67 +131,61 @@ fn is_safe_session_id(session_id: &str) -> bool {
 }
 
 pub fn export_snapshot_path_from_args() -> Option<PathBuf> {
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        if arg == "--export-snapshot" {
-            return args.next().map(PathBuf::from);
-        }
-    }
-
-    std::env::var("TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
+    export_snapshot_path(
+        &std::env::args().collect::<Vec<_>>(),
+        std::env::var("TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT").ok(),
+    )
 }
 
-pub fn build_snapshot_from_conn(
-    conn: &Connection,
+// 只接受第一個參數位置，避免搶走 upstream 子命令（export/import/update）自己的參數
+fn export_snapshot_path(args: &[String], env_value: Option<String>) -> Option<PathBuf> {
+    let is_usable = |value: &str| !value.trim().is_empty() && !value.starts_with("--");
+
+    match args.get(1).map(String::as_str) {
+        Some("--export-snapshot") if args.len() == 3 => args
+            .get(2)
+            .filter(|value| is_usable(value))
+            .map(PathBuf::from),
+        Some(_) => None,
+        None => env_value
+            .filter(|value| is_usable(value))
+            .map(PathBuf::from),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotView {
+    Dates,
+    Months,
+    Years,
+    Daily,
+    Monthly,
+    Yearly,
+}
+
+/// 以 fetch 取得各 API 回應組成 snapshot；fetch 回 Ok(None) 代表該期間無資料（404）
+pub async fn build_snapshot_with<F, Fut>(
     assistants: &[&str],
-) -> Result<DashboardSnapshot, String> {
+    fetch: F,
+) -> Result<DashboardSnapshot, String>
+where
+    F: Fn(String, SnapshotView, String) -> Fut,
+    Fut: Future<Output = Result<Option<Value>, String>>,
+{
     let mut assistant_snapshots = HashMap::new();
 
     for assistant in assistants {
         let assistant = normalize_assistant_name(assistant);
-        let dates = db::get_available_dates(conn, &assistant)?;
-        let months = db::get_available_months(conn, &assistant)?;
-        let years = db::get_available_years(conn, &assistant)?;
+        let dates = fetch_string_list(&fetch, &assistant, SnapshotView::Dates, "dates").await?;
+        let months = fetch_string_list(&fetch, &assistant, SnapshotView::Months, "months").await?;
+        let years = fetch_string_list(&fetch, &assistant, SnapshotView::Years, "years").await?;
 
-        let mut daily = HashMap::new();
-        for date in &dates {
-            let records = db::get_usage_entries_by_date(conn, date, &assistant)?;
-            if records.is_empty() {
-                continue;
-            }
-            let entries = records
-                .into_iter()
-                .map(|(record, assistant_type)| (record.entry, assistant_type))
-                .collect();
-            let response = build_daily_response(date.clone(), entries)?;
-            daily.insert(date.clone(), serde_json::to_value(response).map_err(|e| e.to_string())?);
+        let mut daily = fetch_view_map(&fetch, &assistant, SnapshotView::Daily, &dates).await?;
+        for value in daily.values_mut() {
+            strip_transcript_paths(value);
         }
-
-        let mut monthly = HashMap::new();
-        for month in &months {
-            let entries = db::get_usage_entries_by_month(conn, month, &assistant)?;
-            if entries.is_empty() {
-                continue;
-            }
-            let response = build_monthly_response(month.clone(), entries)?;
-            monthly.insert(
-                month.clone(),
-                serde_json::to_value(response).map_err(|e| e.to_string())?,
-            );
-        }
-
-        let mut yearly = HashMap::new();
-        for year in &years {
-            let entries = db::get_usage_entries_by_year(conn, year, &assistant)?;
-            if entries.is_empty() {
-                continue;
-            }
-            let response = build_yearly_response(year.clone(), entries)?;
-            yearly.insert(year.clone(), serde_json::to_value(response).map_err(|e| e.to_string())?);
-        }
+        let monthly = fetch_view_map(&fetch, &assistant, SnapshotView::Monthly, &months).await?;
+        let yearly = fetch_view_map(&fetch, &assistant, SnapshotView::Yearly, &years).await?;
 
         assistant_snapshots.insert(
             assistant,
@@ -208,8 +209,117 @@ pub fn build_snapshot_from_conn(
     })
 }
 
-pub fn write_snapshot_file(conn: &Connection, path: &Path) -> Result<(), String> {
-    let snapshot = build_snapshot_from_conn(conn, &ASSISTANTS)?;
+async fn fetch_string_list<F, Fut>(
+    fetch: &F,
+    assistant: &str,
+    view: SnapshotView,
+    field: &str,
+) -> Result<Vec<String>, String>
+where
+    F: Fn(String, SnapshotView, String) -> Fut,
+    Fut: Future<Output = Result<Option<Value>, String>>,
+{
+    let Some(value) = fetch(assistant.to_string(), view, String::new()).await? else {
+        return Ok(Vec::new());
+    };
+    Ok(value
+        .get(field)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|item| !item.trim().is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+async fn fetch_view_map<F, Fut>(
+    fetch: &F,
+    assistant: &str,
+    view: SnapshotView,
+    keys: &[String],
+) -> Result<HashMap<String, Value>, String>
+where
+    F: Fn(String, SnapshotView, String) -> Fut,
+    Fut: Future<Output = Result<Option<Value>, String>>,
+{
+    let mut map = HashMap::new();
+    for key in keys {
+        if let Some(value) = fetch(assistant.to_string(), view, key.clone()).await? {
+            map.insert(key.clone(), value);
+        }
+    }
+    Ok(map)
+}
+
+fn strip_transcript_paths(daily: &mut Value) {
+    if let Some(entries) = daily.get_mut("raw_entries").and_then(Value::as_array_mut) {
+        for entry in entries {
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("transcript_path".to_string(), Value::Null);
+            }
+        }
+    }
+}
+
+/// 直接呼叫本機看板的 handler，確保 snapshot 內容與本機 API 回應完全一致
+async fn fetch_from_dashboard_handlers(
+    assistant: String,
+    view: SnapshotView,
+    key: String,
+) -> Result<Option<Value>, String> {
+    let label = format!("{view:?} {assistant}/{key}");
+    let response = match view {
+        SnapshotView::Dates => handlers::get_available_dates(AxumPath(assistant))
+            .await
+            .into_response(),
+        SnapshotView::Months => handlers::get_available_months(AxumPath(assistant))
+            .await
+            .into_response(),
+        SnapshotView::Years => handlers::get_available_years(AxumPath(assistant))
+            .await
+            .into_response(),
+        SnapshotView::Daily => handlers::get_usage_details(AxumPath((assistant, key)))
+            .await
+            .into_response(),
+        SnapshotView::Monthly => handlers::get_monthly_details(AxumPath((assistant, key)))
+            .await
+            .into_response(),
+        SnapshotView::Yearly => handlers::get_yearly_details(AxumPath((assistant, key)))
+            .await
+            .into_response(),
+    };
+
+    response_to_optional_json(&label, response).await
+}
+
+async fn response_to_optional_json(
+    label: &str,
+    response: axum::response::Response,
+) -> Result<Option<Value>, String> {
+    let status = response.status();
+    if status == StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| format!("讀取 {label} 回應失敗: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "{label} 回應 {status}: {}",
+            String::from_utf8_lossy(&body)
+        ));
+    }
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| format!("解析 {label} 回應失敗: {e}"))
+}
+
+pub async fn write_snapshot_file(path: &Path) -> Result<(), String> {
+    let snapshot = build_snapshot_with(&ASSISTANTS, fetch_from_dashboard_handlers).await?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("建立 snapshot 目錄失敗: {e}"))?;
@@ -217,403 +327,6 @@ pub fn write_snapshot_file(conn: &Connection, path: &Path) -> Result<(), String>
     }
     let data = serde_json::to_vec_pretty(&snapshot).map_err(|e| e.to_string())?;
     fs::write(path, data).map_err(|e| format!("寫入 snapshot 失敗: {e}"))
-}
-
-fn sanitize_raw_entry(mut entry: UsageEntry) -> UsageEntry {
-    entry.transcript_path = None;
-    entry
-}
-
-fn build_daily_response(
-    date: String,
-    entries_with_type: Vec<(UsageEntry, String)>,
-) -> Result<UsageDetailsResponse, String> {
-    if entries_with_type.is_empty() {
-        return Err("找不到該日期的使用量資料。".to_string());
-    }
-
-    let mut summary = DaySummary::default();
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-    let mut raw_entries = Vec::new();
-
-    for (entry, assistant_type) in &entries_with_type {
-        raw_entries.push(sanitize_raw_entry(entry.clone()));
-        let (list, _) = sessions_map
-            .entry(entry.session_id.clone())
-            .or_insert_with(|| (Vec::new(), assistant_type.clone()));
-        list.push(entry.clone());
-    }
-
-    summary.total_sessions = sessions_map.len();
-    let pricing_rules = load_pricing_rules();
-    let mut sessions_summary = Vec::new();
-
-    for (session_id, (session_entries, assistant_type)) in &sessions_map {
-        let last_entry = latest_entry(session_entries);
-        let session_totals = sum_session_tokens(session_entries, &last_entry);
-
-        summary.total_tokens += session_totals.total;
-        summary.total_input_tokens += session_totals.input;
-        summary.total_output_tokens += session_totals.output;
-        summary.total_cache_read_tokens += session_totals.cache_read;
-        summary.total_cache_write_tokens += session_totals.cache_write;
-        summary.total_reasoning_tokens += session_totals.reasoning;
-
-        let session_duration = last_entry
-            .cost
-            .as_ref()
-            .and_then(|c| c.total_api_duration_ms)
-            .unwrap_or(0.0) as u64;
-        let session_requests = last_entry
-            .cost
-            .as_ref()
-            .and_then(|c| c.total_premium_requests)
-            .unwrap_or(0.0) as u64;
-        summary.total_duration_ms += session_duration;
-        summary.total_requests += session_requests;
-
-        let model = last_entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "Unknown Model".to_string());
-        let cost_usd = calculate_cost(
-            &pricing_rules,
-            &model,
-            session_totals.input,
-            session_totals.output,
-            session_totals.cache_read,
-        )
-        .unwrap_or(0.0);
-        summary.total_cost_usd += cost_usd;
-
-        sessions_summary.push(SessionSummary {
-            session_id: session_id.clone(),
-            session_name: last_entry
-                .session_name
-                .clone()
-                .unwrap_or_else(|| "Start Coding Session".to_string()),
-            assistant_type: assistant_type.clone(),
-            source_kind: last_entry
-                .source_kind
-                .clone()
-                .unwrap_or_else(|| "legacy".to_string()),
-            cwd: last_entry.cwd.clone().unwrap_or_default(),
-            model,
-            total_tokens: session_totals.total,
-            total_input_tokens: session_totals.input,
-            total_output_tokens: session_totals.output,
-            total_cache_read_tokens: session_totals.cache_read,
-            total_cache_write_tokens: session_totals.cache_write,
-            total_reasoning_tokens: session_totals.reasoning,
-            max_turn_no: session_entries.iter().map(|e| e.turn_no).max().unwrap_or(1),
-            timestamp: session_entries
-                .first()
-                .map(|e| e.timestamp.clone())
-                .unwrap_or_default(),
-            duration_ms: session_duration,
-            cost_usd,
-            parent_session_id: last_entry.parent_session_id.clone(),
-            agent_nickname: last_entry.agent_nickname.clone(),
-            agent_role: last_entry.agent_role.clone(),
-            reasoning_effort: last_entry.reasoning_effort.clone(),
-        });
-    }
-
-    sessions_summary.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-
-    Ok(UsageDetailsResponse {
-        date,
-        summary,
-        sessions: sessions_summary,
-        raw_entries,
-    })
-}
-
-#[derive(Default)]
-struct SessionTokenTotals {
-    total: u64,
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    reasoning: u64,
-}
-
-fn latest_entry(entries: &[UsageEntry]) -> UsageEntry {
-    entries
-        .iter()
-        .max_by_key(|entry| entry.turn_no)
-        .cloned()
-        .unwrap_or_else(|| entries[0].clone())
-}
-
-fn sum_session_tokens(entries: &[UsageEntry], last_entry: &UsageEntry) -> SessionTokenTotals {
-    let mut totals = SessionTokenTotals::default();
-
-    for entry in entries {
-        if let Some(tokens) = &entry.delta_tokens {
-            totals.total += tokens.total;
-            totals.input += tokens.input;
-            totals.output += tokens.output;
-            totals.cache_read += tokens.cache_read.unwrap_or(0);
-            totals.cache_write += tokens.cache_write.unwrap_or(0);
-            totals.reasoning += tokens.reasoning.unwrap_or(0);
-        }
-    }
-
-    if totals.total > 0 {
-        return totals;
-    }
-
-    if let Some(tokens) = &last_entry.tokens {
-        totals.total = tokens.total;
-        totals.input = tokens.input;
-        totals.output = tokens.output;
-        totals.cache_read = tokens.cache_read.unwrap_or(0);
-        totals.cache_write = tokens.cache_write.unwrap_or(0);
-        totals.reasoning = tokens.reasoning.unwrap_or(0);
-    }
-
-    totals
-}
-
-fn build_monthly_response(
-    year_month: String,
-    entries_with_type: Vec<(UsageEntry, String, String)>,
-) -> Result<MonthlyDetailsResponse, String> {
-    if entries_with_type.is_empty() {
-        return Err("找不到該月份的使用量資料。".to_string());
-    }
-
-    let mut daily_map: HashMap<String, Vec<(UsageEntry, String)>> = HashMap::new();
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-
-    for (entry, assistant_type, date) in entries_with_type {
-        daily_map
-            .entry(date)
-            .or_default()
-            .push((entry.clone(), assistant_type.clone()));
-        sessions_map
-            .entry(entry.session_id.clone())
-            .or_insert_with(|| (Vec::new(), assistant_type))
-            .0
-            .push(entry);
-    }
-
-    let mut summary = DaySummary {
-        total_sessions: sessions_map.len(),
-        ..Default::default()
-    };
-    let mut daily_breakdown = Vec::new();
-    let mut sorted_dates: Vec<String> = daily_map.keys().cloned().collect();
-    sorted_dates.sort();
-
-    for date in sorted_dates {
-        let day_response = build_daily_response(
-            date.clone(),
-            daily_map.get(&date).cloned().unwrap_or_default(),
-        )?;
-        summary.total_tokens += day_response.summary.total_tokens;
-        summary.total_input_tokens += day_response.summary.total_input_tokens;
-        summary.total_output_tokens += day_response.summary.total_output_tokens;
-        summary.total_cache_read_tokens += day_response.summary.total_cache_read_tokens;
-        summary.total_cache_write_tokens += day_response.summary.total_cache_write_tokens;
-        summary.total_reasoning_tokens += day_response.summary.total_reasoning_tokens;
-        summary.total_duration_ms += day_response.summary.total_duration_ms;
-        summary.total_requests += day_response.summary.total_requests;
-        summary.total_cost_usd += day_response.summary.total_cost_usd;
-
-        daily_breakdown.push(MonthlyDailyBreakdown {
-            date,
-            total_tokens: day_response.summary.total_tokens,
-            total_input_tokens: day_response.summary.total_input_tokens,
-            total_output_tokens: day_response.summary.total_output_tokens,
-            total_cache_read_tokens: day_response.summary.total_cache_read_tokens,
-            total_reasoning_tokens: day_response.summary.total_reasoning_tokens,
-            sessions_count: day_response.summary.total_sessions,
-            cost_usd: day_response.summary.total_cost_usd,
-        });
-    }
-
-    let (projects, models, agent_breakdown) = summarize_sessions(&sessions_map);
-
-    Ok(MonthlyDetailsResponse {
-        year_month,
-        summary,
-        daily_breakdown,
-        projects,
-        models,
-        agent_breakdown,
-    })
-}
-
-fn build_yearly_response(
-    year: String,
-    entries_with_type: Vec<(UsageEntry, String, String)>,
-) -> Result<YearlyDetailsResponse, String> {
-    if entries_with_type.is_empty() {
-        return Err("找不到該年份的使用量資料。".to_string());
-    }
-
-    let mut monthly_map: HashMap<String, Vec<(UsageEntry, String, String)>> = HashMap::new();
-    let mut sessions_map: HashMap<String, (Vec<UsageEntry>, String)> = HashMap::new();
-
-    for (entry, assistant_type, date) in entries_with_type {
-        let month = date.get(0..7).unwrap_or("Unknown").to_string();
-        monthly_map
-            .entry(month)
-            .or_default()
-            .push((entry.clone(), assistant_type.clone(), date));
-        sessions_map
-            .entry(entry.session_id.clone())
-            .or_insert_with(|| (Vec::new(), assistant_type))
-            .0
-            .push(entry);
-    }
-
-    let mut summary = DaySummary {
-        total_sessions: sessions_map.len(),
-        ..Default::default()
-    };
-    let mut monthly_breakdown = Vec::new();
-    let mut sorted_months: Vec<String> = monthly_map.keys().cloned().collect();
-    sorted_months.sort();
-
-    for month in sorted_months {
-        let month_response = build_monthly_response(
-            month.clone(),
-            monthly_map.get(&month).cloned().unwrap_or_default(),
-        )?;
-        summary.total_tokens += month_response.summary.total_tokens;
-        summary.total_input_tokens += month_response.summary.total_input_tokens;
-        summary.total_output_tokens += month_response.summary.total_output_tokens;
-        summary.total_cache_read_tokens += month_response.summary.total_cache_read_tokens;
-        summary.total_cache_write_tokens += month_response.summary.total_cache_write_tokens;
-        summary.total_reasoning_tokens += month_response.summary.total_reasoning_tokens;
-        summary.total_duration_ms += month_response.summary.total_duration_ms;
-        summary.total_requests += month_response.summary.total_requests;
-        summary.total_cost_usd += month_response.summary.total_cost_usd;
-
-        monthly_breakdown.push(YearlyMonthlyBreakdown {
-            month,
-            total_tokens: month_response.summary.total_tokens,
-            total_input_tokens: month_response.summary.total_input_tokens,
-            total_output_tokens: month_response.summary.total_output_tokens,
-            total_cache_read_tokens: month_response.summary.total_cache_read_tokens,
-            total_reasoning_tokens: month_response.summary.total_reasoning_tokens,
-            sessions_count: month_response.summary.total_sessions,
-            cost_usd: month_response.summary.total_cost_usd,
-        });
-    }
-
-    let (projects, models, agent_breakdown) = summarize_sessions(&sessions_map);
-
-    Ok(YearlyDetailsResponse {
-        year,
-        summary,
-        monthly_breakdown,
-        projects,
-        models,
-        agent_breakdown,
-    })
-}
-
-fn summarize_sessions(
-    sessions_map: &HashMap<String, (Vec<UsageEntry>, String)>,
-) -> (
-    Vec<MonthlyProjectSummary>,
-    Vec<MonthlyModelSummary>,
-    HashMap<String, AgentBreakdown>,
-) {
-    let pricing_rules = load_pricing_rules();
-    let mut project_map: HashMap<String, (usize, u64, f64)> = HashMap::new();
-    let mut model_map: HashMap<String, (usize, u64, u64, u64, u64, f64)> = HashMap::new();
-    let mut agent_breakdown: HashMap<String, AgentBreakdown> = HashMap::new();
-
-    for (entries, assistant_type) in sessions_map.values() {
-        if entries.is_empty() {
-            continue;
-        }
-        let last_entry = latest_entry(entries);
-        let totals = sum_session_tokens(entries, &last_entry);
-        let model = last_entry
-            .model
-            .clone()
-            .unwrap_or_else(|| "Unknown Model".to_string());
-        let cost_usd = calculate_cost(
-            &pricing_rules,
-            &model,
-            totals.input,
-            totals.output,
-            totals.cache_read,
-        )
-        .unwrap_or(0.0);
-
-        let cwd = last_entry
-            .cwd
-            .clone()
-            .unwrap_or_else(|| "Unknown CWD".to_string());
-        let project_stat = project_map.entry(cwd).or_insert((0, 0, 0.0));
-        project_stat.0 += 1;
-        project_stat.1 += totals.total;
-        project_stat.2 += cost_usd;
-
-        let model_stat = model_map.entry(model).or_insert((0, 0, 0, 0, 0, 0.0));
-        model_stat.0 += 1;
-        model_stat.1 += totals.total;
-        model_stat.2 += totals.input;
-        model_stat.3 += totals.output;
-        model_stat.4 += totals.cache_read;
-        model_stat.5 += cost_usd;
-
-        let agent_stat = agent_breakdown.entry(assistant_type.clone()).or_default();
-        agent_stat.total_tokens += totals.total;
-        agent_stat.total_input_tokens += totals.input;
-        agent_stat.total_output_tokens += totals.output;
-        agent_stat.total_cache_read_tokens += totals.cache_read;
-        agent_stat.total_reasoning_tokens += totals.reasoning;
-        agent_stat.total_cost_usd += cost_usd;
-        agent_stat.total_sessions += 1;
-    }
-
-    let mut projects = project_map
-        .into_iter()
-        .map(|(cwd, (sessions_count, total_tokens, cost_usd))| MonthlyProjectSummary {
-            cwd,
-            sessions_count,
-            total_tokens,
-            cost_usd,
-        })
-        .collect::<Vec<_>>();
-    projects.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
-
-    let mut models = model_map
-        .into_iter()
-        .map(
-            |(
-                model,
-                (
-                    sessions_count,
-                    total_tokens,
-                    total_input_tokens,
-                    total_output_tokens,
-                    total_cache_read_tokens,
-                    cost_usd,
-                ),
-            )| MonthlyModelSummary {
-                model,
-                sessions_count,
-                total_tokens,
-                total_input_tokens,
-                total_output_tokens,
-                total_cache_read_tokens,
-                cost_usd,
-            },
-        )
-        .collect::<Vec<_>>();
-    models.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
-
-    (projects, models, agent_breakdown)
 }
 
 async fn load_snapshot_from_env() -> Result<DashboardSnapshot, String> {
@@ -625,7 +338,8 @@ async fn load_snapshot_from_env() -> Result<DashboardSnapshot, String> {
 
     if let Ok(file_id) = std::env::var("DRIVE_SNAPSHOT_FILE_ID") {
         let data = fetch_drive_file(&file_id).await?;
-        return serde_json::from_str(&data).map_err(|e| format!("解析 Drive snapshot JSON 失敗: {e}"));
+        return serde_json::from_str(&data)
+            .map_err(|e| format!("解析 Drive snapshot JSON 失敗: {e}"));
     }
 
     Err("未設定 TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH 或 DRIVE_SNAPSHOT_FILE_ID".to_string())
@@ -727,9 +441,7 @@ fn iam_scoped_access_token(scope: &str) -> Result<String, String> {
         &url,
     ])
     .map_err(|e| {
-        format!(
-            "透過 IAM Credentials 取得 Drive scoped token 失敗 ({service_account_email}): {e}"
-        )
+        format!("透過 IAM Credentials 取得 Drive scoped token 失敗 ({service_account_email}): {e}")
     })?;
     let payload: Value = serde_json::from_str(&response).map_err(|e| e.to_string())?;
     payload
@@ -958,16 +670,23 @@ pub async fn get_setup_info(AxumPath(assistant): AxumPath<String>) -> impl IntoR
         return unsupported_assistant_response();
     }
 
-    Json(serde_json::json!({
-        "workspace_dir": "Cloud Run snapshot mode",
-        "home_dir": "Google Drive snapshot",
-        "antigravity": { "dir_path": "snapshot", "exists": true, "script_path": "" },
-        "copilot": { "dir_path": "snapshot", "exists": true, "script_path": "" },
-        "codex": { "dir_path": "snapshot", "exists": true, "script_path": "" },
-        "claude": { "dir_path": "snapshot", "exists": true, "script_path": "" },
-        "cursor": { "dir_path": "snapshot", "exists": true, "script_path": "" }
-    }))
-    .into_response()
+    Json(snapshot_setup_info()).into_response()
+}
+
+fn snapshot_setup_info() -> Value {
+    let mut info = serde_json::Map::new();
+    info.insert(
+        "workspace_dir".to_string(),
+        Value::from("Cloud Run snapshot mode"),
+    );
+    info.insert("home_dir".to_string(), Value::from("Google Drive snapshot"));
+    for assistant in ASSISTANTS {
+        info.insert(
+            assistant.to_string(),
+            serde_json::json!({ "dir_path": "snapshot", "exists": true, "script_path": "" }),
+        );
+    }
+    Value::Object(info)
 }
 
 pub async fn trigger_manual_sync(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
@@ -1031,6 +750,16 @@ pub async fn get_session_details(
     }
 }
 
+pub async fn unsupported_in_snapshot_mode() -> impl IntoResponse {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "Cloud Run snapshot 模式為唯讀，不支援此功能（Session 搜尋、模型 Session 明細、匯出／匯入）。請在本機看板使用。"
+        })),
+    )
+        .into_response()
+}
+
 pub async fn get_rate_limit(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !ASSISTANTS.contains(&assistant.as_str()) {
@@ -1043,64 +772,278 @@ pub async fn get_rate_limit(AxumPath(assistant): AxumPath<String>) -> impl IntoR
 mod tests {
     use super::*;
 
-    fn insert_usage_entry(
-        conn: &Connection,
-        assistant: &str,
-        date: &str,
-        session_id: &str,
-        turn_no: i64,
-        delta_total: i64,
-    ) {
-        conn.execute(
-            "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, session_name, cwd, turn_no, model,
-                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total
-            ) VALUES (
-                ?, ?, ?, ?, 'Snapshot test', '/workspace/token-dashboard', ?, 'Gemini 3.5 Flash',
-                100, 30, 20, 5, 7, 150,
-                80, 20, 10, 4, 6, ?
-            )",
-            rusqlite::params![
-                assistant,
-                format!("{date} 10:0{turn_no}:00"),
-                date,
-                session_id,
-                turn_no,
-                delta_total,
-            ],
-        )
+    #[tokio::test]
+    async fn snapshot_export_assembles_api_responses_and_strips_transcript_paths() {
+        let snapshot = build_snapshot_with(&["antigravity", "claude"], |assistant, view, key| async move {
+            let is_antigravity = assistant == "antigravity";
+            Ok(match (view, key.as_str()) {
+                (SnapshotView::Dates, _) if is_antigravity => {
+                    Some(serde_json::json!({ "dates": [null, "2026-07-09", ""] }))
+                }
+                (SnapshotView::Months, _) if is_antigravity => {
+                    Some(serde_json::json!({ "months": ["2026-07"] }))
+                }
+                (SnapshotView::Years, _) if is_antigravity => {
+                    Some(serde_json::json!({ "years": ["2026"] }))
+                }
+                (SnapshotView::Dates | SnapshotView::Months | SnapshotView::Years, _) => None,
+                (SnapshotView::Daily, "2026-07-09") => Some(serde_json::json!({
+                    "date": "2026-07-09",
+                    "summary": { "total_tokens": 110 },
+                    "raw_entries": [
+                        { "session_id": "session-1", "transcript_path": "C:\\Users\\me\\.codex\\s.jsonl" }
+                    ]
+                })),
+                (SnapshotView::Monthly, _) => None,
+                (SnapshotView::Yearly, "2026") => Some(serde_json::json!({ "year": "2026" })),
+                (view, key) => panic!("未預期的請求: {view:?} {assistant}/{key}"),
+            })
+        })
+        .await
         .unwrap();
+
+        assert_eq!(snapshot.schema_version, 1);
+        let antigravity = snapshot.lookup_assistant("antigravity").unwrap();
+        assert_eq!(antigravity.dates, vec!["2026-07-09"]);
+        assert_eq!(antigravity.months, vec!["2026-07"]);
+
+        let daily = snapshot.lookup_daily("antigravity", "2026-07-09").unwrap();
+        assert_eq!(daily["summary"]["total_tokens"], 110);
+        assert_eq!(daily["raw_entries"][0]["session_id"], "session-1");
+        assert!(daily["raw_entries"][0]["transcript_path"].is_null());
+
+        assert!(snapshot.lookup_monthly("antigravity", "2026-07").is_none());
+        assert_eq!(
+            snapshot.lookup_yearly("antigravity", "2026").unwrap()["year"],
+            "2026"
+        );
+        assert!(snapshot
+            .lookup_assistant("claude")
+            .unwrap()
+            .dates
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_export_propagates_fetch_errors() {
+        let result = build_snapshot_with(&["claude"], |_, view, _| async move {
+            match view {
+                SnapshotView::Dates => Err("資料庫暫時無法開啟".to_string()),
+                _ => Ok(None),
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap_err(), "資料庫暫時無法開啟");
+    }
+
+    #[tokio::test]
+    async fn snapshot_export_includes_newer_assistants() {
+        let snapshot = build_snapshot_with(&ASSISTANTS, |assistant, view, _| async move {
+            Ok(match view {
+                SnapshotView::Dates if assistant == "muse" => {
+                    Some(serde_json::json!({ "dates": ["2026-09-01"] }))
+                }
+                SnapshotView::Daily => Some(serde_json::json!({ "date": "2026-09-01" })),
+                _ => None,
+            })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            snapshot
+                .lookup_assistant("muse-code")
+                .map(|item| item.dates.clone()),
+            Some(vec!["2026-09-01".to_string()])
+        );
+        assert!(snapshot.lookup_daily("muse", "2026-09-01").is_some());
     }
 
     #[test]
-    fn snapshot_export_precomputes_dashboard_api_responses() {
-        let conn = Connection::open_in_memory().unwrap();
-        db::init_db(&conn).unwrap();
-        insert_usage_entry(&conn, "antigravity", "2026-07-09", "session-1", 1, 110);
-        insert_usage_entry(&conn, "claude", "2026-07-09", "session-2", 1, 220);
+    fn snapshot_assistants_match_handlers_supported_assistants() {
+        let source = include_str!("handlers/mod.rs");
+        let fn_body = source
+            .split("pub fn is_supported_assistant")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}").next())
+            .expect("handlers/mod.rs 應定義 is_supported_assistant");
+        let mut supported: Vec<&str> = fn_body.split('"').skip(1).step_by(2).collect();
+        supported.sort_unstable();
+        let mut ours = ASSISTANTS.to_vec();
+        ours.sort_unstable();
 
-        let snapshot = build_snapshot_from_conn(&conn, &["antigravity", "claude"]).unwrap();
-
-        assert_eq!(snapshot.schema_version, 1);
+        assert!(
+            !supported.is_empty(),
+            "無法從 is_supported_assistant 解析出助理名單"
+        );
         assert_eq!(
-            snapshot.assistants.get("antigravity").unwrap().dates,
-            vec!["2026-07-09"]
+            ours, supported,
+            "snapshot::ASSISTANTS 必須與 handlers::is_supported_assistant 一致，否則新助理在 Cloud Run 看板會消失"
+        );
+    }
+
+    #[test]
+    fn snapshot_setup_info_covers_every_assistant() {
+        let info = snapshot_setup_info();
+        for assistant in ASSISTANTS {
+            assert_eq!(
+                info[assistant]["exists"], true,
+                "setup-info 缺少 {assistant}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_endpoints_return_json_not_implemented() {
+        let response = unsupported_in_snapshot_mode().await.into_response();
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["error"].as_str().unwrap().contains("snapshot"));
+    }
+
+    fn cli_args(list: &[&str]) -> Vec<String> {
+        std::iter::once("token-usage-insights")
+            .chain(list.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn export_snapshot_flag_is_only_accepted_as_first_argument() {
+        assert_eq!(
+            export_snapshot_path(&cli_args(&["--export-snapshot", "out.json"]), None),
+            Some(PathBuf::from("out.json"))
+        );
+        for rejected in [
+            vec!["export", "--out", "--export-snapshot", "x.json"],
+            vec!["--", "--export-snapshot", "x.json"],
+            vec!["import", "--file", "--export-snapshot"],
+            vec!["--export-snapshot"],
+            vec!["--export-snapshot", ""],
+            vec!["--export-snapshot", "   "],
+            vec!["--export-snapshot", "--help"],
+            vec!["--export-snapshot", "out.json", "update", "--force"],
+        ] {
+            assert_eq!(
+                export_snapshot_path(&cli_args(&rejected), None),
+                None,
+                "{rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_snapshot_env_only_applies_without_arguments() {
+        let env = Some("env.json".to_string());
+        assert_eq!(
+            export_snapshot_path(&cli_args(&[]), env.clone()),
+            Some(PathBuf::from("env.json"))
+        );
+        for with_args in [
+            vec!["--help"],
+            vec!["update", "--check"],
+            vec!["export", "--out", "x.json"],
+        ] {
+            assert_eq!(
+                export_snapshot_path(&cli_args(&with_args), env.clone()),
+                None,
+                "{with_args:?}"
+            );
+        }
+        assert_eq!(
+            export_snapshot_path(&cli_args(&[]), Some("  ".to_string())),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn dashboard_response_404_means_no_data_and_other_failures_propagate() {
+        let json_response = |status: StatusCode, body: Value| (status, Json(body)).into_response();
+
+        assert_eq!(
+            response_to_optional_json(
+                "t",
+                json_response(StatusCode::NOT_FOUND, serde_json::json!({ "error": "x" }))
+            )
+            .await,
+            Ok(None)
+        );
+        assert_eq!(
+            response_to_optional_json(
+                "t",
+                json_response(
+                    StatusCode::OK,
+                    serde_json::json!({ "dates": ["2026-09-01"] })
+                )
+            )
+            .await,
+            Ok(Some(serde_json::json!({ "dates": ["2026-09-01"] })))
         );
 
-        let daily = snapshot.lookup_daily("antigravity", "2026-07-09").unwrap();
-        assert_eq!(daily["date"], "2026-07-09");
-        assert_eq!(daily["summary"]["total_tokens"], 110);
-        assert_eq!(daily["sessions"][0]["session_id"], "session-1");
-        assert!(daily["raw_entries"][0]["transcript_path"].is_null());
+        let error = response_to_optional_json(
+            "Daily claude/2026-09-01",
+            json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({ "error": "database is locked" }),
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("500") && error.contains("database is locked"),
+            "{error}"
+        );
 
-        let monthly = snapshot.lookup_monthly("claude", "2026-07").unwrap();
-        assert_eq!(monthly["year_month"], "2026-07");
-        assert_eq!(monthly["summary"]["total_tokens"], 220);
+        let error =
+            response_to_optional_json("t", (StatusCode::BAD_REQUEST, "plain text").into_response())
+                .await
+                .unwrap_err();
+        assert!(error.contains("400"), "{error}");
+    }
 
-        let yearly = snapshot.lookup_yearly("claude", "2026").unwrap();
-        assert_eq!(yearly["year"], "2026");
-        assert_eq!(yearly["summary"]["total_tokens"], 220);
+    #[tokio::test]
+    async fn session_details_rejects_unsafe_session_ids_before_loading_snapshot() {
+        let too_long = "a".repeat(129);
+        for session_id in [
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "%2e%2e",
+            "a b",
+            "",
+            too_long.as_str(),
+        ] {
+            let response =
+                get_session_details(AxumPath(("claude".to_string(), session_id.to_string())))
+                    .await
+                    .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{session_id:?}");
+        }
+        assert!(is_safe_session_id(&"a".repeat(128)));
+        assert!(is_safe_session_id("019a-b_c.1"));
+    }
+
+    #[test]
+    fn upload_script_assistant_list_matches_snapshot_assistants() {
+        let script = include_str!("../scripts/upload-drive-snapshot.ps1");
+        let line = script
+            .lines()
+            .find(|line| line.trim_start().starts_with("$Assistants = @("))
+            .expect("upload-drive-snapshot.ps1 應定義 $Assistants");
+        let mut names: Vec<&str> = line.split('"').skip(1).step_by(2).collect();
+        names.sort_unstable();
+        let mut ours = ASSISTANTS.to_vec();
+        ours.sort_unstable();
+
+        assert_eq!(
+            names, ours,
+            "upload-drive-snapshot.ps1 的 $Assistants 必須與 snapshot::ASSISTANTS 一致"
+        );
     }
 
     #[test]
@@ -1178,7 +1121,9 @@ mod tests {
                 .drive_file_id,
             "drive-file-123"
         );
-        assert!(snapshot.lookup_session_event("claude", "session-1").is_none());
+        assert!(snapshot
+            .lookup_session_event("claude", "session-1")
+            .is_none());
     }
 
     #[test]

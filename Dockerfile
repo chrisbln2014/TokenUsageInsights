@@ -20,6 +20,7 @@ COPY pricing.csv ./pricing.csv
 
 ENV PORT=8080
 ENV TOKEN_USAGE_INSIGHTS_DATA_SOURCE=snapshot
+ENV TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0
 
 EXPOSE 8080
 CMD ["/app/token-usage-insights"]

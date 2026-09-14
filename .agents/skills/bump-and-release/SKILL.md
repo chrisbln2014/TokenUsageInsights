@@ -1,6 +1,6 @@
 ---
 name: bump-and-release
-description: 升級 TokenUsageInsights 的 Rust 套件版本並完成正式 GitHub Release。使用於使用者要求 bump patch、minor、major version，或要求建立、發佈、release 新版本時；涵蓋版本檔同步、零警告驗證、正體中文 Conventional Commit、附註 Git tag、推送、GitHub Actions 監看與 Release 成品確認。
+description: 升級 TokenUsageInsights 的 Rust 套件版本並完成正式 GitHub Release。使用於使用者要求 bump patch、minor、major version，或要求建立、發佈、release 新版本時；未指定升級類型時預設採 patch；涵蓋版本檔同步、零警告驗證、正體中文 Conventional Commit、附註 Git tag、推送、GitHub Actions 監看與 Release 成品確認。
 ---
 
 # Bump and Release
@@ -19,7 +19,10 @@ description: 升級 TokenUsageInsights 的 Rust 套件版本並完成正式 GitH
    - `gh auth status`
 3. 僅在工作目錄變更範圍明確時繼續。不得把不相關變更納入 release commit。
 4. 確認目前分支追蹤 `origin/main`，並以 `origin` 對應的 GitHub repository 作為 workflow 與 Release 查詢目標；不得因 `gh repo view` 選到 `upstream` 而監看錯誤 repository。
-5. 根據使用者指定的 patch、minor 或 major 計算下一個 SemVer。未指定升級類型時，不得猜測；要求使用者明確指定。
+5. 計算下一個 SemVer：
+   - 使用者明確指定 patch、minor 或 major 時，依指定類型升級。
+   - 使用者未指定升級類型時，預設採用 **patch**（`X.Y.(Z+1)`），直接繼續執行，不得再追問或改用其他類型。
+   - 使用者指定 minor 或 major 時才升級對應欄位，並將右側欄位歸零。
 6. 確認目標 tag `vX.Y.Z` 在本機與 `origin` 均不存在。若已存在，停止並回報，不得移動、覆寫或強制推送 tag。
 
 ## 2. 同步版本

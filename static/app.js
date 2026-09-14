@@ -1,8 +1,20 @@
-import i18n from './i18n.js?v=17';
+import i18n from './i18n.js?v=36';
+import {
+  aggregateDailyTokenCandles,
+  calculateCandleViewport,
+  calculateCandleViewportYRange,
+  calculateMovingAverageTrend,
+  calculateMovingAverageViewportTrend,
+  getChartDataPointX,
+  parseUsageTimestamp,
+} from './chart-utils.js?v=7';
+import { compareSessionRows } from './session-utils.js?v=1';
 
 // Globals
 let tokenChartInstance = null;
 let monthlyChartInstance = null;
+let pendingUsageImport = null;
+let importHistoryAssistant = null;
 
 const chartPalette = {
   tokenFill: 'rgba(47, 184, 197, 0.24)',
@@ -11,11 +23,37 @@ const chartPalette = {
   cacheStroke: '#8997ac',
   trendFill: 'rgba(246, 190, 79, 0.14)',
   trendStroke: '#f6be4f',
+  candleInputFill: 'rgba(47, 184, 197, 0.82)',
+  candleOutputFill: 'rgba(167, 139, 250, 0.82)',
+  candleCacheFill: 'rgba(246, 190, 79, 0.84)',
+  candleUp: '#31d0aa',
+  candleDown: '#ff5c8a',
+  candleFlat: '#94a3b8',
+  candleAverage: '#2d8cff',
 };
 
 const chartFontFamily = 'IBM Plex Sans';
 const SIDEBAR_STATE_STORAGE_KEY = 'sidebar_state';
+const DAILY_CHART_MODE_STORAGE_KEY = 'daily_chart_mode';
+const DAILY_CHART_INTERVAL_STORAGE_KEY = 'daily_chart_interval_minutes';
+const DAILY_CHART_INTERVALS = [5, 15, 30, 60, 120, 240];
+const DAILY_CHART_MA_WINDOW = 5;
+const DAILY_CHART_MAX_VISIBLE_CANDLES = 24;
 const utf8TextEncoder = new TextEncoder();
+
+const initialUrlParams = new URLSearchParams(window.location.search);
+const urlChartMode = String(initialUrlParams.get('chart') || '').trim().toLowerCase();
+const savedDailyChartMode = localStorage.getItem(DAILY_CHART_MODE_STORAGE_KEY);
+let dailyChartMode = ['kline', 'trend'].includes(urlChartMode)
+  ? urlChartMode
+  : savedDailyChartMode === 'trend' ? 'trend' : 'kline';
+const savedDailyChartInterval = Number(localStorage.getItem(DAILY_CHART_INTERVAL_STORAGE_KEY));
+let dailyChartIntervalMinutes = DAILY_CHART_INTERVALS.includes(savedDailyChartInterval)
+  ? savedDailyChartInterval
+  : 60;
+let dailyChartViewportStart = 0;
+let dailyChartViewportPinnedToLatest = true;
+let dailyChartViewportContext = '';
 
 // Cookie helper functions
 function setCookie(name, value, days = 365) {
@@ -40,6 +78,20 @@ const assistantAliasMap = {
   'claude-code': 'claude',
   'claude_code': 'claude',
   'claudecode': 'claude',
+  'grok-build': 'grok',
+  'grok_build': 'grok',
+  'grokbuild': 'grok',
+  'pi-coding-agent': 'pi',
+  'pi_coding_agent': 'pi',
+  'picodingagent': 'pi',
+  'oh-my-pi': 'omp',
+  'oh_my_pi': 'omp',
+  'ohmypi': 'omp',
+  'muse-code': 'muse',
+  'muse_code': 'muse',
+  'musecode': 'muse',
+  'code-muse': 'muse',
+  'code_muse': 'muse',
 };
 
 const assistantMeta = {
@@ -50,6 +102,8 @@ const assistantMeta = {
     alt: 'Antigravity',
     badgeStyle: 'background: rgba(47, 184, 197, 0.13); color: #2fb8c5; border: 1px solid rgba(47, 184, 197, 0.26); display: inline-flex; align-items: center;',
     senderName: 'ANTIGRAVITY AGENT',
+    highlightColor: '#2fb8c5',
+    nameHighlights: ['Antigravity CLI'],
   },
   copilot: {
     logo: '/static/githubcopilot.webp',
@@ -58,14 +112,18 @@ const assistantMeta = {
     alt: 'Copilot',
     badgeStyle: 'background: rgba(185, 43, 39, 0.15); color: #b92b27; border: 1px solid rgba(185, 43, 39, 0.3); display: inline-flex; align-items: center;',
     senderName: 'COPILOT AGENT',
+    highlightColor: '#b92b27',
+    nameHighlights: ['GitHub Copilot'],
   },
   codex: {
     logo: '/static/codex.webp',
-    label: 'Codex CLI',
+    label: 'Codex',
     shortLabel: 'Codex',
     alt: 'Codex',
     badgeStyle: 'background: rgba(16, 185, 129, 0.15); color: #10b981; border: 1px solid rgba(16, 185, 129, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CODEX AGENT',
+    highlightColor: '#10b981',
+    nameHighlights: ['Codex Desktop', 'Codex CLI'],
   },
   claude: {
     logo: '/static/claude-code-logo.svg',
@@ -74,6 +132,8 @@ const assistantMeta = {
     alt: 'Claude Code',
     badgeStyle: 'background: rgba(79, 126, 168, 0.15); color: #7aa7cf; border: 1px solid rgba(79, 126, 168, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CLAUDE CODE AGENT',
+    highlightColor: '#7aa7cf',
+    nameHighlights: ['Claude Code'],
   },
   cursor: {
     logo: '/static/cursor-logo.svg',
@@ -82,6 +142,48 @@ const assistantMeta = {
     alt: 'Cursor',
     badgeStyle: 'background: rgba(139, 92, 246, 0.15); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.3); display: inline-flex; align-items: center;',
     senderName: 'CURSOR AGENT',
+    highlightColor: '#a78bfa',
+    nameHighlights: ['Cursor'],
+  },
+  grok: {
+    logo: '/static/grok-logo.svg',
+    label: 'Grok Build',
+    shortLabel: 'Grok',
+    alt: 'Grok Build',
+    badgeStyle: 'background: rgba(239, 68, 68, 0.13); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.28); display: inline-flex; align-items: center;',
+    senderName: 'GROK BUILD AGENT',
+    highlightColor: '#f87171',
+    nameHighlights: ['Grok Build'],
+  },
+  pi: {
+    logo: '/static/pi-logo.svg',
+    label: 'Pi Coding Agent',
+    shortLabel: 'Pi',
+    alt: 'Pi Coding Agent',
+    badgeStyle: 'background: rgba(99, 102, 241, 0.15); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'PI AGENT',
+    highlightColor: '#818cf8',
+    nameHighlights: ['Pi coding agent', 'Pi Coding Agent'],
+  },
+  omp: {
+    logo: '/static/omp-logo.svg',
+    label: 'OMP',
+    shortLabel: 'OMP',
+    alt: 'OMP',
+    badgeStyle: 'background: rgba(13, 148, 136, 0.15); color: #2dd4bf; border: 1px solid rgba(13, 148, 136, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'OMP AGENT',
+    highlightColor: '#2dd4bf',
+    nameHighlights: ['OMP'],
+  },
+  muse: {
+    logo: '/static/favicon-v2.png',
+    label: 'Muse Code',
+    shortLabel: 'Muse',
+    alt: 'Muse Code',
+    badgeStyle: 'background: rgba(0, 122, 255, 0.15); color: #3b82f6; border: 1px solid rgba(0, 122, 255, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'MUSE AGENT',
+    highlightColor: '#3b82f6',
+    nameHighlights: ['Muse Code'],
   },
 };
 
@@ -137,12 +239,23 @@ function updateUrlParams() {
   const url = new URL(window.location.href);
   url.searchParams.set('agent', currentAssistant);
   url.searchParams.set('tab', activeTab);
-  
+  url.searchParams.delete('date');
+  url.searchParams.delete('dir');
+  url.searchParams.delete('chart');
+
   if (activeTab === 'daily') {
     const dateSelect = document.getElementById('date-select');
     if (dateSelect && dateSelect.value) {
       url.searchParams.set('date', dateSelect.value);
     }
+    // 尚未依 Session 清單比對完成前，保留網址原始的 dir 參數
+    if (sessionCwdFilterFromUrl) {
+      const rawDir = initialUrlParams.get('dir');
+      if (rawDir) url.searchParams.set('dir', rawDir);
+    } else if (currentSessionCwdFilter) {
+      url.searchParams.set('dir', currentSessionCwdFilter);
+    }
+    url.searchParams.set('chart', dailyChartMode);
   } else if (activeTab === 'monthly') {
     const monthSelect = document.getElementById('month-select');
     if (monthSelect && monthSelect.value) {
@@ -154,7 +267,7 @@ function updateUrlParams() {
       url.searchParams.set('date', yearSelect.value);
     }
   }
-  
+
   window.history.replaceState(null, '', url.toString());
 }
 
@@ -180,10 +293,39 @@ let currentSessionAssistantType = '';
 let availableDates = [];
 let pricingRules = [];
 
-function getLocalDateString(date = new Date()) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+// Session table sorting state
+let currentSessions = [];
+let currentSortColumn = 'timestamp'; // Default sorted by starting time
+let currentSortDirection = 'desc';  // Default chronological order
+let currentSessionSearchContext = '';
+let currentSessionSearchDataFingerprint = '';
+let currentSessionSearchQuery = '';
+let currentSessionSearchMatches = null;
+let currentSessionSearchUnavailable = 0;
+let currentSessionSearchState = 'idle';
+let sessionSearchDebounceTimer = null;
+let sessionSearchAbortController = null;
+let currentSessionCwdFilter = '';
+let currentSessionHomeDir = '';
+let sessionCwdFilterFromUrl = false;
+
+// Monthly daily summary sorting state
+let monthlyDailySortColumn = 'date';
+let monthlyDailySortDirection = 'desc';
+let currentMonthlyChartData = [];
+
+// Yearly monthly summary sorting state
+let yearlyMonthlySortColumn = 'month';
+let yearlyMonthlySortDirection = 'desc';
+let currentYearlyBreakdown = [];
+let currentYearlyData = null;
+let yearlyChartInstance = null;
+let currentYearlyChartData = [];
+
+function getUtcDateString(date = new Date()) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -200,24 +342,6 @@ function renderSafeMarkdown(markdownText) {
   return DOMPurify.sanitize(parsedHtml);
 }
 
-// Session table sorting state
-let currentSessions = [];
-let currentSortColumn = 'timestamp'; // Default sorted by starting time
-let currentSortDirection = 'desc';  // Default chronological order
-
-// Monthly daily summary sorting state
-let monthlyDailySortColumn = 'date';
-let monthlyDailySortDirection = 'desc';
-let currentMonthlyChartData = [];
-
-// Yearly monthly summary sorting state
-let yearlyMonthlySortColumn = 'month';
-let yearlyMonthlySortDirection = 'desc';
-let currentYearlyBreakdown = [];
-let currentYearlyData = null;
-let yearlyChartInstance = null;
-let currentYearlyChartData = [];
-
 // Live Auto-Refresh State
 let liveRefreshTimer = null;
 let liveProgressTimer = null;
@@ -225,21 +349,89 @@ let secondsRemaining = 10;
 let refreshInterval = 10000; // default 10s
 
 // Language / Internationalization (i18n) State
-let currentLang = localStorage.getItem('lang') || 'zh-TW';
+const supportedLocales = ['zh-TW', 'zh-CN', 'en', 'ja', 'ko'];
+const localeOptions = ['auto', ...supportedLocales];
+const localeLabels = {
+  'zh-TW': '繁體中文',
+  'zh-CN': '简体中文',
+  en: 'English',
+  ja: '日本語',
+  ko: '한국어',
+};
+const localeForFormatting = {
+  'zh-CN': 'zh-CN',
+  'zh-TW': 'zh-TW',
+  en: 'en-US',
+  ja: 'ja-JP',
+  ko: 'ko-KR',
+};
+
+function detectBrowserLocale() {
+  const languages = Array.isArray(navigator.languages) && navigator.languages.length
+    ? navigator.languages
+    : [navigator.language || ''];
+  for (const language of languages) {
+    const normalized = String(language).toLowerCase();
+    if (normalized === 'zh-cn' || normalized === 'zh-sg' || normalized.startsWith('zh-cn-') || normalized.startsWith('zh-sg-')) return 'zh-CN';
+    if (normalized === 'zh-tw' || normalized === 'zh-hk' || normalized === 'zh-mo' || normalized.startsWith('zh-tw-') || normalized.startsWith('zh-hk-') || normalized.startsWith('zh-mo-')) return 'zh-TW';
+    if (normalized === 'en' || normalized.startsWith('en-')) return 'en';
+    if (normalized === 'ja' || normalized.startsWith('ja-')) return 'ja';
+    if (normalized === 'ko' || normalized.startsWith('ko-')) return 'ko';
+  }
+  return 'zh-TW';
+}
+
+const savedLanguage = localStorage.getItem('lang');
+let languagePreference = localeOptions.includes(savedLanguage) ? savedLanguage : 'auto';
+let currentLang = languagePreference === 'auto' ? detectBrowserLocale() : languagePreference;
 let currentUsageData = null;
 let currentMonthlyData = null;
+const modelSessionDetailsCache = new Map();
+const expandedModelDrilldowns = new Map();
 let cachedCodexResets = null;
 let isQueryingCodexResets = false;
 
+// 各報表載入請求的序號：快速切換日期/月份/年份時，僅讓最新一次請求的結果生效
+let dailyRequestSeq = 0;
+let monthlyRequestSeq = 0;
+let yearlyRequestSeq = 0;
+let monthlyInFlightTarget = null;
+let yearlyInFlightTarget = null;
+
 // i18n localization dictionary is now loaded from /static/i18n.js
 
-function t(key) {
-  const isSingle = isSupportedAssistant(currentAssistant);
-  if (isSingle) {
-    const prefix = currentAssistant + '_';
-    return i18n[currentLang][prefix + key] || i18n[currentLang][key] || i18n['zh-TW'][prefix + key] || i18n['zh-TW'][key] || key;
+function t(key, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const currentTranslations = i18n[currentLang] || {};
+  const fallbackTranslations = i18n['zh-TW'] || {};
+  const assistantPrefix = isSupportedAssistant(resolvedAssistant) && !key.startsWith(`${resolvedAssistant}_`)
+    ? `${resolvedAssistant}_`
+    : '';
+  const candidateKeys = assistantPrefix ? [`${assistantPrefix}${key}`, key] : [key];
+
+  for (const candidateKey of candidateKeys) {
+    if (currentTranslations[candidateKey] !== undefined) return currentTranslations[candidateKey];
   }
-  return i18n[currentLang][key] || i18n['zh-TW'][key] || key;
+  for (const candidateKey of candidateKeys) {
+    if (fallbackTranslations[candidateKey] !== undefined) return fallbackTranslations[candidateKey];
+  }
+  return key;
+}
+
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Wraps the agent's product name (e.g. "GitHub Copilot", "Grok Build") inside
+// a translated string with a colored <span> so it stands out at a glance,
+// using each assistant's own brand color from assistantMeta.
+function highlightAgentName(text, assistant = currentAssistant) {
+  const meta = getAssistantMeta(assistant);
+  const terms = meta.nameHighlights;
+  const color = meta.highlightColor;
+  if (!text || !color || !terms || !terms.length) return text;
+  const pattern = new RegExp(terms.map(escapeRegExp).join('|'), 'g');
+  return text.replace(pattern, (match) => `<span class="agent-name-highlight" style="color: ${color};">${match}</span>`);
 }
 
 function iconMarkup(name, extraClass = '') {
@@ -255,8 +447,50 @@ function cardIconMarkup(name, extraClass = '') {
 function setTitleMarkup(iconName, textHtml) {
   const titleEl = document.getElementById('current-date-title');
   if (titleEl) {
-    titleEl.innerHTML = `<span class="title-text">${textHtml}</span>`;
+    // iconName 為 'sync' 表示資料仍在載入，旋轉圖示置於日期右側以避免文字位移晃動
+    const spinner = iconName === 'sync' ? iconMarkup('sync', 'title-sync-icon') : '';
+    titleEl.innerHTML = `<span class="title-text">${textHtml}</span>${spinner}`;
   }
+}
+
+function clearTitleSpinner() {
+  const titleEl = document.getElementById('current-date-title');
+  if (titleEl) {
+    const syncIcon = titleEl.querySelector('.title-sync-icon');
+    if (syncIcon) {
+      syncIcon.remove();
+    }
+  }
+}
+
+// =========================================================================
+// 視窗載入狀態：切換日期/月份/年份時立即給予回饋，資料抵達後再更新內容
+// =========================================================================
+function getActiveViewContainer() {
+  if (activeTab === 'monthly') return document.getElementById('monthly-view-container');
+  if (activeTab === 'yearly') return document.getElementById('yearly-view-container');
+  return document.getElementById('daily-view-container');
+}
+
+function showViewLoading(dim = true) {
+  // 同一期間重整（即時監控、重新整理按鈕）只靠標題同步圖示提示，不遮蔽內容
+  if (!dim) return;
+  const overlay = document.getElementById('view-loading-overlay');
+  const view = getActiveViewContainer();
+  if (view) view.classList.add('is-loading');
+  if (overlay) {
+    overlay.classList.remove('hidden');
+    const label = overlay.querySelector('.view-loading-text');
+    if (label) label.textContent = t('loading_data');
+  }
+}
+
+function hideViewLoading() {
+  const overlay = document.getElementById('view-loading-overlay');
+  if (overlay) overlay.classList.add('hidden');
+  ['daily-view-container', 'monthly-view-container', 'yearly-view-container'].forEach(id => {
+    document.getElementById(id)?.classList.remove('is-loading');
+  });
 }
 
 function setDisclosureIcon(target, expanded) {
@@ -274,39 +508,16 @@ function updateBrandLogo() {
   brandLogo.alt = meta.alt;
 }
 
-function languageMeta(lang) {
-  return lang === 'en'
-    ? { label: 'United States', next: 'zh-TW' }
-    : { label: '臺灣', next: 'en' };
-}
-
-// Flag artwork sourced from the open-source "flag-icons" project (lipis/flag-icons, MIT license):
-// https://github.com/lipis/flag-icons — local copies live in static/flags/{us,tw}.svg
-function languageFlagIcon(lang) {
-  const code = lang === 'en' ? 'us' : 'tw';
-  const label = lang === 'en' ? 'United States flag' : 'Taiwan flag';
-  return `<img src="/static/flags/${code}.svg" alt="${label}" class="lang-flag-icon" />`;
-}
-
 function updateLanguageToggle() {
-  const langToggle = document.getElementById('lang-toggle-btn');
-  if (!langToggle) return;
-
-  const langToggleIcon = document.getElementById('lang-toggle-icon');
-  const langToggleText = document.getElementById('lang-toggle-text');
-
-  const meta = languageMeta(currentLang);
-  const label = currentLang === 'en'
-    ? `Switch language, current: United States`
-    : `切換語言，目前：${meta.label}`;
-  if (langToggleIcon) {
-    langToggleIcon.innerHTML = languageFlagIcon(currentLang);
-  }
-  if (langToggleText) {
-    langToggleText.textContent = t('btn_language');
-  }
-  langToggle.title = label;
-  langToggle.setAttribute('aria-label', label);
+  const langSelect = document.getElementById('lang-select');
+  if (!langSelect) return;
+  langSelect.value = languagePreference;
+  langSelect.setAttribute('aria-label', t('btn_language'));
+  langSelect.title = t('btn_language');
+  langSelect.innerHTML = localeOptions
+    .map(locale => `<option value="${locale}">${locale === 'auto' ? t('language_auto') : localeLabels[locale]}</option>`)
+    .join('');
+  langSelect.value = languagePreference;
 }
 
 function syncSidebarToggleButton() {
@@ -359,19 +570,88 @@ function isEditableShortcutTarget(target) {
     || target.isContentEditable;
 }
 
+function isSidebarToggleShortcut(event) {
+  const hasExactlyOnePrimaryModifier = event.metaKey !== event.ctrlKey;
+  return hasExactlyOnePrimaryModifier
+    && !event.altKey
+    && !event.shiftKey
+    && event.key.toLowerCase() === 'b';
+}
+
 function toggleSidebar() {
   const appContainer = document.querySelector('.app-container');
   if (!appContainer) return;
   setSidebarCollapsed(!appContainer.classList.contains('sidebar-collapsed'), { persist: true });
 }
 
+const setupModalTitleKeys = {
+  antigravity: 'setup_modal_title',
+  copilot: 'copilot_setup_modal_title',
+  codex: 'codex_setup_modal_title',
+  claude: 'claude_setup_modal_title',
+  cursor: 'cursor_setup_modal_title',
+  grok: 'grok_setup_modal_title',
+  pi: 'pi_setup_modal_title',
+  omp: 'omp_setup_modal_title',
+};
+
+function getSetupModalTitleKey(assistant) {
+  return setupModalTitleKeys[assistant] || setupModalTitleKeys.antigravity;
+}
+
+function setSetupModalTitle(assistant) {
+  const titleH2 = document.getElementById('setup-modal-title');
+  if (!titleH2) return;
+
+  const titleKey = getSetupModalTitleKey(assistant);
+  titleH2.setAttribute('data-i18n', titleKey);
+  titleH2.innerHTML = t(titleKey, assistant);
+}
+
+function setSetupModalBody(assistant) {
+  const bodyIds = {
+    antigravity: 'setup-body-statusline',
+    copilot: 'setup-body-statusline',
+    codex: 'setup-body-codex',
+    claude: 'setup-body-claude',
+    cursor: 'setup-body-cursor',
+    grok: 'setup-body-grok',
+    pi: 'setup-body-pi',
+    omp: 'setup-body-omp',
+  };
+  const bodyElements = Object.values(bodyIds)
+    .filter((bodyId, index, ids) => ids.indexOf(bodyId) === index)
+    .map(bodyId => document.getElementById(bodyId))
+    .filter(Boolean);
+  const selectedBody = document.getElementById(bodyIds[assistant]);
+
+  bodyElements.forEach(body => {
+    if (body === selectedBody) {
+      body.style.removeProperty('display');
+    } else {
+      body.style.display = 'none';
+    }
+  });
+}
+
 function updateLanguageUI() {
-  document.title = 'Token 戰情室';
+  document.documentElement.lang = currentLang;
+  document.title = t('title');
+  document.querySelectorAll('[data-i18n-content]').forEach(el => {
+    el.setAttribute('content', t(el.getAttribute('data-i18n-content')));
+  });
 
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
     el.innerHTML = t(key);
   });
+
+  // The header subtitle mentions the active agent's product name; highlight
+  // it in that agent's own brand color so it's easy to spot at a glance.
+  const headerDescriptionEl = document.querySelector('[data-i18n="header_description"]');
+  if (headerDescriptionEl) {
+    headerDescriptionEl.innerHTML = highlightAgentName(t('header_description'));
+  }
 
   document.querySelectorAll('[data-i18n-title]').forEach(el => {
     const key = el.getAttribute('data-i18n-title');
@@ -382,9 +662,18 @@ function updateLanguageUI() {
     }
   });
 
+  document.querySelectorAll('[data-i18n-aria-label]').forEach(el => {
+    const key = el.getAttribute('data-i18n-aria-label');
+    el.setAttribute('aria-label', t(key));
+  });
+
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
     const key = el.getAttribute('data-i18n-placeholder');
     el.placeholder = t(key);
+  });
+
+  document.querySelectorAll('#live-interval option[data-seconds]').forEach(option => {
+    option.textContent = `${option.dataset.seconds} ${t('seconds')}`;
   });
 
   // Specific dynamic text updates
@@ -401,12 +690,31 @@ function updateLanguageUI() {
   // Update dynamic placeholders/empty state if they are currently displayed
   const emptyContainer = document.getElementById('empty-state-container');
   if (emptyContainer && !emptyContainer.classList.contains('hidden')) {
-    toggleEmptyState(true);
+    if (isEmptyState) {
+      toggleEmptyState(true);
+    } else if (activeTab === 'daily') {
+      const dateSelect = document.getElementById('date-select');
+      if (dateSelect && dateSelect.value) showNoDataForDate(dateSelect.value);
+    } else if (activeTab === 'monthly') {
+      const monthSelect = document.getElementById('month-select');
+      if (monthSelect && monthSelect.value) showNoDataForMonth(monthSelect.value);
+    } else if (activeTab === 'yearly') {
+      const yearSelect = document.getElementById('year-select');
+      if (yearSelect && yearSelect.value) showNoDataForYear(yearSelect.value);
+    }
   }
+
+  ['monthly-stat-input-pct', 'monthly-stat-cache-input-pct', 'monthly-stat-output-pct',
+    'yearly-stat-input-pct', 'yearly-stat-output-pct'].forEach(id => {
+    const element = document.getElementById(id);
+    const percent = element?.textContent.match(/\d+(?:\.\d+)?%/);
+    if (element && percent) element.textContent = `${t('ratio_label')}: ${percent[0]}`;
+  });
 
   // Update dynamic brand logo in sidebar
   updateBrandLogo();
   syncSidebarToggleButton();
+  updateDailyChartControls();
   updateCodexRateLimit();
 }
 
@@ -421,6 +729,8 @@ function initApp() {
   const dateSelect = document.getElementById('date-select');
   const monthSelect = document.getElementById('month-select');
   const yearSelect = document.getElementById('year-select');
+  const sessionSearchInput = document.getElementById('session-search-input');
+  const sessionCwdFilter = document.getElementById('session-cwd-filter');
   const closeDrawerBtn = document.getElementById('close-drawer-btn');
   const drawerOverlay = document.getElementById('timeline-drawer');
 
@@ -432,6 +742,28 @@ function initApp() {
   // Live Controls
   const liveToggle = document.getElementById('live-toggle');
   const liveInterval = document.getElementById('live-interval');
+
+  if (sessionSearchInput) {
+    sessionSearchInput.addEventListener('input', () => {
+      scheduleSessionPromptSearch(sessionSearchInput.value);
+    });
+  }
+
+  if (sessionCwdFilter) {
+    sessionCwdFilter.addEventListener('change', () => {
+      currentSessionCwdFilter = sessionCwdFilter.value;
+      sessionCwdFilterFromUrl = false;
+      sessionCwdFilter.title = sessionCwdFilter.selectedOptions[0]?.textContent
+        || t('session_cwd_filter_aria_label');
+      updateUrlParams();
+      resetDailyChartViewport();
+      if (currentUsageData) {
+        renderDashboard(currentUsageData);
+      } else {
+        sortAndRenderSessionTable();
+      }
+    });
+  }
 
   // Apply initial tab visibility based on restored activeTab
   const dailySelector = document.getElementById('daily-selector-section');
@@ -516,7 +848,9 @@ function initApp() {
         badgeButtons.forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
 
-        currentAssistant = normalizeAssistant(btn.getAttribute('data-value'));
+        const newAssistant = normalizeAssistant(btn.getAttribute('data-value'));
+        const assistantChanged = newAssistant !== currentAssistant;
+        currentAssistant = newAssistant;
         setCookie('selected_agent', currentAssistant);
         updateUrlParams();
         
@@ -528,21 +862,31 @@ function initApp() {
           colHeader.classList.add('hidden');
         }
 
-        // 切換 agent 時保留目前日期，當日無資料則顯示提示
-        await fetchDates(null, true);
-        await fetchMonths();
-        await fetchYears();
+        if (assistantChanged) {
+          isEmptyState = false;
+          currentUsageData = null;
+          currentMonthlyData = null;
+          currentYearlyData = null;
+          resetMiniStats();
+          showViewLoading(true);
+        }
+
+        // 切換 agent 時保留目前日期與月份/年份，無資料則顯示提示，不任意倒退
+        await fetchDates(null, true, currentAssistant);
+        await fetchMonths(null, currentAssistant, true);
+        await fetchYears(null, currentAssistant, true);
       });
     });
   }
 
   // Language toggle
-  const langToggle = document.getElementById('lang-toggle-btn');
-  if (langToggle) {
+  const langSelect = document.getElementById('lang-select');
+  if (langSelect) {
     updateLanguageToggle();
-    langToggle.addEventListener('click', () => {
-      currentLang = languageMeta(currentLang).next;
-      localStorage.setItem('lang', currentLang);
+    langSelect.addEventListener('change', () => {
+      languagePreference = localeOptions.includes(langSelect.value) ? langSelect.value : 'auto';
+      currentLang = languagePreference === 'auto' ? detectBrowserLocale() : languagePreference;
+      localStorage.setItem('lang', languagePreference);
       updateLanguageUI();
       
       // Re-render currently active view
@@ -619,11 +963,11 @@ function initApp() {
     const currentDateVal = dateSelect.value;
     if (!currentDateVal) return;
     
-    const currentDate = new Date(currentDateVal);
+    const currentDate = new Date(`${currentDateVal}T00:00:00Z`);
     if (isNaN(currentDate.getTime())) return;
     
-    currentDate.setDate(currentDate.getDate() + offset);
-    const newDateStr = getLocalDateString(currentDate);
+    currentDate.setUTCDate(currentDate.getUTCDate() + offset);
+    const newDateStr = getUtcDateString(currentDate);
     dateSelect.value = newDateStr;
     await loadUsageData(newDateStr);
   };
@@ -642,12 +986,12 @@ function initApp() {
   const btnToday = document.getElementById('btn-today');
   if (btnToday) {
     btnToday.addEventListener('click', async () => {
-      const todayStr = getLocalDateString();
+      const todayStr = getUtcDateString();
       if (dateSelect) {
         dateSelect.value = todayStr;
       }
       await loadUsageData(todayStr);
-      showNotification(`${t('today_btn') || '今日'} ${todayStr}`, 'success');
+      showNotification(`${t('today_btn')} ${todayStr}`, 'success');
     });
   }
 
@@ -743,7 +1087,7 @@ function initApp() {
       }
       monthSelect.value = thisMonthStr;
       await loadMonthlyData(thisMonthStr);
-      showNotification(`${t('this_month_btn') || '今月'} ${thisMonthStr}`, 'success');
+      showNotification(`${t('this_month_btn')} ${thisMonthStr}`, 'success');
     });
   }
 
@@ -870,7 +1214,7 @@ function initApp() {
       }
       yearSelect.value = thisYearStr;
       await loadYearlyData(thisYearStr);
-      showNotification(`${t('this_year_btn') || '今年'} ${thisYearStr}`, 'success');
+      showNotification(`${t('this_year_btn')} ${thisYearStr}`, 'success');
     });
   }
 
@@ -949,6 +1293,50 @@ function initApp() {
     });
   }
 
+  const usageImportModal = document.getElementById('usage-import-modal');
+  const closeUsageImportModalBtn = document.getElementById('close-usage-import-modal-btn');
+  const cancelUsageImportBtn = document.getElementById('cancel-usage-import-btn');
+  const confirmUsageImportBtn = document.getElementById('confirm-usage-import-btn');
+  const usageImportTarget = document.getElementById('usage-import-target-assistant');
+  if (usageImportTarget) {
+    usageImportTarget.addEventListener('change', updateUsageImportValidation);
+  }
+  if (confirmUsageImportBtn) {
+    confirmUsageImportBtn.addEventListener('click', executePendingUsageImport);
+  }
+  [closeUsageImportModalBtn, cancelUsageImportBtn].forEach((button) => {
+    if (button) button.addEventListener('click', closeUsageImportModal);
+  });
+  if (usageImportModal) {
+    usageImportModal.addEventListener('click', (event) => {
+      if (event.target === usageImportModal) closeUsageImportModal();
+    });
+  }
+
+  const btnImportHistory = document.getElementById('btn-import-history');
+  const importHistoryModal = document.getElementById('usage-import-history-modal');
+  const closeImportHistoryBtn = document.getElementById('close-usage-import-history-btn');
+  if (btnImportHistory) {
+    btnImportHistory.addEventListener('click', openUsageImportHistory);
+  }
+  if (closeImportHistoryBtn) {
+    closeImportHistoryBtn.addEventListener('click', closeUsageImportHistory);
+  }
+  if (importHistoryModal) {
+    importHistoryModal.addEventListener('click', (event) => {
+      if (event.target === importHistoryModal) closeUsageImportHistory();
+    });
+  }
+  const importHistoryList = document.getElementById('usage-import-history-list');
+  if (importHistoryList) {
+    importHistoryList.addEventListener('click', handleImportHistoryAction);
+  }
+  document.addEventListener('keydown', (event) => {
+    if (event.key !== 'Escape') return;
+    closeUsageImportModal();
+    closeUsageImportHistory();
+  });
+
   // 監聽 Live 重新整理切換
   liveToggle.addEventListener('change', (e) => {
     toggleLiveRefresh(e.target.checked);
@@ -974,7 +1362,7 @@ function initApp() {
 
   // 支援 ESC 鍵關閉抽屜與關閉行動端側欄
   window.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'b' && !isEditableShortcutTarget(e.target)) {
+    if (isSidebarToggleShortcut(e) && !isEditableShortcutTarget(e.target)) {
       e.preventDefault();
       toggleSidebar();
       return;
@@ -1025,6 +1413,9 @@ function initApp() {
 
   // 初始化表格欄位排序
   initTableSorting();
+
+  // 初始化單日圖表類型與 K 線時間刻度
+  initDailyChartControls();
 
   // 初始化前置設定教學 Modal 與事件
   initSetupGuide();
@@ -1086,8 +1477,14 @@ function switchTab(tab) {
     dailyView.classList.add('hidden');
     monthlyView.classList.add('hidden');
     yearlyView.classList.add('hidden');
-    if (!isEmptyState && activeView) {
-      activeView.classList.remove('hidden');
+    const emptyContainer = document.getElementById('empty-state-container');
+    if (isEmptyState) {
+      if (emptyContainer) emptyContainer.classList.remove('hidden');
+    } else {
+      if (emptyContainer) emptyContainer.classList.add('hidden');
+      if (activeView) {
+        activeView.classList.remove('hidden');
+      }
     }
   };
 
@@ -1104,8 +1501,10 @@ function switchTab(tab) {
 
     // 載入當前日期的數據
     const dateSelect = document.getElementById('date-select');
-    if (dateSelect.value) {
+    if (dateSelect.value && availableDates.length > 0) {
       loadUsageData(dateSelect.value);
+    } else if (availableDates.length === 0) {
+      toggleEmptyState(true, currentAssistant);
     }
   } else if (tab === 'monthly') {
     // 關閉即時自動刷新以節省資源
@@ -1181,7 +1580,7 @@ function toggleLiveRefresh(enabled, showToast = true) {
     if (btnNextDay) btnNextDay.disabled = true;
 
     // 自動切換到當天的日期 (以今天日期進行即時監控)
-    const todayStr = getLocalDateString();
+    const todayStr = getUtcDateString();
     dateSelect.value = todayStr;
     loadUsageData(todayStr);
 
@@ -1252,12 +1651,12 @@ function stopLiveRefresh() {
 
 async function refreshLiveData() {
   try {
+    const todayStr = getUtcDateString();
     const res = await fetch(`/api/${currentAssistant}/dates`);
     const data = await res.json();
     availableDates = data.dates || [];
     
     const dateSelect = document.getElementById('date-select');
-    const todayStr = getLocalDateString();
     
     // 更新日曆的最小與最大限制
     if (availableDates.length > 0) {
@@ -1284,23 +1683,34 @@ async function refreshLiveData() {
 // =========================================================================
 // API 呼叫: 載入日期清單
 // =========================================================================
-async function fetchDates(selectedDate = null, keepDate = false) {
+async function fetchDates(selectedDate = null, keepDate = false, assistant = currentAssistant) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/dates`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/dates`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const dateSelect = document.getElementById('date-select');
     availableDates = data.dates || [];
 
-    if (availableDates.length === 0 && !keepDate) {
-      toggleEmptyState(true);
+    if (availableDates.length === 0) {
+      currentUsageData = null;
+      currentMonthlyData = null;
+      currentYearlyData = null;
+      if (dateSelect) {
+        dateSelect.value = '';
+        dateSelect.min = '';
+        dateSelect.max = '';
+      }
+      toggleEmptyState(true, resolvedAssistant);
       return;
     }
 
     // 設定日曆最小與最大值
     const oldestDate = availableDates.length > 0 ? availableDates[availableDates.length - 1] : null;
     const newestDate = availableDates.length > 0 ? availableDates[0] : null;
-    const todayStr = getLocalDateString();
+    const todayStr = getUtcDateString();
     
     if (oldestDate) dateSelect.min = oldestDate;
     dateSelect.max = todayStr;
@@ -1322,13 +1732,48 @@ async function fetchDates(selectedDate = null, keepDate = false) {
         }
       }
       dateSelect.value = dateToLoad;
-      toggleEmptyState(false);
+      toggleEmptyState(false, resolvedAssistant);
     }
 
-    // 載入所選日期的數據（keepDate 時即使不在清單也直接請求，讓後端回 404）
-    // 若目前在 monthly tab，不呼叫 loadUsageData（避免 showNoDataForDate 蓋掉月報畫面）
-    if (!keepDate || activeTab === 'daily') {
-      await loadUsageData(dateToLoad);
+    // 依目前分頁載入對應資料：
+    // - 日報：載入所選日期（keepDate 時即使不在清單也直接請求，讓後端回 404）
+    // - 月/年報：開機時 options 尚未建立，交給 fetchMonths/fetchYears 載入；
+    //   清單已存在時（如空狀態的「重新整理」）直接重載當前期間。
+    //   不可在此呼叫日報 API，否則網址上的 month/year 參數會被誤當日期請求，
+    //   404 後閃現「無資料」蓋掉月/年報畫面
+    if (activeTab === 'daily') {
+      await loadUsageData(dateToLoad, resolvedAssistant);
+    } else if (!keepDate) {
+      if (activeTab === 'monthly') {
+        const monthSelect = document.getElementById('month-select');
+        // HTML 初始的「載入中...」佔位選項代表清單尚未由 fetchMonths 建立，交給開機流程處理
+        const monthsPending = monthSelect?.querySelector('option[data-i18n="loading"]');
+        if (monthSelect && !monthsPending) {
+          const targetMonth = monthSelect.value || getUrlDateForTab('monthly');
+          if (targetMonth) {
+            // 同一期間已在載入（開機時 fetchMonths 已觸發）就不重複請求
+            if (monthlyInFlightTarget !== targetMonth) {
+              await loadMonthlyData(targetMonth);
+            }
+          } else {
+            // 先前月份清單為空（如空狀態後重試），重新拉清單並載入
+            await fetchMonths();
+          }
+        }
+      } else if (activeTab === 'yearly') {
+        const yearSelect = document.getElementById('year-select');
+        const yearsPending = yearSelect?.querySelector('option[data-i18n="loading"]');
+        if (yearSelect && !yearsPending) {
+          const targetYear = yearSelect.value || getUrlDateForTab('yearly');
+          if (targetYear) {
+            if (yearlyInFlightTarget !== targetYear) {
+              await loadYearlyData(targetYear);
+            }
+          } else {
+            await fetchYears();
+          }
+        }
+      }
     }
 
   } catch (err) {
@@ -1340,58 +1785,86 @@ async function fetchDates(selectedDate = null, keepDate = false) {
 async function reloadDailyData() {
   const dateSelect = document.getElementById('date-select');
   const selectedDate = dateSelect.value;
+  resetSessionCwdFilter();
+  resetDailyChartViewport();
+  if (currentUsageData) renderDashboard(currentUsageData);
   await fetchDates(selectedDate);
 }
 
 // =========================================================================
 // API 呼叫: 載入當日使用量數據
 // =========================================================================
-async function loadUsageData(date) {
+async function loadUsageData(date, assistant = currentAssistant) {
   if (!date || date === 'undefined' || date === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
+  const mySeq = ++dailyRequestSeq;
+  // 同日期重整（即時監控、重新整理）不遮蔽內容，僅在標題顯示同步圖示
+  const dimView = !currentUsageData || currentUsageData.date !== date;
+  showViewLoading(dimView);
   try {
-    // 顯示加載動畫 (可在此擴展)
     setTitleMarkup('sync', date);
 
-    const res = await fetch(`/api/${currentAssistant}/usage/${date}`);
+    const res = await fetch(`/api/${resolvedAssistant}/usage/${date}`);
+    if (mySeq !== dailyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
       // 顯示「此 Agent 當日無資料」提示畫面，不改變日期
-      showNoDataForDate(date);
+      showNoDataForDate(date, resolvedAssistant);
       await updateCodexRateLimit();
       return;
     }
     
     const data = await res.json();
-    toggleEmptyState(false);
+    if (mySeq !== dailyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
+    toggleEmptyState(false, resolvedAssistant);
     renderDashboard(data);
     await updateCodexRateLimit();
 
   } catch (err) {
     console.error('載入使用量失敗:', err);
-    showNotification(t('load_failed'), 'error');
+    if (mySeq === dailyRequestSeq) showNotification(t('load_failed'), 'error');
+  } finally {
+    if (mySeq === dailyRequestSeq) {
+      hideViewLoading();
+      clearTitleSpinner();
+    }
   }
 }
 
-function getCurrentUsageDayDate() {
+function getCurrentUsagePeriod() {
+  if (activeTab === 'monthly') {
+    const monthSelect = document.getElementById('month-select');
+    if (monthSelect?.value) return { value: monthSelect.value, scope: 'month' };
+  } else if (activeTab === 'yearly') {
+    const yearSelect = document.getElementById('year-select');
+    if (yearSelect?.value) return { value: yearSelect.value, scope: 'year' };
+  }
+
   const dateSelect = document.getElementById('date-select');
-  return dateSelect && dateSelect.value ? dateSelect.value : getLocalDateString();
+  return {
+    value: dateSelect && dateSelect.value ? dateSelect.value : getUtcDateString(),
+    scope: 'day',
+  };
 }
 
 function getUsageExportFilename(payload) {
   const safeAssistant = currentAssistant || 'unknown';
-  const date = payload?.date || getCurrentUsageDayDate();
-  return `token-usage-${safeAssistant}-${date}-day-v${payload?.version || 1}.json`;
+  const period = getCurrentUsagePeriod();
+  const value = payload?.date || period.value;
+  return `token-usage-${safeAssistant}-${value}-${period.scope}-v${payload?.version || 1}.json`;
 }
 
 async function exportCurrentUsageDay() {
-  const date = getCurrentUsageDayDate();
+  const period = getCurrentUsagePeriod();
   const btnExport = document.getElementById('btn-export-usage-day');
   if (btnExport) btnExport.classList.add('loading');
 
   try {
-    const res = await fetch(`/api/${currentAssistant}/usage/${date}/export`);
+    const res = await fetch(`/api/${currentAssistant}/usage/${period.value}/export`);
     const payload = await res.json().catch(() => null);
 
     if (!res.ok) {
@@ -1424,7 +1897,7 @@ async function exportCurrentUsageDay() {
     showNotification(
       t('usage_exported')
         .replace('{count}', String(records.length))
-        .replace('{date}', payload.date || date),
+        .replace('{date}', payload.date || period.value),
       'success'
     );
   } catch (err) {
@@ -1441,9 +1914,6 @@ async function importUsageDayFromFile(file) {
     return;
   }
 
-  const importBtn = document.getElementById('btn-import-usage-day');
-  if (importBtn) importBtn.classList.add('loading');
-
   try {
     const rawText = await file.text();
     let payload = null;
@@ -1455,23 +1925,158 @@ async function importUsageDayFromFile(file) {
       return;
     }
 
-    const targetDate = typeof payload?.date === 'string' && payload.date.trim()
+    const dateLabel = typeof payload?.date === 'string' && payload.date.trim()
       ? payload.date.trim()
-      : getCurrentUsageDayDate();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(targetDate)) {
-      showNotification(t('import_failed').replace('{msg}', t('invalid_import_date')), 'error');
+      : t('import_all_dates');
+    const records = Array.isArray(payload?.records) ? payload.records : [];
+    if (records.length === 0) {
+      showNotification(t('import_failed').replace('{msg}', t('import_empty_records')), 'error');
       return;
     }
-    const records = Array.isArray(payload?.records) ? payload.records : [];
 
-    const res = await fetch(`/api/${currentAssistant}/usage/${targetDate}/import`, {
+    let sourceAssistant = null;
+    if (
+      Object.prototype.hasOwnProperty.call(payload || {}, 'assistant')
+      && payload.assistant !== null
+      && (typeof payload.assistant !== 'string' || !payload.assistant.trim())
+    ) {
+      showNotification(
+        t('import_failed').replace('{msg}', t('import_invalid_source')),
+        'error'
+      );
+      return;
+    }
+    if (typeof payload?.assistant === 'string' && payload.assistant.trim()) {
+      sourceAssistant = normalizeAssistant(payload.assistant);
+      if (!isSupportedAssistant(sourceAssistant)) {
+        showNotification(
+          t('import_failed').replace(
+            '{msg}',
+            t('import_unsupported_source').replace('{assistant}', sourceAssistant)
+          ),
+          'error'
+        );
+        return;
+      }
+    }
+
+    pendingUsageImport = {
+      fileName: file.name || t('import_unknown_file'),
+      records,
+      sourceAssistant,
+      dateLabel,
+    };
+    const sourceAssistantElement = document.getElementById('usage-import-source-assistant');
+    const fileNameElement = document.getElementById('usage-import-file-name');
+    const dateElement = document.getElementById('usage-import-date');
+    const recordCountElement = document.getElementById('usage-import-record-count');
+    const targetSelect = document.getElementById('usage-import-target-assistant');
+    if (sourceAssistantElement) {
+      sourceAssistantElement.textContent = sourceAssistant
+        ? getAssistantMeta(sourceAssistant).label
+        : t('import_unknown_source');
+    }
+    if (fileNameElement) fileNameElement.textContent = pendingUsageImport.fileName;
+    if (dateElement) dateElement.textContent = dateLabel;
+    if (recordCountElement) recordCountElement.textContent = String(records.length);
+    if (targetSelect) targetSelect.value = '';
+    updateUsageImportValidation();
+    document.getElementById('usage-import-modal')?.classList.add('active');
+    targetSelect?.focus();
+  } catch (err) {
+    console.error('Import preparation failed:', err);
+    showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
+  }
+}
+
+function closeUsageImportModal() {
+  document.getElementById('usage-import-modal')?.classList.remove('active');
+  pendingUsageImport = null;
+  const targetSelect = document.getElementById('usage-import-target-assistant');
+  if (targetSelect) targetSelect.value = '';
+}
+
+function updateUsageImportValidation() {
+  const targetSelect = document.getElementById('usage-import-target-assistant');
+  const validation = document.getElementById('usage-import-validation');
+  const confirmButton = document.getElementById('confirm-usage-import-btn');
+  const targetAssistant = normalizeAssistant(targetSelect?.value);
+
+  if (!pendingUsageImport || !isSupportedAssistant(targetAssistant)) {
+    if (validation) {
+      validation.className = 'usage-import-validation';
+      validation.textContent = t('import_select_target_required');
+    }
+    if (confirmButton) confirmButton.disabled = true;
+    return false;
+  }
+
+  if (
+    pendingUsageImport.sourceAssistant
+    && pendingUsageImport.sourceAssistant !== targetAssistant
+  ) {
+    if (validation) {
+      validation.className = 'usage-import-validation is-error';
+      validation.textContent = t('import_target_mismatch')
+        .replace('{source}', getAssistantMeta(pendingUsageImport.sourceAssistant).label)
+        .replace('{target}', getAssistantMeta(targetAssistant).label);
+    }
+    if (confirmButton) confirmButton.disabled = true;
+    return false;
+  }
+
+  if (validation) {
+    validation.className = 'usage-import-validation is-valid';
+    validation.textContent = pendingUsageImport.sourceAssistant
+      ? t('import_target_verified').replace('{target}', getAssistantMeta(targetAssistant).label)
+      : t('import_legacy_target_verified').replace('{target}', getAssistantMeta(targetAssistant).label);
+  }
+  if (confirmButton) confirmButton.disabled = false;
+  return true;
+}
+
+function activateAssistantWithoutReload(assistant) {
+  const normalizedAssistant = normalizeAssistant(assistant);
+  document.querySelectorAll('.assistant-badge-btn').forEach((button) => {
+    button.classList.toggle(
+      'active',
+      normalizeAssistant(button.getAttribute('data-value')) === normalizedAssistant
+    );
+  });
+  currentAssistant = normalizedAssistant;
+  setCookie('selected_agent', currentAssistant);
+  updateUrlParams();
+  updateLanguageUI();
+  fetchPricingRules();
+}
+
+async function executePendingUsageImport() {
+  if (!pendingUsageImport || !updateUsageImportValidation()) return;
+
+  const pendingImport = pendingUsageImport;
+  const targetAssistant = normalizeAssistant(
+    document.getElementById('usage-import-target-assistant')?.value
+  );
+  const importBtn = document.getElementById('btn-import-usage-day');
+  const confirmButton = document.getElementById('confirm-usage-import-btn');
+  if (importBtn) importBtn.classList.add('loading');
+  if (confirmButton) {
+    confirmButton.classList.add('loading');
+    confirmButton.disabled = true;
+  }
+
+  try {
+    const res = await fetch(`/api/${targetAssistant}/usage/all/import`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        date: targetDate,
-        records,
+        assistant: pendingImport.sourceAssistant,
+        confirmed_assistant: targetAssistant,
+        source_file_name: pendingImport.fileName,
+        date: pendingImport.dateLabel,
+        records: pendingImport.records,
       }),
     });
 
@@ -1485,46 +2090,199 @@ async function importUsageDayFromFile(file) {
     }
 
     const imported = summary && typeof summary.imported === 'number' ? summary.imported : 0;
-    const total = summary && typeof summary.total === 'number' ? summary.total : records.length;
+    const total = summary && typeof summary.total === 'number'
+      ? summary.total
+      : pendingImport.records.length;
     const skipped = summary && typeof summary.skipped_duplicates === 'number' ? summary.skipped_duplicates : 0;
     let msg = t('usage_import_success')
       .replace('{imported}', String(imported))
       .replace('{total}', String(total));
     if (skipped > 0) {
-      msg = `${msg}，${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
+      msg = `${msg}; ${t('usage_import_skipped').replace('{skipped}', String(skipped))}`;
     }
     showNotification(msg, 'success');
+    document.getElementById('usage-import-modal')?.classList.remove('active');
+    pendingUsageImport = null;
 
-    const dateSelect = document.getElementById('date-select');
-    if (dateSelect) {
-      dateSelect.value = targetDate;
+    if (currentAssistant !== targetAssistant) {
+      activateAssistantWithoutReload(targetAssistant);
     }
-    await fetchDates(targetDate, true);
-    if (activeTab !== 'daily') {
-      switchTab('daily');
-    }
-    await loadUsageData(targetDate);
+    await fetchDates(null, true);
+    await fetchMonths();
+    await fetchYears();
   } catch (err) {
     console.error('Import failed:', err);
     showNotification(t('import_failed').replace('{msg}', err.message || String(err)), 'error');
   } finally {
     if (importBtn) importBtn.classList.remove('loading');
+    if (confirmButton) confirmButton.classList.remove('loading');
+    if (pendingUsageImport) updateUsageImportValidation();
   }
 }
 
+function closeUsageImportHistory() {
+  document.getElementById('usage-import-history-modal')?.classList.remove('active');
+  importHistoryAssistant = null;
+}
+
+async function openUsageImportHistory() {
+  importHistoryAssistant = currentAssistant;
+  const modal = document.getElementById('usage-import-history-modal');
+  const description = document.getElementById('usage-import-history-description');
+  if (description) {
+    description.textContent = t('import_history_description')
+      .replace('{assistant}', getAssistantMeta(importHistoryAssistant).label);
+  }
+  modal?.classList.add('active');
+  await loadUsageImportHistory(importHistoryAssistant);
+}
+
+async function loadUsageImportHistory(assistant) {
+  const list = document.getElementById('usage-import-history-list');
+  if (!list) return;
+  list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(t('import_history_loading'))}</div>`;
+
+  try {
+    const response = await fetch(`/api/${assistant}/imports`);
+    const batches = await response.json().catch(() => null);
+    if (!response.ok) {
+      const error = batches?.error || `${response.status} ${response.statusText}`;
+      throw new Error(error);
+    }
+    renderUsageImportHistory(Array.isArray(batches) ? batches : [], assistant);
+  } catch (error) {
+    list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(
+      t('import_history_failed').replace('{msg}', error.message || String(error))
+    )}</div>`;
+  }
+}
+
+function renderUsageImportHistory(batches, assistant) {
+  const list = document.getElementById('usage-import-history-list');
+  if (!list) return;
+  if (batches.length === 0) {
+    list.innerHTML = `<div class="usage-import-history-empty">${escapeHtml(t('import_history_empty'))}</div>`;
+    return;
+  }
+
+  list.innerHTML = batches.map((batch) => {
+    const rolledBack = batch?.rolled_back_at != null;
+    const fileName = batch?.source_file_name || t('import_unknown_file');
+    const sourceAssistant = isSupportedAssistant(batch?.source_assistant)
+      ? getAssistantMeta(batch.source_assistant).label
+      : t('import_unknown_source');
+    const createdAt = Number.isFinite(batch?.created_at)
+      ? new Date(batch.created_at * 1000).toLocaleString(currentLang)
+      : '—';
+    const status = rolledBack ? t('import_status_rolled_back') : t('import_status_active');
+    const action = rolledBack || Number(batch?.imported || 0) === 0
+      ? ''
+      : `<button type="button" class="import-rollback-btn" data-batch-id="${escapeHtml(String(batch.id || ''))}" data-assistant="${escapeHtml(assistant)}">${escapeHtml(t('import_rollback_button'))}</button>`;
+    return `
+      <article class="usage-import-history-item">
+        <div class="usage-import-history-main">
+          <div class="usage-import-history-heading">
+            <strong title="${escapeHtml(fileName)}">${escapeHtml(fileName)}</strong>
+            <span class="usage-import-status${rolledBack ? ' is-rolled-back' : ''}">${escapeHtml(status)}</span>
+          </div>
+          <div class="usage-import-history-meta">
+            ${escapeHtml(sourceAssistant)} · ${escapeHtml(String(batch?.date || '—'))} ·
+            ${escapeHtml(t('import_history_counts')
+              .replace('{imported}', String(batch?.imported ?? 0))
+              .replace('{total}', String(batch?.total ?? 0))
+              .replace('{skipped}', String(batch?.skipped_duplicates ?? 0)))}<br>
+            ${escapeHtml(createdAt)}
+            ${rolledBack ? ` · ${escapeHtml(t('import_removed_records').replace('{count}', String(batch?.removed_records ?? 0)))}` : ''}
+          </div>
+        </div>
+        ${action}
+      </article>
+    `;
+  }).join('');
+}
+
+async function handleImportHistoryAction(event) {
+  const button = event.target.closest('.import-rollback-btn');
+  if (!button) return;
+  if (button.dataset.confirmed !== 'true') {
+    button.dataset.confirmed = 'true';
+    button.textContent = t('import_rollback_confirm_button');
+    return;
+  }
+
+  const batchId = button.dataset.batchId;
+  const assistant = normalizeAssistant(button.dataset.assistant);
+  if (!batchId || !isSupportedAssistant(assistant)) return;
+  button.disabled = true;
+  button.classList.add('loading');
+
+  try {
+    const response = await fetch(`/api/${assistant}/imports/${encodeURIComponent(batchId)}`, {
+      method: 'DELETE',
+    });
+    const result = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(result?.error || `${response.status} ${response.statusText}`);
+    }
+    showNotification(
+      t('import_rollback_success').replace(
+        '{count}',
+        String(result?.removed_records ?? 0)
+      ),
+      'success'
+    );
+    await loadUsageImportHistory(assistant);
+    if (currentAssistant === assistant) {
+      await fetchDates(null, true);
+      await fetchMonths();
+      await fetchYears();
+      if (activeTab === 'daily') await reloadDailyData();
+      if (activeTab === 'monthly') await reloadMonthlyData();
+      if (activeTab === 'yearly') await reloadYearlyData();
+    }
+  } catch (error) {
+    showNotification(
+      t('import_rollback_failed').replace('{msg}', error.message || String(error)),
+      'error'
+    );
+    button.disabled = false;
+    button.classList.remove('loading');
+  }
+}
+
+function resetMiniStats() {
+  const miniSessions = document.getElementById('mini-sessions');
+  if (miniSessions) miniSessions.textContent = '-';
+  const miniTokens = document.getElementById('mini-tokens');
+  if (miniTokens) miniTokens.textContent = '-';
+  const miniCache = document.getElementById('mini-cache');
+  if (miniCache) miniCache.textContent = `${t('cache_read_label')}: -`;
+  const miniCost = document.getElementById('mini-cost');
+  if (miniCost) miniCost.textContent = '-';
+  const miniDuration = document.getElementById('mini-duration');
+  if (miniDuration) miniDuration.textContent = '-';
+  const miniRequests = document.getElementById('mini-requests');
+  if (miniRequests) miniRequests.textContent = '-';
+}
+
 // 顯示「此 Agent 於當日無資料」的提示畫面
-function showNoDataForDate(date) {
-  const meta = getAssistantMeta(currentAssistant);
-  const title = t('no_data_for_date')
+function showNoDataForDate(date, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_date', resolvedAssistant)
     .replace('{agent}', meta.label)
     .replace('{date}', date);
-  const desc = t('no_data_for_date_desc');
+  const desc = t('no_data_for_date_desc', resolvedAssistant);
   const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
 
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
   const yearlyView = document.getElementById('yearly-view-container');
+
+  isEmptyState = false;
+  currentUsageData = null;
+  resetMiniStats();
 
   if (emptyContainer) {
     emptyContainer.classList.remove('hidden');
@@ -1534,15 +2292,15 @@ function showNoDataForDate(date) {
         <h2>${title}</h2>
         <p style="text-align: center; max-width: 100%;">${desc}</p>
         <div class="action-buttons">
-          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup')}</button>
-          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh')}</button>
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
         </div>
       </div>
     `;
 
     const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
     if (noDataGuideBtn) {
-      noDataGuideBtn.addEventListener('click', openSetupModal);
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
     }
 
     const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
@@ -1554,19 +2312,149 @@ function showNoDataForDate(date) {
           if (dateSelect) {
             dateSelect.value = date;
           }
-          await fetchDates(null, true);
+          await fetchDates(null, true, resolvedAssistant);
         } finally {
           noDataRefreshBtn.classList.remove('loading');
         }
       });
     }
   }
+  clearTitleSpinner();
+  hideViewLoading();
   if (dailyView) dailyView.classList.add('hidden');
   if (monthlyView) monthlyView.classList.add('hidden');
   if (yearlyView) yearlyView.classList.add('hidden');
 
   // 更新標題
-  setTitleMarkup('empty', date);
+  setTitleMarkup('calendar', date);
+}
+
+// 顯示「此 Agent 於當月無資料」的提示畫面
+function showNoDataForMonth(month, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_month', resolvedAssistant)
+    .replace('{agent}', meta.label)
+    .replace('{month}', month);
+  const desc = t('no_data_for_month_desc', resolvedAssistant);
+  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+
+  const emptyContainer = document.getElementById('empty-state-container');
+  const dailyView = document.getElementById('daily-view-container');
+  const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  isEmptyState = false;
+  currentMonthlyData = null;
+  resetMiniStats();
+
+  if (emptyContainer) {
+    emptyContainer.classList.remove('hidden');
+    emptyContainer.innerHTML = `
+      <div class="welcome-setup-card no-agent-card" style="align-items: center; text-align: center;">
+        ${logoMarkup}
+        <h2>${title}</h2>
+        <p style="text-align: center; max-width: 100%;">${desc}</p>
+        <div class="action-buttons">
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
+        </div>
+      </div>
+    `;
+
+    const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
+    if (noDataGuideBtn) {
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
+    }
+
+    const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
+    if (noDataRefreshBtn) {
+      noDataRefreshBtn.addEventListener('click', async () => {
+        noDataRefreshBtn.classList.add('loading');
+        try {
+          const monthSelect = document.getElementById('month-select');
+          if (monthSelect) {
+            monthSelect.value = month;
+          }
+          await fetchMonths(month, resolvedAssistant, true);
+        } finally {
+          noDataRefreshBtn.classList.remove('loading');
+        }
+      });
+    }
+  }
+  clearTitleSpinner();
+  hideViewLoading();
+  if (dailyView) dailyView.classList.add('hidden');
+  if (monthlyView) monthlyView.classList.add('hidden');
+  if (yearlyView) yearlyView.classList.add('hidden');
+
+  // 更新標題
+  setTitleMarkup('calendar', month);
+}
+
+// 顯示「此 Agent 於當年無資料」的提示畫面
+function showNoDataForYear(year, assistant = currentAssistant) {
+  const resolvedAssistant = normalizeAssistant(assistant);
+  const meta = getAssistantMeta(resolvedAssistant);
+  const title = t('no_data_for_year', resolvedAssistant)
+    .replace('{agent}', meta.label)
+    .replace('{year}', year);
+  const desc = t('no_data_for_year_desc', resolvedAssistant);
+  const logoMarkup = `<div class="card-icon"><img src="${meta.logo}" alt="${meta.alt}" style="width: 56px; height: 56px; object-fit: contain;" /></div>`;
+
+  const emptyContainer = document.getElementById('empty-state-container');
+  const dailyView = document.getElementById('daily-view-container');
+  const monthlyView = document.getElementById('monthly-view-container');
+  const yearlyView = document.getElementById('yearly-view-container');
+
+  isEmptyState = false;
+  currentYearlyData = null;
+  resetMiniStats();
+
+  if (emptyContainer) {
+    emptyContainer.classList.remove('hidden');
+    emptyContainer.innerHTML = `
+      <div class="welcome-setup-card no-agent-card" style="align-items: center; text-align: center;">
+        ${logoMarkup}
+        <h2>${title}</h2>
+        <p style="text-align: center; max-width: 100%;">${desc}</p>
+        <div class="action-buttons">
+          <button class="primary-btn" id="btn-no-data-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+          <button class="secondary-btn" id="btn-no-data-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
+        </div>
+      </div>
+    `;
+
+    const noDataGuideBtn = document.getElementById('btn-no-data-setup-guide');
+    if (noDataGuideBtn) {
+      noDataGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
+    }
+
+    const noDataRefreshBtn = document.getElementById('btn-no-data-refresh');
+    if (noDataRefreshBtn) {
+      noDataRefreshBtn.addEventListener('click', async () => {
+        noDataRefreshBtn.classList.add('loading');
+        try {
+          const yearSelect = document.getElementById('year-select');
+          if (yearSelect) {
+            yearSelect.value = year;
+          }
+          await fetchYears(year, resolvedAssistant, true);
+        } finally {
+          noDataRefreshBtn.classList.remove('loading');
+        }
+      });
+    }
+  }
+  clearTitleSpinner();
+  hideViewLoading();
+  if (dailyView) dailyView.classList.add('hidden');
+  if (monthlyView) monthlyView.classList.add('hidden');
+  if (yearlyView) yearlyView.classList.add('hidden');
+
+  // 更新標題
+  setTitleMarkup('calendar', year);
 }
 
 // Helpers to render metrics values (handling agent breakdown when multiple agents are active)
@@ -1647,7 +2535,38 @@ function renderMonthlyMetricValue(elementId, getValFn, formatFn, agentBreakdown,
 // =========================================================================
 function renderDashboard(data) {
   currentUsageData = data;
-  const { date, summary, sessions } = data;
+  const { date, home_dir: homeDir } = data;
+  const allSessions = Array.isArray(data.sessions) ? data.sessions : [];
+  currentSessionHomeDir = typeof homeDir === 'string' ? homeDir : currentSessionHomeDir;
+  const nextSearchContext = `${currentAssistant}:${date}`;
+  if (nextSearchContext !== currentSessionSearchContext) {
+    resetSessionPromptSearch();
+    // 從網址帶入的工作目錄篩選需跨日期切換保留，待下方依實際 Session 清單比對
+    const urlDirRaw = initialUrlParams.get('dir');
+    const pendingUrlDirKey = resolveSessionCwdMatchKeyFromUrl(urlDirRaw, currentSessionHomeDir)?.directKey || null;
+    resetSessionCwdFilter();
+    if (pendingUrlDirKey) {
+      currentSessionCwdFilter = pendingUrlDirKey;
+      sessionCwdFilterFromUrl = true;
+    }
+    currentSessionSearchContext = nextSearchContext;
+  }
+  const nextSearchFingerprint = JSON.stringify(
+    allSessions
+      .map(session => [session.assistant_type, session.session_id, session.max_turn_no])
+      .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
+  );
+  const shouldRefreshSearch = currentSessionSearchQuery
+    && nextSearchFingerprint !== currentSessionSearchDataFingerprint;
+  currentSessionSearchDataFingerprint = nextSearchFingerprint;
+  currentSessions = [...allSessions];
+  updateSessionCwdFilterOptions(currentSessions);
+  if (activeTab === 'daily') {
+    updateUrlParams();
+  }
+
+  const dailyViewData = buildDailyViewData(data);
+  const { summary, sessions } = dailyViewData;
 
   // 1. 更新標題
   setTitleMarkup('calendar', date);
@@ -1663,21 +2582,19 @@ function renderDashboard(data) {
   // 3. 更新主看板 Metric Cards
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const rawInputTokens = summary.total_input_tokens || 0;
+  const inputTokens = summary.total_input_tokens || 0;
   const cacheReadTokens = summary.total_cache_read_tokens || 0;
   const reasoningTokens = summary.total_reasoning_tokens || 0;
-  const netInputTokens = getNetInputTokens(rawInputTokens, cacheReadTokens);
-  const combinedInputTokens = netInputTokens + reasoningTokens;
 
   if (!isMulti) {
     document.getElementById('stat-total-tokens').textContent = formatToken(summary.total_tokens);
-    document.getElementById('stat-input-tokens').textContent = formatToken(combinedInputTokens);
+    document.getElementById('stat-input-tokens').textContent = formatToken(inputTokens);
     document.getElementById('stat-cache-read-tokens').textContent = formatToken(cacheReadTokens);
     document.getElementById('stat-output-tokens').textContent = formatToken(summary.total_output_tokens);
     document.getElementById('stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMetricValue('stat-total-tokens', s => s.total_tokens, formatToken, sessions, activeAgents);
-    renderMetricValue('stat-input-tokens', getDisplayedInputTokens, formatToken, sessions, activeAgents);
+    renderMetricValue('stat-input-tokens', s => s.total_input_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-cache-read-tokens', s => s.total_cache_read_tokens || 0, formatToken, sessions, activeAgents);
     renderMetricValue('stat-output-tokens', s => s.total_output_tokens, formatToken, sessions, activeAgents);
     renderMetricValue('stat-total-cost', s => s.cost_usd || 0, formatCost, sessions, activeAgents);
@@ -1689,18 +2606,14 @@ function renderDashboard(data) {
   const statCacheReadLabel = document.getElementById('stat-cache-read-label');
   const statCacheWrite = document.getElementById('stat-cache-write');
   const statOutputLabel = document.getElementById('stat-output-label');
-  const inputPercent = calculatePercentage(combinedInputTokens, summary.total_tokens);
+  const inputPercent = calculatePercentage(inputTokens, summary.total_tokens);
   const cacheReadPercent = calculatePercentage(cacheReadTokens, summary.total_tokens);
   const outputPercent = calculatePercentage(summary.total_output_tokens || 0, summary.total_tokens);
   const reasoningPercent = calculatePercentage(reasoningTokens, summary.total_tokens);
 
   if (statInputLabel) {
     const inputTooltip = t('input_tokens_percentage_formula')
-      .replace('{input}', formatNumber(rawInputTokens))
-      .replace('{cacheRead}', formatNumber(cacheReadTokens))
-      .replace('{netInput}', formatNumber(netInputTokens))
-      .replace('{reasoning}', formatNumber(reasoningTokens))
-      .replace('{combined}', formatNumber(combinedInputTokens))
+      .replace('{input}', formatNumber(inputTokens))
       .replace('{total}', formatNumber(summary.total_tokens || 0))
       .replace('{percent}', inputPercent);
     statInputLabel.textContent = `${t('input_tokens_label')} (${inputPercent})`;
@@ -1709,11 +2622,11 @@ function renderDashboard(data) {
   }
   if (statInputTokens) {
     const inputValueTooltip = t('reasoning_tokens_value_tooltip')
-      .replace('{netInput}', formatToken(netInputTokens))
+      .replace('{input}', formatToken(inputTokens))
       .replace('{reasoning}', formatToken(reasoningTokens))
       .replace('{percent}', reasoningPercent);
     statInputTokens.title = inputValueTooltip;
-    statInputTokens.setAttribute('aria-label', `${formatToken(combinedInputTokens)}; ${inputValueTooltip}`);
+    statInputTokens.setAttribute('aria-label', `${formatToken(inputTokens)}; ${inputValueTooltip}`);
   }
   if (statCacheReadLabel) {
     const cacheReadTooltip = t('cache_read_percentage_formula')
@@ -1755,25 +2668,759 @@ function renderDashboard(data) {
   }
 
   // 4. 繪製 Token 圖表
-  renderChart(sessions);
+  renderChart(dailyViewData);
 
   // 5. 渲染 Session 列表
-  currentSessions = [...sessions];
-  sortAndRenderSessionTable();
+  if (shouldRefreshSearch) {
+    scheduleSessionPromptSearch(currentSessionSearchQuery, { immediate: true });
+  } else {
+    sortAndRenderSessionTable();
+  }
 }
 
 // =========================================================================
-// 渲染 Chart.js Token 使用趨勢圖
+// 單日 Token 圖表控制與 K 線資料聚合
 // =========================================================================
-function renderChart(sessions) {
+function resetDailyChartViewport() {
+  dailyChartViewportStart = 0;
+  dailyChartViewportPinnedToLatest = true;
+  dailyChartViewportContext = '';
+}
+
+function resolveDailyChartViewport(candles, utcDate) {
+  const context = `${utcDate || ''}:${dailyChartIntervalMinutes}`;
+  if (dailyChartViewportContext !== context) {
+    dailyChartViewportContext = context;
+    dailyChartViewportPinnedToLatest = true;
+    dailyChartViewportStart = 0;
+  }
+
+  const requestedStart = dailyChartViewportPinnedToLatest
+    ? null
+    : dailyChartViewportStart;
+  const viewport = calculateCandleViewport(
+    candles,
+    DAILY_CHART_MAX_VISIBLE_CANDLES,
+    requestedStart
+  );
+  dailyChartViewportStart = viewport.start;
+  return viewport;
+}
+
+function applyDailyChartViewport(chart, viewport, candles, movingAverageValues) {
+  if (!chart?.options?.scales?.x || !viewport) return;
+  const yRange = calculateCandleViewportYRange(candles, movingAverageValues, viewport);
+  chart.$dailyViewport = viewport;
+  chart.options.scales.x.min = viewport.start;
+  chart.options.scales.x.max = viewport.end;
+  chart.options.scales.y.min = yRange.min;
+  chart.options.scales.y.max = yRange.max;
+  chart.options.scales.y.beginAtZero = yRange.min === 0;
+}
+
+function updateDailyChartNavigator(candles, viewport) {
+  const navigator = document.getElementById('daily-chart-navigator');
+  const range = document.getElementById('daily-chart-range');
+  const previous = document.getElementById('daily-chart-pan-previous');
+  const next = document.getElementById('daily-chart-pan-next');
+  const status = document.getElementById('daily-chart-window-status');
+  const canvas = document.getElementById('tokenChart');
+  const isVisible = dailyChartMode === 'kline' && Boolean(viewport?.canPan);
+
+  if (navigator) navigator.classList.toggle('hidden', !isVisible);
+  if (canvas) canvas.classList.toggle('is-pannable', isVisible);
+  if (!viewport) return;
+
+  if (range) {
+    range.min = '0';
+    range.max = String(viewport.maxStart);
+    range.value = String(viewport.start);
+    range.disabled = !viewport.canPan;
+    range.setAttribute('aria-label', t('chart_pan_slider_label'));
+  }
+  if (previous) {
+    previous.disabled = viewport.start <= 0;
+    previous.title = t('chart_pan_earlier');
+    previous.setAttribute('aria-label', t('chart_pan_earlier'));
+  }
+  if (next) {
+    next.disabled = viewport.start >= viewport.maxStart;
+    next.title = t('chart_pan_later');
+    next.setAttribute('aria-label', t('chart_pan_later'));
+  }
+  if (status && candles.length > 0) {
+    const startLabel = candles[viewport.start]?.startLabel || candles[viewport.start]?.label || '';
+    const endLabel = candles[viewport.end]?.endLabel || candles[viewport.end]?.label || '';
+    status.textContent = t('chart_pan_status')
+      .replace('{start}', startLabel)
+      .replace('{end}', endLabel)
+      .replace('{visible}', String(viewport.visibleCount))
+      .replace('{total}', String(viewport.candleCount));
+  }
+}
+
+function setDailyChartViewportStart(requestedStart) {
+  if (!tokenChartInstance || tokenChartInstance.$dailyChartMode !== 'kline') return;
+  const candles = tokenChartInstance.$dailyCandles;
+  if (!Array.isArray(candles)) return;
+
+  const viewport = calculateCandleViewport(
+    candles,
+    DAILY_CHART_MAX_VISIBLE_CANDLES,
+    requestedStart
+  );
+  dailyChartViewportStart = viewport.start;
+  dailyChartViewportPinnedToLatest = viewport.start >= viewport.maxStart;
+  const fullTrendMetrics = tokenChartInstance.$dailyFullTrendMetrics;
+  tokenChartInstance.$dailyTrendMetrics = calculateMovingAverageViewportTrend(
+    fullTrendMetrics?.values || [],
+    dailyChartIntervalMinutes,
+    viewport,
+    DAILY_CHART_MA_WINDOW
+  );
+  applyDailyChartViewport(
+    tokenChartInstance,
+    viewport,
+    candles,
+    fullTrendMetrics?.values
+  );
+  updateDailyChartNavigator(candles, viewport);
+  tokenChartInstance.update('none');
+}
+
+function initializeDailyChartPanInteractions(canvas) {
+  if (!canvas || canvas.dataset.panInitialized === 'true') return;
+  canvas.dataset.panInitialized = 'true';
+  let panState = null;
+
+  const finishPan = event => {
+    if (!panState) return;
+    if (canvas.hasPointerCapture?.(event.pointerId)) {
+      canvas.releasePointerCapture(event.pointerId);
+    }
+    panState = null;
+    canvas.classList.remove('is-dragging');
+  };
+
+  canvas.addEventListener('pointerdown', event => {
+    const viewport = tokenChartInstance?.$dailyViewport;
+    if (!viewport?.canPan || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    panState = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      viewportStart: viewport.start,
+    };
+    canvas.setPointerCapture?.(event.pointerId);
+    canvas.classList.add('is-dragging');
+  });
+
+  canvas.addEventListener('pointermove', event => {
+    if (!panState || event.pointerId !== panState.pointerId) return;
+    const viewport = tokenChartInstance?.$dailyViewport;
+    const chartWidth = tokenChartInstance?.chartArea?.width || canvas.clientWidth;
+    if (!viewport || chartWidth <= 0) return;
+    const slotWidth = chartWidth / Math.max(1, viewport.visibleCount);
+    const candleOffset = Math.round((panState.startX - event.clientX) / slotWidth);
+    if (Math.abs(event.clientX - panState.startX) >= 3) event.preventDefault();
+    setDailyChartViewportStart(panState.viewportStart + candleOffset);
+  });
+
+  canvas.addEventListener('pointerup', finishPan);
+  canvas.addEventListener('pointercancel', finishPan);
+  canvas.addEventListener('lostpointercapture', () => {
+    panState = null;
+    canvas.classList.remove('is-dragging');
+  });
+
+  canvas.addEventListener('wheel', event => {
+    const viewport = tokenChartInstance?.$dailyViewport;
+    const horizontalDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      ? event.deltaX
+      : event.shiftKey ? event.deltaY : 0;
+    if (!viewport?.canPan || horizontalDelta === 0) return;
+    event.preventDefault();
+    setDailyChartViewportStart(viewport.start + Math.sign(horizontalDelta));
+  }, { passive: false });
+}
+
+function initDailyChartControls() {
+  const modeToggle = document.getElementById('daily-chart-mode-toggle');
+  if (modeToggle) {
+    modeToggle.addEventListener('click', () => {
+      dailyChartMode = dailyChartMode === 'kline' ? 'trend' : 'kline';
+      localStorage.setItem(DAILY_CHART_MODE_STORAGE_KEY, dailyChartMode);
+      updateUrlParams();
+      updateDailyChartControls();
+      if (currentUsageData) {
+        renderChart(buildDailyViewData(currentUsageData));
+      }
+    });
+  }
+
+  document.querySelectorAll('.chart-interval-button').forEach(button => {
+    button.addEventListener('click', () => {
+      const interval = Number(button.dataset.minutes);
+      if (!DAILY_CHART_INTERVALS.includes(interval) || interval === dailyChartIntervalMinutes) {
+        return;
+      }
+      dailyChartIntervalMinutes = interval;
+      resetDailyChartViewport();
+      localStorage.setItem(DAILY_CHART_INTERVAL_STORAGE_KEY, String(interval));
+      updateDailyChartControls();
+      if (currentUsageData && dailyChartMode === 'kline') {
+        renderChart(buildDailyViewData(currentUsageData));
+      }
+    });
+  });
+
+  const range = document.getElementById('daily-chart-range');
+  if (range) {
+    range.addEventListener('input', event => {
+      setDailyChartViewportStart(Number(event.target.value));
+    });
+  }
+  const previous = document.getElementById('daily-chart-pan-previous');
+  if (previous) {
+    previous.addEventListener('click', () => {
+      setDailyChartViewportStart(dailyChartViewportStart - 1);
+    });
+  }
+  const next = document.getElementById('daily-chart-pan-next');
+  if (next) {
+    next.addEventListener('click', () => {
+      setDailyChartViewportStart(dailyChartViewportStart + 1);
+    });
+  }
+  initializeDailyChartPanInteractions(document.getElementById('tokenChart'));
+
+  updateDailyChartControls();
+}
+
+function getDailyChartIntervalLabel(minutes) {
+  if (minutes < 60) return `${minutes}min`;
+  return `${minutes / 60}hr`;
+}
+
+function updateDailyChartControls() {
+  const isKline = dailyChartMode === 'kline';
+  const modeToggle = document.getElementById('daily-chart-mode-toggle');
+  const title = document.getElementById('daily-chart-title');
+  const caption = document.getElementById('daily-chart-caption');
+  const experimentBadge = document.getElementById('daily-chart-experiment-badge');
+  const intervalSelector = document.getElementById('daily-chart-intervals');
+  const navigator = document.getElementById('daily-chart-navigator');
+  const marketSummary = document.getElementById('daily-chart-market-summary');
+  const canvas = document.getElementById('tokenChart');
+
+  if (modeToggle) {
+    modeToggle.setAttribute('aria-checked', String(isKline));
+    modeToggle.setAttribute('aria-label', t('chart_mode_toggle_label'));
+    modeToggle.querySelectorAll('.chart-mode-option').forEach(option => {
+      option.classList.toggle('is-active', option.dataset.chartMode === dailyChartMode);
+    });
+  }
+  if (title) {
+    title.textContent = t(isKline ? 'chart_daily_kline_title' : 'chart_daily_title');
+  }
+  if (caption) {
+    caption.textContent = t(isKline ? 'chart_kline_caption' : 'chart_trend_caption');
+  }
+  if (experimentBadge) {
+    experimentBadge.classList.toggle('hidden', !isKline);
+  }
+  if (intervalSelector) {
+    intervalSelector.classList.toggle('hidden', !isKline);
+    intervalSelector.setAttribute('aria-label', t('chart_interval_label'));
+  }
+  if (navigator && !isKline) {
+    navigator.classList.add('hidden');
+  }
+  if (marketSummary) {
+    marketSummary.classList.toggle('hidden', !isKline);
+  }
+  if (canvas && !isKline) {
+    canvas.setAttribute('aria-label', t('chart_trend_aria'));
+    canvas.classList.remove('is-pannable', 'is-dragging');
+  }
+
+  document.querySelectorAll('.chart-interval-button').forEach(button => {
+    const isActive = Number(button.dataset.minutes) === dailyChartIntervalMinutes;
+    button.classList.toggle('is-active', isActive);
+    button.setAttribute('aria-pressed', String(isActive));
+  });
+}
+
+function getCandlestickThemeColors() {
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  return {
+    up: isLight ? '#07845f' : chartPalette.candleUp,
+    down: isLight ? '#d93666' : chartPalette.candleDown,
+    flat: isLight ? '#64748b' : chartPalette.candleFlat,
+    empty: isLight ? 'rgba(71, 85, 105, 0.58)' : 'rgba(148, 163, 184, 0.52)',
+    average: chartPalette.candleAverage,
+    tagBackground: isLight ? 'rgba(255, 255, 255, 0.94)' : 'rgba(13, 17, 24, 0.94)',
+    cost: isLight ? '#a75808' : chartPalette.trendStroke,
+  };
+}
+
+function getCandlestickBodyWidth(chart) {
+  const candleCount = Math.max(
+    1,
+    chart.$dailyViewport?.visibleCount || chart.$dailyCandles?.length || 1
+  );
+  const slotWidth = chart.chartArea.width / candleCount;
+  return Math.max(2, Math.min(18, slotWidth * 0.68));
+}
+
+function isCandleInDailyViewport(chart, index) {
+  const viewport = chart.$dailyViewport;
+  return !viewport || (index >= viewport.start && index <= viewport.end);
+}
+
+const dailyTokenCandlestickPlugin = {
+  id: 'dailyTokenCandlesticks',
+  beforeDatasetsDraw(chart) {
+    if (chart.$dailyChartMode !== 'kline' || !Array.isArray(chart.$dailyCandles)) return;
+    const { ctx, chartArea, scales } = chart;
+    const colors = getCandlestickThemeColors();
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+    ctx.clip();
+    chart.$dailyCandles.forEach((candle, index) => {
+      if (candle.isFuture || !isCandleInDailyViewport(chart, index)) return;
+      const x = getChartDataPointX(chart, index);
+      const top = scales.y.getPixelForValue(candle.close);
+      const bottom = scales.y.getPixelForValue(candle.open);
+      if (candle.total <= 0) {
+        ctx.strokeStyle = colors.empty;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, Math.max(chartArea.top, top - 7));
+        ctx.lineTo(x, Math.min(chartArea.bottom, top + 7));
+        ctx.stroke();
+        return;
+      }
+      const stroke = candle.direction > 0 ? colors.up : candle.direction < 0 ? colors.down : colors.flat;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, Math.max(chartArea.top, top - 4));
+      ctx.lineTo(x, Math.min(chartArea.bottom, bottom + 4));
+      ctx.stroke();
+    });
+    ctx.restore();
+  },
+  afterDatasetsDraw(chart) {
+    if (chart.$dailyChartMode !== 'kline' || !Array.isArray(chart.$dailyCandles)) return;
+    const { ctx, chartArea, scales } = chart;
+    const colors = getCandlestickThemeColors();
+    const width = getCandlestickBodyWidth(chart);
+    const slotWidth = chartArea.width / Math.max(
+      1,
+      chart.$dailyViewport?.visibleCount || chart.$dailyCandles.length
+    );
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(chartArea.left, chartArea.top, chartArea.width, chartArea.height);
+    ctx.clip();
+    chart.$dailyCandles.forEach((candle, index) => {
+      if (candle.isFuture || !isCandleInDailyViewport(chart, index)) return;
+      const x = getChartDataPointX(chart, index);
+      const top = scales.y.getPixelForValue(candle.close);
+      const bottom = scales.y.getPixelForValue(candle.open);
+      const isEmpty = candle.total <= 0;
+      const emptyHeight = Math.max(8, Math.min(12, width * 0.7));
+      const bodyTop = isEmpty
+        ? Math.min(chartArea.bottom - emptyHeight, Math.max(chartArea.top, top - emptyHeight / 2))
+        : top;
+      const height = isEmpty ? emptyHeight : Math.max(2, bottom - top);
+      if (isEmpty) {
+        ctx.strokeStyle = colors.empty;
+        ctx.lineWidth = 1.25;
+        ctx.strokeRect(x - width / 2, bodyTop, width, height);
+        return;
+      }
+      const stroke = candle.direction > 0 ? colors.up : candle.direction < 0 ? colors.down : colors.flat;
+      ctx.strokeStyle = stroke;
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x - width / 2, bodyTop, width, height);
+
+      const costLabel = formatCandlestickCost(candle.cost);
+      const labelY = Math.max(chartArea.top + 8, top - 7 - candle.labelRow * 9);
+      ctx.fillStyle = colors.cost;
+      ctx.font = `600 ${slotWidth < 10 ? 8 : 9}px "IBM Plex Mono", monospace`;
+      if (slotWidth < 12) {
+        ctx.save();
+        ctx.translate(x, labelY);
+        ctx.rotate(-Math.PI / 2);
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(costLabel, 0, 0);
+        ctx.restore();
+      } else {
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(costLabel, x, labelY);
+      }
+    });
+    drawMovingAverageSlopeTag(chart, colors);
+    ctx.restore();
+  },
+};
+
+function formatCandlestickCost(cost) {
+  const value = Math.max(0, Number(cost) || 0);
+  if (value === 0) return '$0';
+  if (value < 0.0001) return '<$0.0001';
+  if (value < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+}
+
+function formatTokenRate(rate) {
+  if (!Number.isFinite(rate)) return '—';
+  const sign = rate > 0 ? '+' : rate < 0 ? '−' : '';
+  return `${sign}${formatToken(Math.abs(rate))} Token/hr`;
+}
+
+function formatShortTokenRate(rate) {
+  if (!Number.isFinite(rate)) return '—';
+  const sign = rate > 0 ? '+' : rate < 0 ? '−' : '';
+  return `${sign}${formatToken(Math.abs(rate))}/hr`;
+}
+
+function drawMovingAverageSlopeTag(chart, colors) {
+  const metrics = chart.$dailyTrendMetrics;
+  if (!metrics || metrics.lastIndex < 0 || !Number.isFinite(metrics.slopeTokensPerHour)) return;
+  if (!isCandleInDailyViewport(chart, metrics.lastIndex)) return;
+  const value = metrics.values[metrics.lastIndex];
+  if (!Number.isFinite(value)) return;
+
+  const { ctx, chartArea, scales } = chart;
+  const x = getChartDataPointX(chart, metrics.lastIndex);
+  const y = scales.y.getPixelForValue(value);
+  const arrow = metrics.slopeTokensPerHour > 0 ? '↗' : metrics.slopeTokensPerHour < 0 ? '↘' : '→';
+  const label = `MA${metrics.windowSize} ${arrow} ${formatShortTokenRate(metrics.slopeTokensPerHour)}`;
+  ctx.font = '600 10px "IBM Plex Mono", monospace';
+  const horizontalPadding = 7;
+  const labelWidth = ctx.measureText(label).width + horizontalPadding * 2;
+  const labelHeight = 22;
+  const left = Math.min(
+    chartArea.right - labelWidth - 2,
+    Math.max(chartArea.left + 2, x + 9)
+  );
+  const top = Math.min(
+    chartArea.bottom - labelHeight - 2,
+    Math.max(chartArea.top + 2, y - labelHeight - 9)
+  );
+
+  ctx.fillStyle = colors.tagBackground;
+  ctx.strokeStyle = colors.average;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  if (typeof ctx.roundRect === 'function') {
+    ctx.roundRect(left, top, labelWidth, labelHeight, 5);
+  } else {
+    ctx.rect(left, top, labelWidth, labelHeight);
+  }
+  ctx.fill();
+  ctx.stroke();
+  ctx.fillStyle = colors.average;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, left + horizontalPadding, top + labelHeight / 2);
+}
+
+function updateDailyChartMarketSummary(candles, trendMetrics) {
+  const summary = document.getElementById('daily-chart-market-summary');
+  if (!summary) return;
+  const activeCount = candles.filter(candle => candle.total > 0).length;
+  const totalTokens = candles.length > 0 ? candles[candles.length - 1].close : 0;
+  const totalCost = candles.reduce((sum, candle) => sum + candle.cost, 0);
+  const hasSlope = Number.isFinite(trendMetrics?.slopeTokensPerHour);
+  const momentumLabel = hasSlope
+    ? t(`chart_momentum_${trendMetrics.momentum}`)
+    : '';
+  const momentumSymbol = trendMetrics?.momentum === 'accelerating'
+    ? '↑'
+    : trendMetrics?.momentum === 'cooling' ? '↓' : '→';
+  const momentumPercent = Number.isFinite(trendMetrics?.momentumChangePercent)
+    ? ` ${Math.min(999, Math.abs(trendMetrics.momentumChangePercent)).toFixed(1)}%`
+    : '';
+  summary.innerHTML = `
+    <span>${getDailyChartIntervalLabel(dailyChartIntervalMinutes)} K</span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span><span class="market-value">${formatNumber(activeCount)}</span> ${t('chart_active_candles')}</span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span>${t('chart_day_total')} <span class="market-value">${formatToken(totalTokens)}</span></span>
+    <span class="market-divider" aria-hidden="true"></span>
+    <span>${t('estimated_cost_label')} <span class="market-value market-cost">${formatCost(totalCost)}</span></span>
+    ${hasSlope ? `
+      <span class="market-divider" aria-hidden="true"></span>
+      <span>MA${trendMetrics.windowSize} ${t('chart_slope_label')} <span class="market-value market-slope">${formatTokenRate(trendMetrics.slopeTokensPerHour)}</span></span>
+      <span class="market-momentum is-${trendMetrics.momentum}">${momentumSymbol} ${momentumLabel}${momentumPercent}</span>
+    ` : ''}
+  `;
+}
+
+function renderTokenCandlestickChart(data) {
+  const canvas = document.getElementById('tokenChart');
+  const candles = aggregateDailyTokenCandles(
+    data.raw_entries,
+    data.sessions,
+    dailyChartIntervalMinutes,
+    data.date
+  );
+  const viewport = resolveDailyChartViewport(candles, data.date);
+  const trendMetrics = calculateMovingAverageTrend(
+    candles,
+    dailyChartIntervalMinutes,
+    DAILY_CHART_MA_WINDOW
+  );
+  const viewportYRange = calculateCandleViewportYRange(
+    candles,
+    trendMetrics.values,
+    viewport
+  );
+  const viewportTrendMetrics = calculateMovingAverageViewportTrend(
+    trendMetrics.values,
+    dailyChartIntervalMinutes,
+    viewport,
+    DAILY_CHART_MA_WINDOW
+  );
+  const labels = candles.map(candle => candle.label);
+  const inputData = candles.map(candle => candle.input > 0
+    ? [candle.open, candle.open + candle.input]
+    : null);
+  const outputData = candles.map(candle => candle.output > 0
+    ? [candle.open + candle.input, candle.open + candle.input + candle.output]
+    : null);
+  const cacheData = candles.map(candle => candle.cache > 0
+    ? [candle.open + candle.input + candle.output, candle.close]
+    : null);
+  const candleDatasets = [
+    {
+      label: t('chart_input_label'),
+      data: inputData,
+      backgroundColor: chartPalette.candleInputFill,
+    },
+    {
+      label: t('chart_output_label'),
+      data: outputData,
+      backgroundColor: chartPalette.candleOutputFill,
+    },
+    {
+      label: t('chart_cache_combined_label'),
+      data: cacheData,
+      backgroundColor: chartPalette.candleCacheFill,
+    },
+  ].map(dataset => ({
+    ...dataset,
+    borderWidth: 0,
+    borderSkipped: false,
+    borderRadius: 0,
+    grouped: false,
+    barPercentage: 0.72,
+    categoryPercentage: 0.9,
+  }));
+  const datasets = [
+    ...candleDatasets,
+    {
+      label: t('chart_ma_label').replace('{window}', String(trendMetrics.windowSize)),
+      data: trendMetrics.values,
+      type: 'line',
+      dailyRole: 'movingAverage',
+      borderColor: chartPalette.candleAverage,
+      backgroundColor: 'rgba(45, 140, 255, 0.1)',
+      borderWidth: 2,
+      pointRadius: 0,
+      pointHoverRadius: 3,
+      pointHitRadius: 8,
+      pointStyle: 'line',
+      tension: 0.24,
+      fill: false,
+      spanGaps: false,
+      order: -10,
+    },
+  ];
+
+  updateDailyChartMarketSummary(candles, trendMetrics);
+  const totalTokens = candles.length > 0 ? candles[candles.length - 1].close : 0;
+  canvas.setAttribute(
+    'aria-label',
+    t('chart_kline_aria')
+      .replace('{interval}', getDailyChartIntervalLabel(dailyChartIntervalMinutes))
+      .replace('{total}', formatNumber(totalTokens))
+  );
+  currentChartSessions = [];
+
+  if (tokenChartInstance) {
+    tokenChartInstance.data.labels = labels;
+    tokenChartInstance.data.datasets = datasets;
+    tokenChartInstance.$dailyCandles = candles;
+    tokenChartInstance.$dailyFullTrendMetrics = trendMetrics;
+    tokenChartInstance.$dailyTrendMetrics = viewportTrendMetrics;
+    applyDailyChartViewport(tokenChartInstance, viewport, candles, trendMetrics.values);
+    updateDailyChartNavigator(candles, viewport);
+    tokenChartInstance.options.scales.y.title.text = t('chart_day_total');
+    tokenChartInstance.update();
+    return;
+  }
+
+  const prefersReducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  tokenChartInstance = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets },
+    plugins: [dailyTokenCandlestickPlugin],
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: prefersReducedMotion ? false : { duration: 180 },
+      layout: {
+        padding: { top: 16, right: 8 },
+      },
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      onHover: (event, activeElements) => {
+        if (canvas.classList.contains('is-dragging')) return;
+        canvas.style.cursor = tokenChartInstance?.$dailyViewport?.canPan
+          ? 'grab'
+          : activeElements.length ? 'crosshair' : 'default';
+      },
+      plugins: {
+        legend: {
+          position: 'top',
+          align: 'start',
+          onClick: () => {},
+          labels: {
+            color: '#f4f7fb',
+            boxWidth: 10,
+            boxHeight: 10,
+            padding: 14,
+            font: {
+              family: chartFontFamily,
+              size: 11,
+            },
+          },
+        },
+        tooltip: {
+          padding: 12,
+          backgroundColor: 'rgba(15, 18, 29, 0.96)',
+          titleColor: chartPalette.tokenStroke,
+          bodyColor: '#f4f7fb',
+          borderColor: 'rgba(255, 255, 255, 0.1)',
+          borderWidth: 1,
+          filter: context => !context.chart.$dailyCandles?.[context.dataIndex]?.isFuture,
+          callbacks: {
+            title: contexts => contexts[0]?.chart.$dailyCandles?.[contexts[0].dataIndex]?.rangeLabel || '',
+            label: context => {
+              if (context.dataset.dailyRole === 'movingAverage') {
+                return `${context.dataset.label}: ${formatToken(context.parsed.y)} Token`;
+              }
+              const candle = context.chart.$dailyCandles[context.dataIndex];
+              const values = [candle.input, candle.output, candle.cache];
+              return `${context.dataset.label}: ${formatToken(values[context.datasetIndex])} (${formatNumber(values[context.datasetIndex])})`;
+            },
+            afterBody: contexts => {
+              const candle = contexts[0]?.chart.$dailyCandles?.[contexts[0].dataIndex];
+              if (!candle) return [];
+              const changeLabel = candle.changePercent === null
+                ? t('chart_usage_flat')
+                : `${candle.direction > 0 ? t('chart_usage_up') : candle.direction < 0 ? t('chart_usage_down') : t('chart_usage_flat')} ${Math.abs(candle.changePercent).toFixed(1)}%`;
+              return [
+                `${t('chart_interval_total')}: ${formatToken(candle.total)} (${formatNumber(candle.total)})`,
+                `${t('chart_accumulated_label')}: ${formatToken(candle.open)} → ${formatToken(candle.close)}`,
+                `${t('chart_interval_cost')}: ${formatCandlestickCost(candle.cost)}`,
+                `${t('chart_usage_change')}: ${changeLabel}`,
+              ];
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          stacked: false,
+          min: viewport.start,
+          max: viewport.end,
+          grid: {
+            display: false,
+          },
+          ticks: {
+            color: '#94a3b8',
+            autoSkip: true,
+            maxRotation: 0,
+            maxTicksLimit: 12,
+            font: {
+              family: 'IBM Plex Mono',
+              size: 10,
+            },
+          },
+        },
+        y: {
+          stacked: false,
+          beginAtZero: viewportYRange.min === 0,
+          min: viewportYRange.min,
+          max: viewportYRange.max,
+          grace: '18%',
+          grid: {
+            color: 'rgba(255, 255, 255, 0.05)',
+          },
+          ticks: {
+            color: '#94a3b8',
+            callback: value => formatToken(value),
+          },
+          title: {
+            display: true,
+            text: t('chart_day_total'),
+            color: '#f4f7fb',
+          },
+        },
+      },
+    },
+  });
+  tokenChartInstance.$dailyChartMode = 'kline';
+  tokenChartInstance.$dailyCandles = candles;
+  tokenChartInstance.$dailyFullTrendMetrics = trendMetrics;
+  tokenChartInstance.$dailyTrendMetrics = viewportTrendMetrics;
+  applyDailyChartViewport(tokenChartInstance, viewport, candles, trendMetrics.values);
+  updateDailyChartNavigator(candles, viewport);
+
+  const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  updateChartsTheme(currentTheme);
+}
+
+function renderChart(data) {
+  updateDailyChartControls();
   if (typeof Chart === 'undefined') {
     console.warn('Chart.js is not available; skipping daily chart rendering.');
     return;
   }
+  if (tokenChartInstance && tokenChartInstance.$dailyChartMode !== dailyChartMode) {
+    tokenChartInstance.destroy();
+    tokenChartInstance = null;
+  }
+
+  if (dailyChartMode === 'kline') {
+    renderTokenCandlestickChart(data);
+  } else {
+    renderSessionTrendChart(Array.isArray(data.sessions) ? data.sessions : []);
+  }
+}
+
+// =========================================================================
+// 渲染 Chart.js Session Token 使用趨勢圖
+// =========================================================================
+function renderSessionTrendChart(sessions) {
   const canvas = document.getElementById('tokenChart');
 
   // 只取前 15 個 Session 來畫，避免過於擁擠
-  const sortedSessions = [...sessions].sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  const sortedSessions = [...sessions].sort((a, b) => {
+    const timeA = parseUsageTimestamp(a.timestamp)?.getTime() ?? 0;
+    const timeB = parseUsageTimestamp(b.timestamp)?.getTime() ?? 0;
+    return timeA - timeB;
+  });
   const displaySessions = sortedSessions.slice(-15);
 
   currentChartSessions = displaySessions;
@@ -1939,6 +3586,7 @@ function renderChart(sessions) {
       }
     }
   });
+  tokenChartInstance.$dailyChartMode = 'trend';
 
   // 根據當前主題更新圖表樣式
   const currentTheme = document.documentElement.getAttribute('data-theme') || 'dark';
@@ -1997,6 +3645,328 @@ function initTableSorting() {
   });
 }
 
+function resetSessionPromptSearch() {
+  if (sessionSearchDebounceTimer) {
+    clearTimeout(sessionSearchDebounceTimer);
+    sessionSearchDebounceTimer = null;
+  }
+  if (sessionSearchAbortController) {
+    sessionSearchAbortController.abort();
+    sessionSearchAbortController = null;
+  }
+
+  currentSessionSearchQuery = '';
+  currentSessionSearchMatches = null;
+  currentSessionSearchUnavailable = 0;
+  currentSessionSearchState = 'idle';
+  currentSessionSearchDataFingerprint = '';
+
+  const input = document.getElementById('session-search-input');
+  if (input) input.value = '';
+}
+
+function normalizeSessionCwd(value) {
+  let path = String(value || '').trim();
+  if (!path) return '';
+
+  const usesWindowsSeparators = /^[a-zA-Z]:[\\/]/.test(path) || path.includes('\\');
+  if (usesWindowsSeparators) {
+    path = path.replace(/[\\/]+/g, '\\');
+    if (!/^[a-zA-Z]:\\$/.test(path) && !/^\\\\[^\\]+\\[^\\]+\\?$/.test(path)) {
+      path = path.replace(/\\+$/, '');
+    }
+  } else {
+    path = path.replace(/\/{2,}/g, '/');
+    if (path !== '/') path = path.replace(/\/+$/, '');
+  }
+
+  return path;
+}
+
+function sessionCwdMatchKey(value) {
+  const path = normalizeSessionCwd(value);
+  return /^[a-zA-Z]:\\/.test(path) ? path.toLocaleLowerCase('en-US') : path;
+}
+
+function abbreviateHomePath(value) {
+  const path = normalizeSessionCwd(value);
+  const homeDir = normalizeSessionCwd(currentSessionHomeDir);
+  if (!path || !homeDir) return path;
+
+  const pathKey = sessionCwdMatchKey(path);
+  const homeKey = sessionCwdMatchKey(homeDir);
+  if (pathKey === homeKey) return '~';
+  if (!pathKey.startsWith(homeKey)) return path;
+
+  const suffix = path.slice(homeDir.length);
+  return suffix.startsWith('/') || suffix.startsWith('\\') ? `~${suffix}` : path;
+}
+
+function resetSessionCwdFilter() {
+  currentSessionCwdFilter = '';
+  sessionCwdFilterFromUrl = false;
+  const select = document.getElementById('session-cwd-filter');
+  if (select) select.value = '';
+}
+
+// 將網址的 dir 參數（完整路徑、~ 家目錄縮寫或尾碼片段）解析為篩選用的 match key
+function resolveSessionCwdMatchKeyFromUrl(rawValue, homeDir) {
+  const raw = String(rawValue || '').trim();
+  if (!raw) return null;
+
+  // 支援 ~ 與 ~/path 的家目錄縮寫寫法
+  let expanded = raw;
+  if (raw === '~' || raw.startsWith('~/') || raw.startsWith('~\\')) {
+    const normalizedHome = normalizeSessionCwd(homeDir);
+    if (normalizedHome) {
+      expanded = raw === '~' ? normalizedHome : normalizedHome + raw.slice(1);
+    }
+  }
+
+  const directKey = sessionCwdMatchKey(expanded);
+  if (!directKey) return null;
+  return { directKey, normalizedInput: normalizeSessionCwd(expanded) };
+}
+
+function getCwdFilteredSessions(sessions = currentSessions) {
+  if (!currentSessionCwdFilter) return sessions;
+  return sessions.filter(session => (
+    sessionCwdMatchKey(session.cwd) === currentSessionCwdFilter
+  ));
+}
+
+function summarizeDailySessions(sessions) {
+  const sum = key => sessions.reduce(
+    (total, session) => total + (Number(session[key]) || 0),
+    0
+  );
+
+  return {
+    total_sessions: sessions.length,
+    total_tokens: sum('total_tokens'),
+    total_input_tokens: sum('total_input_tokens'),
+    total_output_tokens: sum('total_output_tokens'),
+    total_cache_read_tokens: sum('total_cache_read_tokens'),
+    total_cache_write_tokens: sum('total_cache_write_tokens'),
+    total_reasoning_tokens: sum('total_reasoning_tokens'),
+    total_duration_ms: sum('duration_ms'),
+    total_requests: sum('total_requests'),
+    total_cost_usd: sum('cost_usd'),
+  };
+}
+
+function buildDailyViewData(data) {
+  if (!currentSessionCwdFilter) return data;
+
+  const sessions = getCwdFilteredSessions(Array.isArray(data.sessions) ? data.sessions : []);
+  const sessionIds = new Set(sessions.map(session => String(session.session_id || '')));
+  const rawEntries = (Array.isArray(data.raw_entries) ? data.raw_entries : []).filter(entry => (
+    sessionIds.has(String(entry.session_id || ''))
+  ));
+
+  return {
+    ...data,
+    summary: summarizeDailySessions(sessions),
+    sessions,
+    raw_entries: rawEntries,
+  };
+}
+
+function updateSessionCwdFilterOptions(sessions) {
+  const select = document.getElementById('session-cwd-filter');
+  if (!select) return;
+
+  const uniqueDirectories = new Map();
+  sessions.forEach(session => {
+    const normalizedPath = normalizeSessionCwd(session.cwd);
+    const matchKey = sessionCwdMatchKey(normalizedPath);
+    if (matchKey && !uniqueDirectories.has(matchKey)) {
+      uniqueDirectories.set(matchKey, {
+        matchKey,
+        displayPath: abbreviateHomePath(normalizedPath),
+      });
+    }
+  });
+
+  const directories = [...uniqueDirectories.values()].sort((a, b) => (
+    a.displayPath.localeCompare(b.displayPath, currentLang, {
+      numeric: true,
+      sensitivity: 'base',
+    })
+  ));
+  if (currentSessionCwdFilter && !uniqueDirectories.has(currentSessionCwdFilter)) {
+    currentSessionCwdFilter = '';
+  }
+
+  select.replaceChildren();
+  const allOption = document.createElement('option');
+  allOption.value = '';
+  allOption.textContent = t('session_cwd_filter_all');
+  select.appendChild(allOption);
+
+  directories.forEach(directory => {
+    const option = document.createElement('option');
+    option.value = directory.matchKey;
+    option.textContent = directory.displayPath;
+    option.title = directory.displayPath;
+    select.appendChild(option);
+  });
+
+  if (sessionCwdFilterFromUrl) {
+    // 保留從網址帶入的篩選條件：先嘗試完整路徑比對，再以唯一尾碼比對
+    const requested = resolveSessionCwdMatchKeyFromUrl(
+      initialUrlParams.get('dir'),
+      currentSessionHomeDir
+    );
+    let resolvedKey = null;
+    if (requested) {
+      if (uniqueDirectories.has(requested.directKey)) {
+        resolvedKey = requested.directKey;
+      } else {
+        // 尾碼比對需對齊路徑分隔邊界，避免 TokenUsageInsights 誤配 myTokenUsageInsights。
+        // 一律用不分大小寫比對（Windows 路徑不分大小寫；POSIX 的混用大小寫情境極少，且仍需唯一比對才會採用）。
+        // 當輸入恰好等於完整 key 時，邊界索引為 -1，charAt(-1) 回傳 ''，視為完全比對通過。
+        const lowerInput = requested.normalizedInput.toLocaleLowerCase('en-US');
+        const matchesPathBoundary = (key) => {
+          const lowerKey = key.toLocaleLowerCase('en-US');
+          if (!lowerKey.endsWith(lowerInput)) return false;
+          const boundary = lowerKey.charAt(lowerKey.length - lowerInput.length - 1);
+          return boundary === '' || boundary === '/' || boundary === '\\';
+        };
+        const suffixMatches = directories.filter(directory => (
+          matchesPathBoundary(directory.matchKey)
+            || matchesPathBoundary(sessionCwdMatchKey(directory.displayPath))
+        ));
+        if (suffixMatches.length === 1) {
+          resolvedKey = suffixMatches[0].matchKey;
+        }
+      }
+    }
+    if (resolvedKey) {
+      currentSessionCwdFilter = resolvedKey;
+      select.title = uniqueDirectories.get(resolvedKey)?.displayPath
+        || t('session_cwd_filter_aria_label');
+    }
+    sessionCwdFilterFromUrl = false;
+  }
+
+  select.disabled = directories.length === 0;
+  select.value = currentSessionCwdFilter;
+  select.title = currentSessionCwdFilter
+    ? (select.selectedOptions[0]?.textContent || t('session_cwd_filter_aria_label'))
+    : t('session_cwd_filter_aria_label');
+}
+
+function sessionSearchMatchKey(assistantType, sessionId) {
+  return JSON.stringify([assistantType || '', sessionId || '']);
+}
+
+function getSearchFilteredSessions() {
+  const cwdFilteredSessions = getCwdFilteredSessions();
+
+  if (
+    !currentSessionSearchQuery
+    || currentSessionSearchState !== 'complete'
+    || !(currentSessionSearchMatches instanceof Set)
+  ) {
+    return cwdFilteredSessions;
+  }
+
+  return cwdFilteredSessions.filter(session => currentSessionSearchMatches.has(
+    sessionSearchMatchKey(session.assistant_type, session.session_id)
+  ));
+}
+
+function scheduleSessionPromptSearch(value, { immediate = false } = {}) {
+  const query = String(value || '').trim();
+
+  if (sessionSearchDebounceTimer) {
+    clearTimeout(sessionSearchDebounceTimer);
+    sessionSearchDebounceTimer = null;
+  }
+  if (sessionSearchAbortController) {
+    sessionSearchAbortController.abort();
+    sessionSearchAbortController = null;
+  }
+
+  currentSessionSearchQuery = query;
+  currentSessionSearchMatches = null;
+  currentSessionSearchUnavailable = 0;
+
+  if (!query) {
+    currentSessionSearchState = 'idle';
+    sortAndRenderSessionTable();
+    return;
+  }
+
+  if (!currentUsageData?.date) {
+    currentSessionSearchState = 'idle';
+    return;
+  }
+
+  currentSessionSearchState = 'loading';
+  sortAndRenderSessionTable();
+  const delay = immediate ? 0 : 250;
+  sessionSearchDebounceTimer = setTimeout(() => {
+    sessionSearchDebounceTimer = null;
+    executeSessionPromptSearch(query, currentSessionSearchContext);
+  }, delay);
+}
+
+async function executeSessionPromptSearch(query, searchContext) {
+  const controller = new AbortController();
+  sessionSearchAbortController = controller;
+  const date = currentUsageData?.date;
+  const params = new URLSearchParams({ q: query });
+
+  try {
+    const response = await fetch(
+      `/api/${encodeURIComponent(currentAssistant)}/usage/${encodeURIComponent(date)}/session-search?${params}`,
+      { signal: controller.signal }
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const result = await response.json();
+
+    if (
+      searchContext !== currentSessionSearchContext
+      || query !== currentSessionSearchQuery
+    ) {
+      return;
+    }
+
+    currentSessionSearchMatches = new Set(
+      (result.matches || []).map(match => sessionSearchMatchKey(
+        match.assistant_type,
+        match.session_id
+      ))
+    );
+    currentSessionSearchUnavailable = Number(result.unavailable_sessions) || 0;
+    currentSessionSearchState = 'complete';
+    sortAndRenderSessionTable();
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    if (
+      searchContext !== currentSessionSearchContext
+      || query !== currentSessionSearchQuery
+    ) {
+      return;
+    }
+
+    console.error('搜尋 USER 提示詞失敗:', error);
+    currentSessionSearchMatches = null;
+    currentSessionSearchUnavailable = 0;
+    currentSessionSearchState = 'error';
+    sortAndRenderSessionTable();
+    showNotification(t('session_search_failed'), 'error');
+  } finally {
+    if (sessionSearchAbortController === controller) {
+      sessionSearchAbortController = null;
+    }
+  }
+}
+
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const map = new Map();
   sessions.forEach(s => {
@@ -2014,17 +3984,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
     }
   });
 
-  const compare = (a, b) => {
-    let valA = a[sortCol];
-    let valB = b[sortCol];
-    if (valA === undefined || valA === null) valA = 0;
-    if (valB === undefined || valB === null) valB = 0;
-
-    if (typeof valA === 'string' && typeof valB === 'string') {
-      return sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
-    }
-    return sortDir === 'asc' ? valA - valB : valB - valA;
-  };
+  const compare = (a, b) => compareSessionRows(a, b, sortCol, sortDir);
 
   // 排序 Root 節點
   roots.sort(compare);
@@ -2062,7 +4022,8 @@ function sortAndRenderSessionTable() {
     return;
   }
 
-  const flatSessions = sortAndGetFlatSessions(currentSessions, currentSortColumn, currentSortDirection);
+  const filteredSessions = getSearchFilteredSessions();
+  const flatSessions = sortAndGetFlatSessions(filteredSessions, currentSortColumn, currentSortDirection);
   renderSessionTable(flatSessions);
   updateSortHeadersUI();
 }
@@ -2093,9 +4054,70 @@ function updateSortHeadersUI() {
 // =========================================================================
 // 渲染 Session 列表 Table
 // =========================================================================
+function getSessionSourceBadge(session) {
+  if (session.source_kind === 'vscode-chat') {
+    return '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>';
+  }
+  if (session.source_kind === 'copilot-app') {
+    return '<span class="badge source-badge" title="GitHub Copilot App">App</span>';
+  }
+  if (session.assistant_type === 'copilot') {
+    return '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>';
+  }
+  if (session.source_kind === 'codex-desktop') {
+    return '<span class="badge source-badge" title="Codex Desktop">Desktop</span>';
+  }
+  if (session.source_kind === 'codex-cli') {
+    return '<span class="badge source-badge" title="Codex CLI">CLI</span>';
+  }
+  if (session.source_kind === 'cursor-agent') {
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-agent" title="${escapeHtml(t('source_cursor_agent_title'))}">${escapeHtml(t('source_cursor_agent'))}</span>`;
+  }
+  if (session.source_kind === 'cursor-ide') {
+    return `<span class="badge source-badge cursor-mode-badge cursor-mode-ide" title="${escapeHtml(t('source_cursor_ide_title'))}">${escapeHtml(t('source_cursor_ide'))}</span>`;
+  }
+  if (session.source_kind === 'grok-build-usage') {
+    return `<span class="badge source-badge" title="${escapeHtml(t('grok_source_usage_title'))}">${escapeHtml(t('grok_source_usage'))}</span>`;
+  }
+  if (session.source_kind === 'grok-build-context') {
+    return `<span class="badge source-badge" title="${escapeHtml(t('grok_source_context_title'))}">${escapeHtml(t('grok_source_context'))}</span>`;
+  }
+  return '';
+}
+
+function getCursorModeBadge(mode) {
+  if (mode === 'agent') {
+    return getSessionSourceBadge({ source_kind: 'cursor-agent' });
+  }
+  if (mode === 'ide') {
+    return getSessionSourceBadge({ source_kind: 'cursor-ide' });
+  }
+  return '';
+}
+
 function renderSessionTable(sessions) {
   const tbody = document.getElementById('session-list-body');
-  document.getElementById('session-count').textContent = `${sessions.length} Sessions`;
+  const sessionCount = document.getElementById('session-count');
+  const cwdFilteredTotal = currentSessionCwdFilter
+    ? currentSessions.filter(session => sessionCwdMatchKey(session.cwd) === currentSessionCwdFilter).length
+    : currentSessions.length;
+  if (currentSessionSearchQuery && currentSessionSearchState === 'loading') {
+    sessionCount.textContent = t('session_search_loading');
+  } else if (currentSessionSearchQuery && currentSessionSearchState === 'complete') {
+    const countKey = currentSessionSearchUnavailable > 0 && !currentSessionCwdFilter
+      ? 'session_search_count_partial'
+      : 'session_search_count';
+    sessionCount.textContent = t(countKey)
+      .replace('{matched}', sessions.length)
+      .replace('{total}', cwdFilteredTotal)
+      .replace('{unavailable}', currentSessionSearchUnavailable);
+  } else if (currentSessionCwdFilter) {
+    sessionCount.textContent = t('session_cwd_filter_count')
+      .replace('{matched}', sessions.length)
+      .replace('{total}', currentSessions.length);
+  } else {
+    sessionCount.textContent = t('session_count').replace('{count}', sessions.length);
+  }
   tbody.innerHTML = '';
 
   const colHeader = document.getElementById('col-assistant-header');
@@ -2108,7 +4130,15 @@ function renderSessionTable(sessions) {
   }
 
   if (sessions.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="12" class="placeholder-text">${t('placeholder_no_sessions')}</td></tr>`;
+    let placeholderKey = 'placeholder_no_sessions';
+    if (currentSessionSearchQuery && currentSessionSearchState === 'complete') {
+      placeholderKey = currentSessionCwdFilter
+        ? 'placeholder_no_session_cwd_search_results'
+        : 'placeholder_no_session_search_results';
+    } else if (currentSessionCwdFilter) {
+      placeholderKey = 'placeholder_no_session_cwd_results';
+    }
+    tbody.innerHTML = `<tr><td colspan="13" class="placeholder-text">${t(placeholderKey)}</td></tr>`;
     return;
   }
 
@@ -2155,17 +4185,16 @@ function renderSessionTable(sessions) {
     
     // 格式化時間
     const timeFormatted = s.timestamp ? formatLocalTime(s.timestamp, true) : '-';
+    const displayCwd = abbreviateHomePath(s.cwd) || '-';
 
     let assistantBadge = "";
     if (isSupportedAssistant(s.assistant_type)) {
       const meta = getAssistantMeta(s.assistant_type);
       assistantBadge = `<span class="badge" style="${meta.badgeStyle}">${getAssistantLogoHtml(s.assistant_type)} ${meta.shortLabel}</span>`;
     }
-    const sourceBadge = s.source_kind === 'vscode-chat'
-      ? '<span class="badge source-badge" title="GitHub Copilot in VS Code">VS Code</span>'
-      : (s.assistant_type === 'copilot'
-        ? '<span class="badge source-badge" title="GitHub Copilot CLI">CLI</span>'
-        : '');
+    const sourceBadge = getSessionSourceBadge(s);
+    const nameSourceBadge = s.assistant_type === 'cursor' ? '' : sourceBadge;
+    const modelSourceBadge = s.assistant_type === 'cursor' ? sourceBadge : '';
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td>${assistantBadge}</td>` : '';
 
@@ -2175,18 +4204,21 @@ function renderSessionTable(sessions) {
       const paddingLeft = s.depth * 16;
       const connectorLeft = (s.depth - 1) * 16 + 4;
       const nickname = s.agent_nickname || '';
-      const role = s.agent_role || '';
+      // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
+      const rawRole = (s.agent_role || '').trim();
+      const semanticRole = rawRole && !['sub-agent', 'subagent'].includes(rawRole.toLowerCase()) ? rawRole : '';
+      // Subagent 顯示 parent session title，避免 collector 自動產生的 (subagent call_xxx) 後綴
+      const subagentDisplayName = s.parentName || s.session_name;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
           <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
-            <span class="badge subagent-badge" title="Subagent of: ${escapeHtml(s.parentName || '')}">Subagent</span>
-            ${sourceBadge}
-            ${nickname ? `<span class="badge agent-nickname-badge" title="Agent Nickname: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
-            ${role ? `<span class="badge agent-role-badge" title="Agent Role: ${escapeHtml(role)}">${escapeHtml(role)}</span>` : ''}
+            <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
+            ${nameSourceBadge}
+            ${nickname ? `<span class="badge agent-nickname-badge" title="${escapeHtml(t('assistant_nickname_label'))}: ${escapeHtml(nickname)}">${escapeHtml(nickname)}</span>` : ''}
+            ${semanticRole ? `<span class="badge agent-role-badge" title="${escapeHtml(t('assistant_role_label'))}: ${escapeHtml(semanticRole)}">${escapeHtml(semanticRole)}</span>` : ''}
           </div>
-          <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          <span class="session-name-text" title="${escapeHtml(subagentDisplayName)}">${escapeHtml(subagentDisplayName)}</span>
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -2194,7 +4226,7 @@ function renderSessionTable(sessions) {
       nameCellContent = `
         <div class="session-name-wrapper">
           <span class="session-name-text" title="${escapeHtml(s.session_name)}">${escapeHtml(s.session_name)}</span>
-          ${sourceBadge}
+          ${nameSourceBadge}
           <span class="session-id-sub">${escapeHtml(String(s.session_id))}</span>
         </div>
       `;
@@ -2208,6 +4240,7 @@ function renderSessionTable(sessions) {
       <td class="model-column">
         <div class="model-cell-content">
           <span class="badge highlight">${escapeHtml(s.model)}</span>
+          ${modelSourceBadge}
           ${s.reasoning_effort ? `<span class="badge" style="background: rgba(127, 142, 163, 0.15); color: #aeb9c8; font-size: 11px; font-weight: 600;">${escapeHtml(s.reasoning_effort)}</span>` : ''}
         </div>
       </td>
@@ -2220,6 +4253,9 @@ function renderSessionTable(sessions) {
       <td style="font-weight: 700; color: var(--accent-cyan);">${formatCost(s.cost_usd || 0)}</td>
       <td>${formatDuration(s.duration_ms)}</td>
       <td style="color: var(--text-secondary);">${timeFormatted}</td>
+      <td class="session-cwd-column">
+        <span class="session-cwd-value" title="${escapeHtml(displayCwd)}">${escapeHtml(displayCwd)}</span>
+      </td>
     `;
 
     // 當點擊 Session 時，開啟對話詳細還原
@@ -2269,6 +4305,8 @@ async function openSessionTimeline(session) {
     agent_nickname: agentNickname,
     agent_role: agentRole,
     cost_usd: estimatedCost,
+    source_kind: sourceKind,
+    source_dir_key: sourceDirKey,
   } = session;
   const drawerOverlay = document.getElementById('timeline-drawer');
   const timelineContainer = document.getElementById('timeline-items');
@@ -2294,8 +4332,9 @@ async function openSessionTimeline(session) {
   document.getElementById('drawer-session-id').textContent = sessionId;
 
   // 更新會話 Token & 基礎資訊（立即呈現在畫面上）
-  document.getElementById('meta-cwd').textContent = cwd || '-';
-  document.getElementById('meta-cwd').title = cwd || '';
+  const displayCwd = abbreviateHomePath(cwd) || '-';
+  document.getElementById('meta-cwd').textContent = displayCwd;
+  document.getElementById('meta-cwd').title = displayCwd;
   document.getElementById('meta-model').textContent = model || '-';
   const metaEffort = document.getElementById('meta-effort');
   if (metaEffort) {
@@ -2335,14 +4374,41 @@ async function openSessionTimeline(session) {
 
   try {
     const resolvedAssistant = assistantType || currentAssistant;
-    const res = await fetch(`/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}`);
+    // Pass source_kind and source_dir_key as query params so the backend can
+    // unambiguously identify the correct session when multiple sources share
+    // the same session_id (e.g. Copilot CLI vs. App, or two App directories).
+    const queryParams = new URLSearchParams();
+    if (sourceKind) queryParams.set('source_kind', sourceKind);
+    if (sourceDirKey) queryParams.set('source_dir_key', sourceDirKey);
+    const queryString = queryParams.toString();
+    const sessionUrl = `/api/${encodeURIComponent(resolvedAssistant)}/session/${encodeURIComponent(sessionId)}${queryString ? `?${queryString}` : ''}`;
+    const res = await fetch(sessionUrl);
     if (res.status === 404) {
       const errData = await res.json().catch(() => ({}));
-      if (errData.reason === 'no_events_yet') {
+      const reason = errData.reason;
+      // Map the backend reason code to the right user-facing message. Generic
+      // errors (no reason) fall back to the "cleaned up" message only when we
+      // genuinely believe the file was removed; otherwise show the backend
+      // error text when present, or a generic load-failed message.
+      if (reason === 'no_events_yet') {
         timelineContainer.innerHTML = `<div class="placeholder-text">${t('drawer_no_events_yet')}</div>`;
+      } else if (reason === 'file_missing') {
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_file_missing')}</div>`;
+      } else if (reason === 'content_unavailable') {
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_content_unavailable')}</div>`;
+      } else if (errData && typeof errData.error === 'string' && errData.error.trim()) {
+        // Backend supplied a specific error (e.g. path validation) without a
+        // recognized reason code. Surface it directly rather than masking it
+        // as a "cleaned up" file, which was the previous misleading behavior.
+        timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${escapeHtml(errData.error)}</div>`;
       } else {
         timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed_cleaned')}</div>`;
       }
+      return;
+    }
+
+    if (!res.ok) {
+      timelineContainer.innerHTML = `<div class="placeholder-text" style="color: var(--neon-red);">${t('drawer_load_failed')}</div>`;
       return;
     }
 
@@ -2364,17 +4430,19 @@ function closeDrawer() {
 // 渲染 Session 詳細時間軸 (Timeline) 內容
 // =========================================================================
 function renderTimeline(data) {
-  const { metadata, timeline } = data;
+  const metadata = data?.metadata && typeof data.metadata === 'object' ? data.metadata : {};
+  const timeline = Array.isArray(data?.timeline) ? data.timeline : [];
   const timelineContainer = document.getElementById('timeline-items');
   timelineContainer.innerHTML = '';
 
   // 取得最終使用的基礎資訊（API 回傳優先，沒有則 fallback 到列表正確欄位）
   const finalCwd = metadata.cwd || currentSessionCwd || '-';
+  const displayCwd = abbreviateHomePath(finalCwd) || '-';
   const finalModel = metadata.selected_model || currentSessionModel || '-';
 
   // 更新 Metadata 區塊
-  document.getElementById('meta-cwd').textContent = finalCwd;
-  document.getElementById('meta-cwd').title = finalCwd;
+  document.getElementById('meta-cwd').textContent = displayCwd;
+  document.getElementById('meta-cwd').title = displayCwd;
   document.getElementById('meta-branch').textContent = metadata.git_branch || '-';
   document.getElementById('meta-model').textContent = finalModel;
   document.getElementById('meta-repo').textContent = metadata.repository || '-';
@@ -2449,7 +4517,7 @@ function renderTimeline(data) {
         if (item.event_data.attachments && item.event_data.attachments.length > 0) {
           attachmentsHTML = `<div class="bubble-attachments">`;
           item.event_data.attachments.forEach(att => {
-            const path = att.filePath || att.path || '檔名未知';
+            const path = att.filePath || att.path || t('attachment_unknown_filename');
             const basename = path.split(/[\\/]/).pop();
             const attType = att.type || 'file';
             attachmentsHTML += `
@@ -2564,11 +4632,11 @@ function renderTimeline(data) {
         if (totalTokens || inTokens || outTokens || cacheReadTokens || reasoningTokens) {
           tokenBadge = `
             <div class="turn-token-stats">
-              ${inTokens ? `<span class="token-badge input" title="輸入 Token (Input Tokens)">In: ${formatToken(inTokens)}</span>` : ''}
-              ${outTokens ? `<span class="token-badge output" title="輸出 Token (Output Tokens)">Out: ${formatToken(outTokens)}</span>` : ''}
-              ${reasoningTokens ? `<span class="token-badge reasoning" title="推理 Token (Reasoning Tokens)">Reasoning: ${formatToken(reasoningTokens)}</span>` : ''}
-              ${cacheReadTokens ? `<span class="token-badge cache" title="快取讀取 Token (Cache Read Tokens)">Cache: ${formatToken(cacheReadTokens)}</span>` : ''}
-              ${totalTokens ? `<span class="token-badge total" title="總 Token (Total Tokens)">Total: ${formatToken(totalTokens)}</span>` : ''}
+              ${inTokens ? `<span class="token-badge input" title="${escapeHtml(t('token_input_title'))}">${escapeHtml(t('input_tokens_label'))}: ${formatToken(inTokens)}</span>` : ''}
+              ${outTokens ? `<span class="token-badge output" title="${escapeHtml(t('token_output_title'))}">${escapeHtml(t('output_tokens_label'))}: ${formatToken(outTokens)}</span>` : ''}
+              ${reasoningTokens ? `<span class="token-badge reasoning" title="${escapeHtml(t('token_reasoning_title'))}">${escapeHtml(t('reasoning_tokens_label'))}: ${formatToken(reasoningTokens)}</span>` : ''}
+              ${cacheReadTokens ? `<span class="token-badge cache" title="${escapeHtml(t('token_cache_title'))}">${escapeHtml(t('cache_read_label'))}: ${formatToken(cacheReadTokens)}</span>` : ''}
+              ${totalTokens ? `<span class="token-badge total" title="${escapeHtml(t('token_total_title'))}">${escapeHtml(t('total_tokens_label'))}: ${formatToken(totalTokens)}</span>` : ''}
             </div>
           `;
         }
@@ -2665,7 +4733,7 @@ function renderTimeline(data) {
 
         const isSuccess = result !== null && result !== undefined;
         const badgeClass = isSuccess ? 'badge success' : 'badge executing';
-        const badgeText = isSuccess ? 'Success' : 'Executing';
+        const badgeText = isSuccess ? t('tool_status_success') : t('tool_status_executing');
 
         // 格式化 Args & Result 為 Pre 區塊
         const argsStr = stringifyToolValue(args, '{}');
@@ -2740,9 +4808,9 @@ function renderTimeline(data) {
           message = t('session_compaction');
         }
 
-        let statusLabel = 'System';
+        let statusLabel = t('system_status');
         if (item.event_data.status_type === 'session_compaction') {
-          statusLabel = 'Compaction';
+          statusLabel = t('system_compaction');
         }
 
         div.innerHTML = `
@@ -2832,17 +4900,6 @@ function calculatePercentage(part, total) {
   return `${Math.round(percent)}%`;
 }
 
-function getNetInputTokens(inputTokens, cacheReadTokens) {
-  const input = Number(inputTokens) || 0;
-  const cacheRead = Number(cacheReadTokens) || 0;
-  return input >= cacheRead ? input - cacheRead : input;
-}
-
-function getDisplayedInputTokens(stats) {
-  return getNetInputTokens(stats?.total_input_tokens, stats?.total_cache_read_tokens)
-    + (Number(stats?.total_reasoning_tokens) || 0);
-}
-
 function formatDuration(ms) {
   if (ms === null || ms === undefined || ms === 0) return '-';
   if (ms < 1000) return `${ms}ms`;
@@ -2869,8 +4926,8 @@ function formatDuration(ms) {
 function formatLocalTime(isoString, includeSeconds = true) {
   if (!isoString) return '';
   try {
-    const date = new Date(isoString);
-    if (isNaN(date.getTime())) return '';
+    const date = parseUsageTimestamp(isoString);
+    if (!date) return '';
     const pad = (num) => String(num).padStart(2, '0');
     const hours = pad(date.getHours());
     const minutes = pad(date.getMinutes());
@@ -2897,26 +4954,44 @@ function escapeHtml(unsafe) {
 // =========================================================================
 // API 呼叫: 載入月份清單
 // =========================================================================
-async function fetchMonths(selectedMonth = null) {
+async function fetchMonths(selectedMonth = null, assistant = currentAssistant, keepMonth = false) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/months`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/months`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const monthSelect = document.getElementById('month-select');
+    if (!monthSelect) return;
+
+    const currentMonthVal = /^\d{4}-\d{2}$/.test(monthSelect.value) ? monthSelect.value : null;
     const urlMonth = getUrlDateForTab('monthly');
-    const targetMonth = selectedMonth || urlMonth || monthSelect.value;
+    const now = new Date();
+    const thisMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const targetMonth = selectedMonth || (keepMonth ? (currentMonthVal || urlMonth || thisMonthStr) : (urlMonth || currentMonthVal));
     
     monthSelect.innerHTML = '';
 
     if (!data.months || data.months.length === 0) {
       monthSelect.innerHTML = `<option value="" disabled selected>${t('no_month_logs')}</option>`;
+      if (activeTab === 'monthly') {
+        currentMonthlyData = null;
+        toggleEmptyState(true, resolvedAssistant);
+      }
       return;
     }
 
-    let monthToLoad = data.months[0];
+    const availableMonths = [...data.months];
+    if (targetMonth && /^\d{4}-\d{2}$/.test(targetMonth) && !availableMonths.includes(targetMonth)) {
+      availableMonths.push(targetMonth);
+      availableMonths.sort((a, b) => b.localeCompare(a));
+    }
+
+    let monthToLoad = targetMonth && /^\d{4}-\d{2}$/.test(targetMonth) ? targetMonth : availableMonths[0];
     let hasSelected = false;
 
-    data.months.forEach((month) => {
+    availableMonths.forEach((month) => {
       const opt = document.createElement('option');
       opt.value = month;
       opt.textContent = month;
@@ -2928,14 +5003,13 @@ async function fetchMonths(selectedMonth = null) {
       monthSelect.appendChild(opt);
     });
 
-    if (!hasSelected) {
-      if (monthSelect.options.length > 0) {
-        monthSelect.options[0].selected = true;
-      }
+    if (!hasSelected && monthSelect.options.length > 0) {
+      monthSelect.options[0].selected = true;
+      monthToLoad = monthSelect.options[0].value;
     }
 
     if (activeTab === 'monthly') {
-      await loadMonthlyData(monthToLoad);
+      await loadMonthlyData(monthToLoad, resolvedAssistant);
     }
 
   } catch (err) {
@@ -2953,27 +5027,44 @@ async function reloadMonthlyData() {
 // =========================================================================
 // API 呼叫: 載入年份清單
 // =========================================================================
-async function fetchYears(selectedYear = null) {
+async function fetchYears(selectedYear = null, assistant = currentAssistant, keepYear = false) {
   try {
-    const res = await fetch(`/api/${currentAssistant}/years`);
+    const resolvedAssistant = normalizeAssistant(assistant);
+    const res = await fetch(`/api/${resolvedAssistant}/years`);
     const data = await res.json();
+
+    if (currentAssistant !== resolvedAssistant) return;
     
     const yearSelect = document.getElementById('year-select');
     if (!yearSelect) return;
+
+    const currentYearVal = /^\d{4}$/.test(yearSelect.value) ? yearSelect.value : null;
     const urlYear = getUrlDateForTab('yearly');
-    const targetYear = selectedYear || urlYear || yearSelect.value;
+    const now = new Date();
+    const thisYearStr = String(now.getFullYear());
+    const targetYear = selectedYear || (keepYear ? (currentYearVal || urlYear || thisYearStr) : (urlYear || currentYearVal));
     
     yearSelect.innerHTML = '';
 
     if (!data.years || data.years.length === 0) {
       yearSelect.innerHTML = `<option value="" disabled selected>${t('no_year_logs')}</option>`;
+      if (activeTab === 'yearly') {
+        currentYearlyData = null;
+        toggleEmptyState(true, resolvedAssistant);
+      }
       return;
     }
 
-    let yearToLoad = data.years[0];
+    const availableYears = [...data.years];
+    if (targetYear && /^\d{4}$/.test(targetYear) && !availableYears.includes(targetYear)) {
+      availableYears.push(targetYear);
+      availableYears.sort((a, b) => b.localeCompare(a));
+    }
+
+    let yearToLoad = targetYear && /^\d{4}$/.test(targetYear) ? targetYear : availableYears[0];
     let hasSelected = false;
 
-    data.years.forEach((year) => {
+    availableYears.forEach((year) => {
       const opt = document.createElement('option');
       opt.value = year;
       opt.textContent = year;
@@ -2985,14 +5076,13 @@ async function fetchYears(selectedYear = null) {
       yearSelect.appendChild(opt);
     });
 
-    if (!hasSelected) {
-      if (yearSelect.options.length > 0) {
-        yearSelect.options[0].selected = true;
-      }
+    if (!hasSelected && yearSelect.options.length > 0) {
+      yearSelect.options[0].selected = true;
+      yearToLoad = yearSelect.options[0].value;
     }
 
     if (activeTab === 'yearly') {
-      await loadYearlyData(yearToLoad);
+      await loadYearlyData(yearToLoad, resolvedAssistant);
     }
 
   } catch (err) {
@@ -3012,27 +5102,43 @@ async function reloadYearlyData() {
 // =========================================================================
 // API 呼叫: 載入單年彙整數據
 // =========================================================================
-async function loadYearlyData(year) {
+async function loadYearlyData(year, assistant = currentAssistant) {
   if (!year || year === 'undefined' || year === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
+  const mySeq = ++yearlyRequestSeq;
+  const dimView = !currentYearlyData || currentYearlyData.year !== year;
+  yearlyInFlightTarget = year;
+  showViewLoading(dimView);
   try {
     setTitleMarkup('sync', year);
 
-    const res = await fetch(`/api/${currentAssistant}/yearly/${year}`);
+    const res = await fetch(`/api/${resolvedAssistant}/yearly/${year}`);
+    if (mySeq !== yearlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
-      showNotification(t('year_not_found'), 'error');
+      showNoDataForYear(year, resolvedAssistant);
       return;
     }
     
     const data = await res.json();
-    toggleEmptyState(false);
+    if (mySeq !== yearlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
+    modelSessionDetailsCache.clear();
+    toggleEmptyState(false, resolvedAssistant);
     renderYearlyDashboard(data);
 
   } catch (err) {
     console.error('載入年份彙整失敗:', err);
-    showNotification(t('yearly_load_failed'), 'error');
+    if (mySeq === yearlyRequestSeq) showNotification(t('yearly_load_failed'), 'error');
+  } finally {
+    if (mySeq === yearlyRequestSeq) {
+      yearlyInFlightTarget = null;
+      hideViewLoading();
+      clearTitleSpinner();
+    }
   }
 }
 
@@ -3049,7 +5155,7 @@ function renderYearlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const yearlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
+  const yearlyInputTokens = summary.total_input_tokens || 0;
 
   if (!isMulti) {
     const totalTokensEl = document.getElementById('yearly-stat-total-tokens');
@@ -3065,7 +5171,7 @@ function renderYearlyDashboard(data) {
     if (totalCostEl) totalCostEl.textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderYearlyMetricValue('yearly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderYearlyMetricValue('yearly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
+    renderYearlyMetricValue('yearly-stat-input-tokens', a => a.total_input_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderYearlyMetricValue('yearly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
     
@@ -3124,7 +5230,7 @@ function renderYearlyDashboard(data) {
   renderYearlyProjectsTable(projects);
 
   // 5. 渲染模型佔比列表
-  renderYearlyModelsTable(models);
+  renderYearlyModelsTable(models, year);
 
   // 6. 渲染當年每月彙總列表
   yearlyMonthlySortColumn = 'month';
@@ -3352,7 +5458,7 @@ function renderYearlyProjectsTable(projects) {
 
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}">${escapeHtml(p.cwd)}</td>
       <td><span class="badge">${p.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-cyan);">
         ${formatToken(p.total_tokens)}
@@ -3366,7 +5472,274 @@ function renderYearlyProjectsTable(projects) {
 // =========================================================================
 // 渲染年度模型佔比列表 Table
 // =========================================================================
-function renderYearlyModelsTable(models) {
+function normalizedModelMode(mode) {
+  return mode === 'agent' || mode === 'ide' ? mode : 'unclassified';
+}
+
+function modelSessionCacheKey(period, model, mode) {
+  return [currentAssistant, period, model, normalizedModelMode(mode)].join('\u0000');
+}
+
+async function fetchModelSessions(period, model, mode) {
+  const normalizedMode = normalizedModelMode(mode);
+  const cacheKey = modelSessionCacheKey(period, model, normalizedMode);
+  if (modelSessionDetailsCache.has(cacheKey)) {
+    return modelSessionDetailsCache.get(cacheKey);
+  }
+
+  const params = new URLSearchParams({ period, model, mode: normalizedMode });
+  const response = await fetch(
+    `/api/${encodeURIComponent(currentAssistant)}/model-sessions?${params.toString()}`
+  );
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error || `HTTP ${response.status}`);
+  }
+
+  const payload = await response.json();
+  const sessions = Array.isArray(payload.sessions) ? payload.sessions : [];
+  modelSessionDetailsCache.set(cacheKey, sessions);
+  return sessions;
+}
+
+function groupModelSessionsByDate(sessions) {
+  const groups = new Map();
+  sessions.forEach(session => {
+    const date = isValidDateKey(session.date) ? session.date : null;
+    const key = date || '';
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(session);
+  });
+
+  return Array.from(groups, ([date, dateSessions]) => ({ date, sessions: dateSessions }))
+    .sort((left, right) => {
+      if (!left.date) return 1;
+      if (!right.date) return -1;
+      return right.date.localeCompare(left.date);
+    });
+}
+
+function renderModelSessionDrilldown(sessions) {
+  if (sessions.length === 0) {
+    return `<div class="model-session-state">${escapeHtml(t('model_sessions_unavailable'))}</div>`;
+  }
+
+  const dateGroups = groupModelSessionsByDate(sessions);
+  const summary = t('model_sessions_summary')
+    .replace('{sessions}', String(sessions.length))
+    .replace('{dates}', String(dateGroups.length));
+
+  return `
+    <div class="model-session-drilldown">
+      <div class="model-session-summary">${escapeHtml(summary)}</div>
+      <div class="model-date-groups">
+        ${dateGroups.map(group => {
+          const dateTokens = group.sessions.reduce(
+            (total, session) => total + (session.total_tokens || 0),
+            0
+          );
+          const dateLabel = group.date || t('unknown_date');
+          const dateControl = group.date
+            ? `<button type="button" class="model-date-button" data-date="${escapeHtml(group.date)}" title="${escapeHtml(t('view_date'))}">${escapeHtml(group.date)}</button>`
+            : `<span class="model-date-label">${escapeHtml(dateLabel)}</span>`;
+          const sessionsLabel = t('model_sessions_count')
+            .replace('{count}', String(group.sessions.length));
+          const tokensLabel = t('model_tokens_count')
+            .replace('{tokens}', formatToken(dateTokens));
+
+          return `
+            <section class="model-date-group">
+              <div class="model-date-header">
+                ${dateControl}
+                <span>${escapeHtml(sessionsLabel)}</span>
+                <span>${escapeHtml(tokensLabel)}</span>
+              </div>
+              <div class="model-session-list">
+                ${group.sessions.map(session => {
+                  const name = session.session_name || session.session_id;
+                  const cwd = session.cwd || t('unknown_cwd');
+                  const time = formatLocalTime(session.timestamp, true) || '—';
+                  return `
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                      <span class="model-session-primary">
+                        <span class="model-session-name-row">
+                          <span class="model-session-name">${escapeHtml(name)}</span>
+                          ${getSessionSourceBadge(session)}
+                        </span>
+                        <span class="model-session-cwd" title="${escapeHtml(cwd)}">${escapeHtml(cwd)}</span>
+                      </span>
+                      <span class="model-session-time">${escapeHtml(time)}</span>
+                      <span class="model-session-tokens">${escapeHtml(formatToken(session.total_tokens || 0))}</span>
+                    </button>
+                  `;
+                }).join('')}
+              </div>
+            </section>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  `;
+}
+
+async function populateModelSessionDetails(detailsRow, period, model, mode) {
+  detailsRow.dataset.state = 'loading';
+  detailsRow.innerHTML = `
+    <td colspan="5">
+      <div class="model-session-state" role="status">${escapeHtml(t('model_sessions_loading'))}</div>
+    </td>
+  `;
+
+  try {
+    const sessions = await fetchModelSessions(period, model, mode);
+    if (!detailsRow.isConnected) return;
+    detailsRow.modelSessions = sessions;
+    detailsRow.dataset.state = 'loaded';
+    detailsRow.innerHTML = `<td colspan="5">${renderModelSessionDrilldown(sessions)}</td>`;
+  } catch (error) {
+    console.error('載入模型 Session 明細失敗:', error);
+    if (!detailsRow.isConnected) return;
+    detailsRow.dataset.state = 'error';
+    detailsRow.innerHTML = `
+      <td colspan="5">
+        <div class="model-session-state model-session-error" role="alert">
+          <span>${escapeHtml(t('model_sessions_failed'))}</span>
+          <button type="button" class="model-session-retry">${escapeHtml(t('model_sessions_retry'))}</button>
+        </div>
+      </td>
+    `;
+  }
+}
+
+function appendModelSummaryRows(tbody, models, period) {
+  const preserved = expandedModelDrilldowns.get(tbody.id);
+  if (preserved && preserved.period !== period) {
+    expandedModelDrilldowns.delete(tbody.id);
+  }
+
+  models.forEach((model, index) => {
+    const modelMode = model.mode || null;
+    const summaryRow = document.createElement('tr');
+    summaryRow.className = 'model-summary-row';
+    const detailsId = `${tbody.id}-details-${index}`;
+    summaryRow.innerHTML = `
+      <td style="text-align: center;"><span class="badge ${index < 3 ? 'highlight' : ''}">${index + 1}</span></td>
+      <td>
+        <button type="button" class="model-drilldown-toggle" aria-expanded="false" aria-controls="${detailsId}" title="${escapeHtml(t('model_drilldown_hint'))}">
+          <span class="model-drilldown-chevron" aria-hidden="true">›</span>
+          <span class="badge highlight model-badge">${escapeHtml(model.model)}</span>
+          ${getCursorModeBadge(modelMode)}
+        </button>
+      </td>
+      <td><span class="badge">${model.sessions_count} Sessions</span></td>
+      <td style="font-weight: 700; color: var(--accent-purple);">
+        ${formatToken(model.total_tokens)}
+        ${model.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(model.total_cache_read_tokens)}</div>` : ''}
+      </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(model.cost_usd || 0)}</td>
+    `;
+
+    const detailsRow = document.createElement('tr');
+    detailsRow.id = detailsId;
+    detailsRow.className = 'model-details-row';
+    detailsRow.hidden = true;
+
+    const toggle = summaryRow.querySelector('.model-drilldown-toggle');
+    const openDetails = async () => {
+      tbody.querySelectorAll('.model-summary-row.is-expanded').forEach(row => {
+        row.classList.remove('is-expanded');
+        row.querySelector('.model-drilldown-toggle')?.setAttribute('aria-expanded', 'false');
+      });
+      tbody.querySelectorAll('.model-details-row').forEach(row => {
+        row.hidden = true;
+      });
+      summaryRow.classList.add('is-expanded');
+      toggle.setAttribute('aria-expanded', 'true');
+      detailsRow.hidden = false;
+      expandedModelDrilldowns.set(tbody.id, { period, model: model.model, mode: modelMode });
+      if (!detailsRow.dataset.state) {
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
+      }
+    };
+
+    toggle.addEventListener('click', async () => {
+      const shouldOpen = toggle.getAttribute('aria-expanded') !== 'true';
+      if (!shouldOpen) {
+        summaryRow.classList.remove('is-expanded');
+        toggle.setAttribute('aria-expanded', 'false');
+        detailsRow.hidden = true;
+        expandedModelDrilldowns.delete(tbody.id);
+        return;
+      }
+      await openDetails();
+    });
+
+    detailsRow.addEventListener('click', async event => {
+      const retryButton = event.target.closest('.model-session-retry');
+      if (retryButton) {
+        await populateModelSessionDetails(detailsRow, period, model.model, modelMode);
+        return;
+      }
+
+      const dateButton = event.target.closest('.model-date-button');
+      if (dateButton) {
+        switchToDailyDate(dateButton.dataset.date);
+        return;
+      }
+
+      const sessionButton = event.target.closest('.model-session-link');
+      if (!sessionButton || !Array.isArray(detailsRow.modelSessions)) return;
+      const session = detailsRow.modelSessions.find(
+        item =>
+          item.session_id === sessionButton.dataset.sessionId
+          && (item.assistant_type || '') === sessionButton.dataset.assistantType
+          && (item.source_kind || '') === sessionButton.dataset.sourceKind
+      );
+      if (session) {
+        openSessionTimeline({
+          ...session,
+          model: session.session_model || session.model,
+          total_tokens: session.session_total_tokens ?? session.total_tokens,
+          total_input_tokens: session.session_total_input_tokens ?? session.total_input_tokens,
+          total_output_tokens: session.session_total_output_tokens ?? session.total_output_tokens,
+          total_cache_read_tokens:
+            session.session_total_cache_read_tokens ?? session.total_cache_read_tokens,
+          total_cache_write_tokens:
+            session.session_total_cache_write_tokens ?? session.total_cache_write_tokens,
+          total_reasoning_tokens:
+            session.session_total_reasoning_tokens ?? session.total_reasoning_tokens,
+          cost_usd: session.session_cost_usd ?? session.cost_usd,
+        });
+      }
+    });
+
+    tbody.appendChild(summaryRow);
+    tbody.appendChild(detailsRow);
+
+    const restore = expandedModelDrilldowns.get(tbody.id);
+    if (
+      restore?.period === period
+      && restore.model === model.model
+      && (restore.mode || null) === modelMode
+    ) {
+      void openDetails();
+    }
+  });
+
+  const active = expandedModelDrilldowns.get(tbody.id);
+  if (
+    active
+    && !models.some(
+      model => model.model === active.model && (model.mode || null) === (active.mode || null)
+    )
+  ) {
+    expandedModelDrilldowns.delete(tbody.id);
+  }
+}
+
+function renderYearlyModelsTable(models, period) {
   const tbody = document.getElementById('yearly-models-body');
   if (!tbody) return;
   tbody.innerHTML = '';
@@ -3376,22 +5749,7 @@ function renderYearlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models, period);
 }
 
 // =========================================================================
@@ -3529,27 +5887,43 @@ function updateYearlySortHeadersUI() {
 // =========================================================================
 // API 呼叫: 載入單月彙整數據
 // =========================================================================
-async function loadMonthlyData(month) {
+async function loadMonthlyData(month, assistant = currentAssistant) {
   if (!month || month === 'undefined' || month === 'null') {
     return;
   }
+  const resolvedAssistant = normalizeAssistant(assistant);
   updateUrlParams();
+  const mySeq = ++monthlyRequestSeq;
+  const dimView = !currentMonthlyData || currentMonthlyData.year_month !== month;
+  monthlyInFlightTarget = month;
+  showViewLoading(dimView);
   try {
     setTitleMarkup('sync', month);
 
-    const res = await fetch(`/api/${currentAssistant}/monthly/${month}`);
+    const res = await fetch(`/api/${resolvedAssistant}/monthly/${month}`);
+    if (mySeq !== monthlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
     if (res.status === 404) {
-      showNotification(t('month_not_found'), 'error');
+      showNoDataForMonth(month, resolvedAssistant);
       return;
     }
     
     const data = await res.json();
-    toggleEmptyState(false);
+    if (mySeq !== monthlyRequestSeq) return;
+    if (currentAssistant !== resolvedAssistant) return;
+    modelSessionDetailsCache.clear();
+    toggleEmptyState(false, resolvedAssistant);
     renderMonthlyDashboard(data);
 
   } catch (err) {
     console.error('載入月份彙整失敗:', err);
-    showNotification(t('monthly_load_failed'), 'error');
+    if (mySeq === monthlyRequestSeq) showNotification(t('monthly_load_failed'), 'error');
+  } finally {
+    if (mySeq === monthlyRequestSeq) {
+      monthlyInFlightTarget = null;
+      hideViewLoading();
+      clearTitleSpinner();
+    }
   }
 }
 
@@ -3566,7 +5940,7 @@ function renderMonthlyDashboard(data) {
   // 2. 更新指標卡片
   const activeAgents = getActiveAgents();
   const isMulti = activeAgents.length > 1;
-  const monthlyInputTokens = getNetInputTokens(summary.total_input_tokens, summary.total_cache_read_tokens);
+  const monthlyInputTokens = summary.total_input_tokens || 0;
 
   if (!isMulti) {
     document.getElementById('monthly-stat-total-tokens').textContent = formatToken(summary.total_tokens);
@@ -3576,7 +5950,7 @@ function renderMonthlyDashboard(data) {
     document.getElementById('monthly-stat-total-cost').textContent = formatCost(summary.total_cost_usd || 0);
   } else {
     renderMonthlyMetricValue('monthly-stat-total-tokens', a => a.total_tokens, formatToken, agent_breakdown, activeAgents);
-    renderMonthlyMetricValue('monthly-stat-input-tokens', a => getNetInputTokens(a.total_input_tokens, a.total_cache_read_tokens), formatToken, agent_breakdown, activeAgents);
+    renderMonthlyMetricValue('monthly-stat-input-tokens', a => a.total_input_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-cache-input-tokens', a => a.total_cache_read_tokens || 0, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-output-tokens', a => a.total_output_tokens, formatToken, agent_breakdown, activeAgents);
     renderMonthlyMetricValue('monthly-stat-total-cost', a => a.total_cost_usd, formatCost, agent_breakdown, activeAgents);
@@ -3617,7 +5991,7 @@ function renderMonthlyDashboard(data) {
   renderMonthlyProjectsTable(projects);
 
   // 5. 渲染模型佔比列表
-  renderMonthlyModelsTable(models);
+  renderMonthlyModelsTable(models, year_month);
 
   // 6. 渲染當月每日彙總列表
   monthlyDailySortColumn = 'date';
@@ -3822,7 +6196,7 @@ function renderMonthlyProjectsTable(projects) {
 
     tr.innerHTML = `
       <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td class="cwd-cell" title="${escapeHtml(p.cwd)}" style="max-width: 250px;">${escapeHtml(p.cwd)}</td>
+      <td class="cwd-cell" title="${escapeHtml(p.cwd)}">${escapeHtml(p.cwd)}</td>
       <td><span class="badge">${p.sessions_count} Sessions</span></td>
       <td style="font-weight: 700; color: var(--accent-cyan);">
         ${formatToken(p.total_tokens)}
@@ -3836,7 +6210,7 @@ function renderMonthlyProjectsTable(projects) {
 // =========================================================================
 // 渲染模型佔比列表 Table
 // =========================================================================
-function renderMonthlyModelsTable(models) {
+function renderMonthlyModelsTable(models, period) {
   const tbody = document.getElementById('monthly-models-body');
   tbody.innerHTML = '';
 
@@ -3845,22 +6219,7 @@ function renderMonthlyModelsTable(models) {
     return;
   }
 
-  models.forEach((m, idx) => {
-    const tr = document.createElement('tr');
-    tr.style.cursor = 'default';
-
-    tr.innerHTML = `
-      <td style="text-align: center;"><span class="badge ${idx < 3 ? 'highlight' : ''}">${idx + 1}</span></td>
-      <td><span class="badge highlight">${escapeHtml(m.model)}</span></td>
-      <td><span class="badge">${m.sessions_count} Sessions</span></td>
-      <td style="font-weight: 700; color: var(--accent-purple);">
-        ${formatToken(m.total_tokens)}
-        ${m.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(m.total_cache_read_tokens)}</div>` : ''}
-      </td>
-      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(m.cost_usd || 0)}</td>
-    `;
-    tbody.appendChild(tr);
-  });
+  appendModelSummaryRows(tbody, models, period);
 }
 
 // =========================================================================
@@ -4021,7 +6380,8 @@ function showNotification(message, type = 'info') {
     color = 'var(--neon-red)';
   }
 
-  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);">${message}</span>`;
+  toast.innerHTML = `<span class="toast-kind" style="color: ${color};">${icon}</span> <span style="color: ${color}; font-family: var(--font-display);"></span>`;
+  toast.lastElementChild.textContent = message;
   container.appendChild(toast);
 
   setTimeout(() => {
@@ -4115,7 +6475,7 @@ function initSetupGuide() {
   const modalOverlay = document.getElementById('setup-guide-modal');
 
   if (setupBtn && modalOverlay) {
-    setupBtn.addEventListener('click', openSetupModal);
+    setupBtn.addEventListener('click', () => openSetupModal(currentAssistant));
   }
 
   if (closeBtn && modalOverlay) {
@@ -4141,31 +6501,17 @@ function initSetupGuide() {
   initClipboardButtons();
 }
 
-function openSetupModal() {
+function openSetupModal(assistant = currentAssistant) {
   const modal = document.getElementById('setup-guide-modal');
-  if (modal) {
-    const statuslineBody = document.getElementById('setup-body-statusline');
-    const codexBody = document.getElementById('setup-body-codex');
-    const claudeBody = document.getElementById('setup-body-claude');
-    const cursorBody = document.getElementById('setup-body-cursor');
-    if (statuslineBody) statuslineBody.style.display = 'none';
-    if (codexBody) codexBody.style.display = 'none';
-    if (claudeBody) claudeBody.style.display = 'none';
-    if (cursorBody) cursorBody.style.display = 'none';
+  if (!modal) return;
 
-    if (currentAssistant === 'codex') {
-      if (codexBody) codexBody.style.display = 'block';
-    } else if (currentAssistant === 'claude') {
-      if (claudeBody) claudeBody.style.display = 'block';
-    } else if (currentAssistant === 'cursor') {
-      if (cursorBody) cursorBody.style.display = 'block';
-    } else {
-      if (statuslineBody) statuslineBody.style.display = 'none';
-      if (statuslineBody) statuslineBody.style.display = 'block';
-    }
-    loadSetupInfo();
-    modal.classList.add('active');
-  }
+  const resolvedAssistant = normalizeAssistant(assistant);
+  if (!isSupportedAssistant(resolvedAssistant)) return;
+
+  setSetupModalTitle(resolvedAssistant);
+  setSetupModalBody(resolvedAssistant);
+  modal.classList.add('active');
+  loadSetupInfo(resolvedAssistant);
 }
 
 function closeSetupModal() {
@@ -4175,39 +6521,29 @@ function closeSetupModal() {
   }
 }
 
-async function loadSetupInfo() {
+async function loadSetupInfo(assistant = currentAssistant) {
   try {
-    const resolvedAssistant = isSupportedAssistant(currentAssistant) ? currentAssistant : 'antigravity';
+    const resolvedAssistant = normalizeAssistant(assistant);
+    if (!isSupportedAssistant(resolvedAssistant)) return;
+
     const res = await fetch(`/api/${resolvedAssistant}/setup-info`);
     const data = await res.json();
+    if (currentAssistant !== resolvedAssistant) return;
+    currentSessionHomeDir = typeof data.home_dir === 'string' ? data.home_dir : currentSessionHomeDir;
     
     const isWindows = data.platform === 'windows';
     const quotePowerShell = value => `'${String(value).replace(/'/g, "''")}'`;
     const quoteShell = value => `'${String(value).replace(/'/g, `'"'"'`)}'`;
 
-    // Localize modal title based on selected assistant
-    const titleH2 = document.getElementById('setup-modal-title');
-    if (titleH2) {
-      if (currentAssistant === 'copilot') {
-        titleH2.setAttribute('data-i18n', 'copilot_setup_modal_title');
-      } else if (currentAssistant === 'codex') {
-        titleH2.setAttribute('data-i18n', 'codex_setup_modal_title');
-      } else if (currentAssistant === 'claude') {
-        titleH2.setAttribute('data-i18n', 'claude_setup_modal_title');
-      } else if (currentAssistant === 'cursor') {
-        titleH2.setAttribute('data-i18n', 'cursor_setup_modal_title');
-      } else {
-        titleH2.setAttribute('data-i18n', 'setup_modal_title');
-      }
-    }
+    setSetupModalTitle(resolvedAssistant);
     
-    if (currentAssistant === 'antigravity' || currentAssistant === 'copilot') {
-      const assistantSetup = data[currentAssistant] || {};
+    if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
+      const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';
       const settingsPath = assistantSetup.settings_path || '';
       const targetScriptCommand = isWindows
-        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${currentAssistant}`
+        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${resolvedAssistant}`
         : targetScriptPath;
 
       const settingsJson = JSON.stringify({
@@ -4244,7 +6580,7 @@ async function loadSetupInfo() {
       const step5H3 = document.getElementById('setup-step-5');
       const step5DescP = document.getElementById('setup-step-5-desc');
 
-      if (currentAssistant === 'copilot') {
+      if (resolvedAssistant === 'copilot') {
         if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
         if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
         if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
@@ -4302,7 +6638,7 @@ async function loadSetupInfo() {
       }
       if (troubleshootAEl) {
         troubleshootAEl.textContent = isWindows
-          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${currentAssistant}`
+          ? `Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File ${quotePowerShell(targetScriptPath)} -Assistant ${resolvedAssistant}`
           : `echo '{}' | ${quoteShell(targetScriptPath)}`;
       }
       if (troubleshootBEl) {
@@ -4310,15 +6646,24 @@ async function loadSetupInfo() {
           ? `Get-Content -Raw -LiteralPath ${quotePowerShell(settingsPath)} | ConvertFrom-Json | Out-Null`
           : `jq . ${quoteShell(settingsPath)}`;
       }
-    } else if (currentAssistant === 'codex') {
+    } else if (resolvedAssistant === 'codex') {
       const homeLabelCodex = document.getElementById('lbl-detected-home-codex');
-      if (homeLabelCodex) homeLabelCodex.textContent = data.codex?.data_path || '';
-    } else if (currentAssistant === 'claude') {
+      if (homeLabelCodex) homeLabelCodex.textContent = abbreviateHomePath(data.codex?.data_path || '');
+    } else if (resolvedAssistant === 'claude') {
       const homeLabelClaude = document.getElementById('lbl-detected-home-claude');
-      if (homeLabelClaude) homeLabelClaude.textContent = data.claude?.data_path || '';
-    } else if (currentAssistant === 'cursor') {
+      if (homeLabelClaude) homeLabelClaude.textContent = abbreviateHomePath(data.claude?.data_path || '');
+    } else if (resolvedAssistant === 'cursor') {
       const homeLabelCursor = document.getElementById('lbl-detected-home-cursor');
-      if (homeLabelCursor) homeLabelCursor.textContent = data.cursor?.data_path || '';
+      if (homeLabelCursor) homeLabelCursor.textContent = abbreviateHomePath(data.cursor?.data_path || '');
+    } else if (resolvedAssistant === 'grok') {
+      const homeLabelGrok = document.getElementById('lbl-detected-home-grok');
+      if (homeLabelGrok) homeLabelGrok.textContent = abbreviateHomePath(data.grok?.data_path || '');
+    } else if (resolvedAssistant === 'pi') {
+      const homeLabelPi = document.getElementById('lbl-detected-home-pi');
+      if (homeLabelPi) homeLabelPi.textContent = abbreviateHomePath(data.pi?.data_path || '');
+    } else if (resolvedAssistant === 'omp') {
+      const homeLabelOmp = document.getElementById('lbl-detected-home-omp');
+      if (homeLabelOmp) homeLabelOmp.textContent = abbreviateHomePath(data.omp?.data_path || '');
     }
 
     // Apply updated language translations
@@ -4358,51 +6703,53 @@ function initClipboardButtons() {
   });
 }
 
-function toggleEmptyState(showEmpty) {
+function toggleEmptyState(showEmpty, assistant = currentAssistant) {
   isEmptyState = showEmpty;
+  const resolvedAssistant = normalizeAssistant(assistant);
   const emptyContainer = document.getElementById('empty-state-container');
   const dailyView = document.getElementById('daily-view-container');
   const monthlyView = document.getElementById('monthly-view-container');
   const yearlyView = document.getElementById('yearly-view-container');
   
   if (showEmpty) {
+    hideViewLoading();
+    resetMiniStats();
+    clearTitleSpinner();
     if (emptyContainer) {
       emptyContainer.classList.remove('hidden');
-      if (currentAssistant === 'none') {
+      if (resolvedAssistant === 'none') {
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card no-agent-card">
             ${cardIconMarkup('alert')}
-            <h2>${t('no_agent_selected_title')}</h2>
-            <p>${t('no_agent_selected_desc')}</p>
+            <h2>${t('no_agent_selected_title', resolvedAssistant)}</h2>
+            <p>${t('no_agent_selected_desc', resolvedAssistant)}</p>
           </div>
         `;
       } else {
-        const meta = getAssistantMeta(currentAssistant);
-        let emptyLogoUrl = meta.logo;
         emptyContainer.innerHTML = `
           <div class="welcome-setup-card">
             <div class="card-icon" style="display: flex; justify-content: center; align-items: center; filter: drop-shadow(0 0 10px rgba(255,255,255,0.1)); margin-bottom: 12px;">
-              <img src="${emptyLogoUrl}" alt="${meta.alt}" style="width: 48px; height: 48px; border-radius: 8px; object-fit: cover;" />
+              ${getAssistantLogoHtml(resolvedAssistant, 'empty-agent-logo')}
             </div>
-            <h2>${t('empty_title')}</h2>
-            <p>${t('empty_desc')}</p>
+            <h2>${t('empty_title', resolvedAssistant)}</h2>
+            <p>${t('empty_desc', resolvedAssistant)}</p>
             <div class="action-buttons">
-              <button class="primary-btn" id="btn-empty-setup-guide">${t('btn_empty_setup')}</button>
-              <button class="secondary-btn" id="btn-empty-refresh">${t('btn_empty_refresh')}</button>
+              <button class="primary-btn" id="btn-empty-setup-guide">${t('btn_empty_setup', resolvedAssistant)}</button>
+              <button class="secondary-btn" id="btn-empty-refresh">${t('btn_empty_refresh', resolvedAssistant)}</button>
             </div>
           </div>
         `;
         
         const emptyGuideBtn = document.getElementById('btn-empty-setup-guide');
         if (emptyGuideBtn) {
-          emptyGuideBtn.addEventListener('click', openSetupModal);
+          emptyGuideBtn.addEventListener('click', () => openSetupModal(resolvedAssistant));
         }
         
         const emptyRefreshBtn = document.getElementById('btn-empty-refresh');
         if (emptyRefreshBtn) {
           emptyRefreshBtn.addEventListener('click', async () => {
             emptyRefreshBtn.classList.add('loading');
-            await fetchDates();
+            await fetchDates(null, false, resolvedAssistant);
             emptyRefreshBtn.classList.remove('loading');
           });
         }
@@ -4433,7 +6780,19 @@ function toggleEmptyState(showEmpty) {
 }
 
 // 點擊月度彙整圖表跳轉到每日即時
+function isValidDateKey(date) {
+  if (typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    return false;
+  }
+  const parsed = new Date(`${date}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === date;
+}
+
 function switchToDailyDate(date) {
+  if (!isValidDateKey(date)) {
+    console.warn('Ignored invalid daily date:', date);
+    return;
+  }
   const dateSelect = document.getElementById('date-select');
   if (!dateSelect) return;
 
@@ -4512,7 +6871,7 @@ function renderPricingModalTable() {
   tbody.innerHTML = '';
 
   if (!pricingRules || pricingRules.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="placeholder-text">載入中...</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="7" class="placeholder-text">${escapeHtml(t('pricing_loading'))}</td></tr>`;
     return;
   }
 
@@ -4556,14 +6915,15 @@ function renderCodexResets(cachedData) {
 
 function formatDateTime(dateObj) {
   if (!dateObj || isNaN(dateObj.getTime())) return '';
-  const pad = (num) => String(num).padStart(2, '0');
-  const year = dateObj.getFullYear();
-  const month = pad(dateObj.getMonth() + 1);
-  const date = pad(dateObj.getDate());
-  const hours = pad(dateObj.getHours());
-  const minutes = pad(dateObj.getMinutes());
-  const seconds = pad(dateObj.getSeconds());
-  return `${year}-${month}-${date} ${hours}:${minutes}:${seconds}`;
+  return new Intl.DateTimeFormat(localeForFormatting[currentLang] || 'zh-TW', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).format(dateObj).replace(',', '');
 }
 
 async function updateCodexAuthSwitcher() {

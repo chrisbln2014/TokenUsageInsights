@@ -6,6 +6,12 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-09-14 - 整合 upstream v0.9.9
+- **upstream 變更**：新增 `src/browser.rs`，手動於互動式終端機啟動時顯示網址橫幅並自動開啟預設瀏覽器；背景服務（`TOKEN_USAGE_INSIGHTS_SERVICE=1`）與非互動輸出不開瀏覽器。
+- **合併**：`improve` ← upstream（僅 README.md 衝突，保留 fork 版），再 `feature` ← `improve`（自動合併）。備份標籤 `backup/improve-pre-v0.9.9`、`backup/feature-pre-v0.9.9`。
+- **對 fork 的影響**：Cloud Run snapshot 模式走自有啟動路徑、不呼叫 `browser::announce_dashboard`，不會嘗試開瀏覽器；本機排程／背景啟動為非互動模式，也不會開瀏覽器。`FORK_AUTO_UPDATE_DISABLED` 與 snapshot 嫁接順序不變。
+- **驗證**：`cargo test --no-fail-fast` 主程式 324 過（含 upstream 新增 browser 測試）、`tests/auto_update_disabled.rs` 1、`tests/cli.rs` 2、`tests/snapshot_mode.rs` 3 過；4 個 updater 測試因本機執行中的看板 fail-closed（既有）；`node --test` 12/12；clippy 無新增警告。
+
 ### 2026-09-14 - fork 版永久停用自動更新
 - **決策**：upstream 自動更新會下載 doggy8088 官方 Release 覆蓋 fork 功能；雲端與地端都關閉，upstream 新版改為手動合併程式碼。
 - **修法**：`src/updater.rs` 以 `FORK_AUTO_UPDATE_DISABLED` 讓 `is_auto_update_disabled` 永遠回傳 true（這是背景自動更新唯一閘門，opus 審查查無其他自動下載路徑）；環境變數與 `config.yaml` 開啟皆無效。Cloud Run 另有 snapshot 模式早退與 `Dockerfile` 的 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE=0`。

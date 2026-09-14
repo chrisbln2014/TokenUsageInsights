@@ -110,8 +110,11 @@ fn snapshot_mode_serves_without_creating_local_database_or_update_log() {
 
     assert!(started, "snapshot 模式未啟動: {lines:?}");
     assert!(still_running, "snapshot 模式啟動後不應自行結束: {lines:?}");
+    // snapshot 模式必須走自有啟動訊息，不可改走會開瀏覽器的 browser::announce_dashboard
     assert!(
-        lines.iter().any(|line| line.contains("snapshot")),
+        lines
+            .iter()
+            .any(|line| line.contains("(snapshot) is running on")),
         "{lines:?}"
     );
     assert!(

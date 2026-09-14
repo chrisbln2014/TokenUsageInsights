@@ -213,6 +213,7 @@ Restart=always
 RestartSec=2
 Environment="PORT=${port_systemd}"
 Environment="HOST=${host_systemd}"
+Environment="TOKEN_USAGE_INSIGHTS_SERVICE=1"
 Environment="TOKEN_USAGE_INSIGHTS_INSTALL_DIR=${install_dir_systemd}"${extra_env_systemd}
 
 [Install]
@@ -338,6 +339,8 @@ SERVICE
     <string>${host_plist}</string>
     <key>PORT</key>
     <string>${port_plist}</string>
+    <key>TOKEN_USAGE_INSIGHTS_SERVICE</key>
+    <string>1</string>
     <key>TOKEN_USAGE_INSIGHTS_INSTALL_DIR</key>
     <string>${install_dir_plist}</string>${extra_env_plist}
   </dict>

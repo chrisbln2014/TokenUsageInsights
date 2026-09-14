@@ -10,6 +10,7 @@ Restart=always
 RestartSec=2
 Environment=HOST=0.0.0.0
 Environment=PORT=3003
+Environment=TOKEN_USAGE_INSIGHTS_SERVICE=1
 
 [Install]
 WantedBy=default.target

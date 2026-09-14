@@ -12,6 +12,7 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+mod browser;
 mod cli;
 mod db;
 mod grok;
@@ -397,10 +398,8 @@ async fn main() {
             std::process::exit(1);
         });
     println!("🌐 服務綁定位址: {bind_address}");
-    println!(
-        "🚀 Token 戰情室 is running on: {}",
-        browser_url_for_bind_address(bind_address)
-    );
+    let browser_url = browser_url_for_bind_address(bind_address);
+    browser::announce_dashboard(&browser_url);
 
     // HTTP 先開始監聽；可能耗時的遷移與 transcript 同步在 blocking thread 執行。
     let usage_sync_task = spawn_usage_sync_task();

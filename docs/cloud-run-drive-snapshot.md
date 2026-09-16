@@ -112,6 +112,16 @@ TokenUsageInsights Drive Snapshot Upload
 
 目前排程每 30 分鐘執行一次，從 `http://localhost:3003` 匯出 snapshot 後上傳 Drive。因此本機看板服務需要在排程執行時可連線。
 
+## 本機看板服務重啟（`scripts/restart-service.ps1`）
+
+本機看板以 NSSM 裝成 Windows 服務 `TokenUsageInsights`；因服務開了不停機記錄檔輪替（`AppRotateOnline=1`，NSSM 2.24-101 已知會卡在 STOP_PENDING），一律用此腳本重啟，不要直接 `Restart-Service`：
+
+```text
+TokenUsageInsights-NightlyRestart（每天 01:00，Highest 權限）
+```
+
+腳本會先 `Disable-ScheduledTask` 暫停上傳排程（等目前執行中的那次結束，上限 40 分鐘）、停止服務（卡住時只結束本服務的 nssm 主進程，不動同機其他 NSSM 服務）、啟動並驗證 API，`finally` 一律恢復上傳排程。此腳本內的服務名稱、路徑、埠號為本機安裝專屬，跨機器需自行調整。
+
 ## Google Drive 權限
 
 1. 建立或選用 Cloud Run service account，例如：

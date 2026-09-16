@@ -6,6 +6,15 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-09-15/16 - 新增 `scripts/restart-service.ps1`（本機看板服務重啟）
+- **問題**：本機看板服務用 NSSM 裝成 Windows 服務，停止一律卡在 STOP_PENDING（根因：NSSM 2.24-101 的 `AppRotateOnline=1` 不停機記錄檔輪替，以臨時測試服務對照重現，開啟 2/2 卡住、關閉 0.9 秒正常停止）。每晚 01:00 的自動重啟排程長期用一般權限執行，`Restart-Service` 被拒但仍回報成功，從未真正重啟過；記錄檔因此從未輪替，一路長到 1.8 GB。
+- **修法**：
+  - 排程改 `Highest` 權限、執行上限 1 小時。
+  - `scripts/restart-service.ps1`：停止時卡住只結束本服務自己的 nssm 主進程（不誤殺同機其他 NSSM 服務）；v1 用「等待 Drive 上傳排程出現空檔」判斷是否安全，但上傳每 30 分鐘跑一次、每次約 28 分鐘，幾乎沒有空檔，09-14 夜間等 50 分鐘後直接放棄；v2 改為重啟前主動 `Disable-ScheduledTask` 暫停上傳排程，只需等「可能正在執行中的那一次」結束（上限 40 分鐘），`finally` 一律 `Enable-ScheduledTask` 恢復。
+  - NSSM 設 `AppRotateBytes=10MB`（原本的 `AppRotateSeconds` 以最後寫入時間判斷，持續寫入的檔案永不觸發），並修清理排程的刪檔規則對上實際輪替檔名。
+- **驗證**：09-14 換版後兩次手動重啟正常；09-15 白天在上傳排程空閒時觸發實測，38 秒完成；**09-16 01:00 首次遇到「重啟時上傳正在跑」的真實情境**，等待 25 分 33 秒後成功完成，`LastTaskResult=0`。1.8 GB 舊記錄檔已輪替，API 與資料同步皆正常。
+- **影響範圍**：僅本機部署維運；不影響程式碼行為。腳本內服務名稱、安裝路徑、埠號為本機專屬，跨機器需調整，見 `docs/cloud-run-drive-snapshot.md`「本機看板服務重啟」一節。
+
 ### 2026-09-14 - 整合 upstream v0.9.9
 - **upstream 變更**：新增 `src/browser.rs`，手動於互動式終端機啟動時顯示網址橫幅並自動開啟預設瀏覽器；背景服務（`TOKEN_USAGE_INSIGHTS_SERVICE=1`）與非互動輸出不開瀏覽器。
 - **合併**：`improve` ← upstream（僅 README.md 衝突，保留 fork 版），再 `feature` ← `improve`（自動合併）。備份標籤 `backup/improve-pre-v0.9.9`、`backup/feature-pre-v0.9.9`。

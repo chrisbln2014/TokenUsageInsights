@@ -6,6 +6,41 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-09-23 - 修正 codex/claude/copilot/grok/pi/omp/muse 本地午夜前後被歸錯日期
+
+- **問題**：從 Claude Code 委派 codex 在本地時間凌晨執行，完成後看板日報查不到當天資料。
+- **根因**：`src/db.rs` 同步各助理 session log 到 SQLite 時，`usage_entries.date` 欄位直接截取
+  timestamp 字串前 10 碼；但這些原始 timestamp 都是 UTC ISO8601，沒有轉換成本地時區。使用者在
+  UTC+8，本地時間 00:00~07:59 執行的 session 全被歸到前一天。實際受影響範圍：codex、claude、
+  copilot（app／cli agent／VS Code Chat 三種來源）、grok、pi/omp/muse 共 7 個同步寫入點，加上
+  CLI／API 匯入路徑；另外 Cursor 在對話內容缺少 `<timestamp>` 標籤、退回用檔案 mtime 當
+  fallback 時同樣受影響（Cursor 正常路徑本身沒問題，來源字串已內建時區偏移）。
+- **修法**：
+  - 新增共用 helper `date_from_timestamp_in_tz`／`local_date_from_timestamp`，用 `chrono::Local`
+    把 UTC timestamp 轉本地時區後再取日期；trim 前後空白避免與既有格式驗證函式的寬容度不一致。
+  - 替換全部 7 個同步寫入點與匯入路徑改呼叫新 helper；Cursor mtime fallback 改用
+    `chrono::DateTime<chrono::Local>`（抽成獨立函式 `local_timestamp_string_from_system_time`
+    方便測試，不依賴檔案系統或真實時鐘）。
+  - `init_db` 新增一次性 backfill migration，用既有 `timestamp` 欄位重算既有資料的 `date`（不
+    依賴原始 session log 檔案是否還存在）；`migrate_old_databases` 把舊獨立資料庫複製進來的資料
+    也納入涵蓋範圍，且改成只在真的有資料被遷移時才重跑，避免每次啟動都無條件清 marker、重新全
+    表掃描。Cursor 的歷史資料刻意不做 backfill（正常路徑與 mtime fallback 寫入的資料格式相同、
+    資料庫層面無法安全區分兩者來源，強行 backfill 會把正常資料錯誤地做二次時區偏移）。
+  - 新增測試時發現：若斷言依賴「測試機時區必須不是 UTC」，會讓 `.github/workflows/release.yml`
+    （4 平台 CI、`RUSTFLAGS: "-D warnings"`）在 UTC runner 上必定失敗。改為斷言值用對應 helper
+    現算、額外的「不應停留在舊 UTC 值」檢查改成只在機器時區確實有偏移時才執行。
+- **審查**：codex 節點審（2 個發現：匯入路徑未轉時區、舊資料庫遷移順序問題）→ codex 總審兩輪
+  （3 個發現：Cursor mtime fallback、trim 不一致、CI 時區依賴）→ advisor 覆核（1 個 blocker：
+  修 grok 既有測試時寫死了會讓 CI 失敗的日期字面值）。全部發現皆已修復並補測試、逐一做突變測試
+  驗證紅在正確斷言行。
+- **驗證**：`cargo test` 336 passed（4 個 `updater::tests::*` 失敗以 `git stash` 驗證改動前後一
+  致、確認是本機常駐 NSSM 服務造成的既有環境汙染，與本次修正無關）；`cargo clippy
+  --all-targets --all-features` 在 `src/db.rs`／`src/muse.rs` 零警告（`src/updater.rs` 10 個既
+  有警告，改動前後一致）；`cargo fmt --check` 乾淨。用正式資料庫複本在獨立 port 實測：codex
+  `date=2026-09-21` 從 440 筆精準拆成 226＋214（本地日期 09-22），無流失；`SUM(tokens_total)`
+  migration 前後完全一致。
+- **影響檔案**：`src/db.rs`（核心邏輯與測試）、`src/muse.rs`（清理未使用的舊 UTC 截字串死程式碼）。
+
 ### 2026-09-15/16 - 新增 `scripts/restart-service.ps1`（本機看板服務重啟）
 - **問題**：本機看板服務用 NSSM 裝成 Windows 服務，停止一律卡在 STOP_PENDING（根因：NSSM 2.24-101 的 `AppRotateOnline=1` 不停機記錄檔輪替，以臨時測試服務對照重現，開啟 2/2 卡住、關閉 0.9 秒正常停止）。每晚 01:00 的自動重啟排程長期用一般權限執行，`Restart-Service` 被拒但仍回報成功，從未真正重啟過；記錄檔因此從未輪替，一路長到 1.8 GB。
 - **修法**：

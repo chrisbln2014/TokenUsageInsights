@@ -226,6 +226,14 @@ const COPILOT_CLI_AGENT_MIGRATION_KEY: &str = "migration:copilot_cli_agent_split
 /// re-runs only cover sessions synced after the marker.
 const COPILOT_CWD_BACKFILL_MIGRATION_KEY: &str = "migration:copilot_cwd_backfill_v1";
 
+/// One-time backfill correcting `usage_entries.date` for rows written before
+/// sync paths converted UTC timestamps to the local timezone. Recomputes
+/// `date` from the already-stored `timestamp` for every affected
+/// assistant_type; never re-parses source session files, so rows survive even
+/// if their original log file has since been deleted or archived. Idempotent:
+/// the marker is set on success so re-runs are a no-op.
+const LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY: &str = "migration:local_timezone_date_v1";
+
 #[derive(Default)]
 enum InitialUserPromptState {
     #[default]
@@ -1123,6 +1131,54 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         .map_err(|error| format!("記錄 Grok Build parser migration 失敗: {error}"))?;
     }
 
+    let local_timezone_date_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !local_timezone_date_migration_done {
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, timestamp, date FROM usage_entries
+                     WHERE assistant_type IN ('codex','claude','copilot','grok','pi','omp','muse')",
+                )
+                .map_err(|error| format!("準備時區日期回填查詢失敗: {error}"))?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("執行時區日期回填查詢失敗: {error}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("讀取時區日期回填資料失敗: {error}"))?
+        };
+
+        for (id, timestamp, old_date) in rows {
+            let new_date = local_date_from_timestamp(&timestamp);
+            if new_date != old_date {
+                conn.execute(
+                    "UPDATE usage_entries SET date = ?1 WHERE id = ?2",
+                    params![new_date, id],
+                )
+                .map_err(|error| format!("更新時區日期回填資料失敗 (id={id}): {error}"))?;
+            }
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄時區日期回填遷移失敗: {error}"))?;
+    }
+
     Ok(())
 }
 
@@ -1554,7 +1610,7 @@ fn insert_vscode_usage_entry(
             "copilot",
             entry.source_kind.as_deref().unwrap_or(crate::vscode::SOURCE_KIND),
             entry.timestamp,
-            entry.timestamp.get(0..10).unwrap_or("unknown"),
+            local_date_from_timestamp(&entry.timestamp),
             entry.session_id,
             entry.session_name.as_deref(),
             entry.transcript_path.as_deref(),
@@ -2601,7 +2657,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
         // Normalize timestamp: Copilot App uses `YYYY-MM-DD HH:MM:SS` UTC.
         // Convert to ISO 8601 with `Z` to match other collectors.
         let timestamp = normalize_copilot_app_timestamp(&row.ts);
-        let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
+        let date_str = local_date_from_timestamp(&timestamp);
         let turn_no = (row.turn_index.max(0) + 1) as u32;
 
         // tokens_total counts cache_read once (as its own component), since
@@ -3508,7 +3564,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
         // Insert the split per-agent rows.
         for row in agent_rows {
             let timestamp = normalize_copilot_app_timestamp(&row.ts);
-            let date_str = timestamp.get(..10).unwrap_or(&row.ts).to_string();
+            let date_str = local_date_from_timestamp(&timestamp);
             // CLI accounting mirrors the hook: raw input + output. Since
             // `input_tokens` was normalized to exclude cache reads, add
             // `cache_read` back once. Reasoning and cache write remain separate
@@ -4016,7 +4072,7 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         "codex",
                         entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
                         entry.timestamp,
-                        entry.timestamp.get(0..10).unwrap_or("unknown"),
+                        local_date_from_timestamp(&entry.timestamp),
                         entry.session_id,
                         entry.session_name.as_deref(),
                         entry.transcript_path.as_deref(),
@@ -4431,7 +4487,7 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                     params![
                         "claude",
                         entry.timestamp,
-                        entry.timestamp.get(0..10).unwrap_or("unknown"),
+                        local_date_from_timestamp(&entry.timestamp),
                         entry.session_id,
                         entry.session_name.as_deref(),
                         entry.transcript_path.as_deref(),
@@ -4696,6 +4752,15 @@ fn cursor_date_from_timestamp(timestamp: &str) -> Option<&str> {
     let date = timestamp.get(..10)?;
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
     Some(date)
+}
+
+/// 供 `parse_cursor_session_file` 在找不到 `<timestamp>` 標籤時，用檔案 mtime
+/// 當作 fallback timestamp。必須轉本地時區（而非 UTC）再格式化，因為
+/// `cursor_date_from_timestamp` 只單純截取這個字串前 10 碼當日期，不會再做任
+/// 何時區換算。
+fn local_timestamp_string_from_system_time(modified: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Local> = modified.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 fn run_cursor_model_attribution_migration(conn: &mut Connection) -> Result<(), String> {
@@ -5390,13 +5455,12 @@ fn parse_cursor_session_file(
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
                     if let Ok(modified) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        current_timestamp = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+                        current_timestamp = local_timestamp_string_from_system_time(modified);
                     }
                 }
             }
             if current_timestamp.is_empty() {
-                current_timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                current_timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             }
 
             let input_tokens = (current_prompt.len() / 4).max(10) as u64;
@@ -5741,7 +5805,7 @@ pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Re
                     source_kind,
                     usage_identity,
                     entry.timestamp,
-                    entry.timestamp.get(0..10).unwrap_or("unknown"),
+                    local_date_from_timestamp(&entry.timestamp),
                     entry.session_id,
                     entry.session_name.as_deref(),
                     entry.transcript_path.as_deref(),
@@ -5901,7 +5965,7 @@ fn sync_pi_family_usage_logs(
                     source_kind,
                     usage_identity,
                     entry.timestamp,
-                    entry.timestamp.get(0..10).unwrap_or("unknown"),
+                    local_date_from_timestamp(&entry.timestamp),
                     entry.session_id,
                     entry.session_name.as_deref(),
                     entry.transcript_path.as_deref(),
@@ -6073,6 +6137,8 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
         None => return Err("無法讀取家目錄以進行資料庫遷移。".to_string()),
     };
 
+    let mut migrated_any = false;
+
     // 1. Migrate Antigravity
     let old_antigravity_db = home.join(".gemini/antigravity-cli/antigravity_cli_token_insights.db");
     if old_antigravity_db.exists() {
@@ -6085,6 +6151,7 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
                 let backup_path =
                     home.join(".gemini/antigravity-cli/antigravity_cli_token_insights.db.bak");
                 let _ = fs::rename(&old_antigravity_db, &backup_path);
+                migrated_any = true;
             }
         }
     }
@@ -6100,6 +6167,7 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
                 println!("✅ Copilot 數據遷移完成！");
                 let backup_path = home.join(".copilot/copilot_cli_token_insights.db.bak");
                 let _ = fs::rename(&old_copilot_db, &backup_path);
+                migrated_any = true;
             }
         }
     }
@@ -6115,11 +6183,34 @@ pub fn migrate_old_databases(dest_conn: &mut Connection) -> Result<(), String> {
                 println!("✅ Codex 數據遷移完成！");
                 let backup_path = home.join(".codex/codex_cli_token_insights.db.bak");
                 let _ = fs::rename(&old_codex_db, &backup_path);
+                migrated_any = true;
             }
         }
     }
 
+    if migrated_any {
+        // 舊資料庫的 date 欄位是原樣複製過來的（見 migrate_records），可能帶有
+        // 時區 backfill 修正前的錯誤 UTC 日期，且複製時間點在 init_db 的
+        // backfill 之後，不會被自動涵蓋。清掉 marker 讓 init_db 重新掃一遍，把
+        // 剛複製進來的資料也一併修正。只在真的有資料被遷移時才重跑，避免每次
+        // 啟動都無條件清 marker、重新全表掃描。
+        rerun_local_timezone_date_backfill(dest_conn)?;
+    }
+
     Ok(())
+}
+
+/// 清掉時區日期 backfill migration 的 marker，並重跑 `init_db` 觸發它重新執行。
+/// `init_db` 本身冪等、backfill 只在算出的新值與既有值不同時才 UPDATE，即使
+/// 這次沒有任何新資料需要修正，重跑一次也沒有副作用。用於 `migrate_old_databases`
+/// 把舊資料庫的（可能帶錯誤 UTC 日期的）資料複製進來之後，確保它們也被涵蓋。
+fn rerun_local_timezone_date_backfill(conn: &Connection) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM sync_state WHERE filename = ?",
+        params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+    )
+    .map_err(|e| format!("重設時區日期回填遷移狀態失敗: {}", e))?;
+    init_db(conn)
 }
 
 fn migrate_records(
@@ -6560,6 +6651,28 @@ fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
         .filter(|date_part| date_part.len() == 10)
 }
 
+/// 將 UTC-ish ISO8601 timestamp 轉換到指定時區後取 "YYYY-MM-DD"。
+/// 無法解析為 RFC3339 時退回舊行為（截取字串前 10 碼），維持防禦性、
+/// 不讓格式異常的資料造成同步失敗。先 trim 前後空白，確保跟
+/// `entry_date_from_timestamp`（用於驗證格式合法性）的寬容度一致，避免帶
+/// 空白的 timestamp 通過驗證、卻在這裡解析失敗並 fallback 出截斷的髒字串。
+fn date_from_timestamp_in_tz<Tz>(timestamp: &str, tz: &Tz) -> String
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let trimmed = timestamp.trim();
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .ok()
+        .map(|dt| dt.with_timezone(tz).format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| trimmed.get(0..10).unwrap_or("unknown").to_string())
+}
+
+/// 各同步路徑實際呼叫的版本：用執行服務所在主機的本地時區。
+fn local_date_from_timestamp(timestamp: &str) -> String {
+    date_from_timestamp_in_tz(timestamp, &chrono::Local)
+}
+
 pub fn export_usage_day_entries(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -6646,9 +6759,11 @@ pub fn import_usage_day_entries(
     for record in records {
         let mut entry = record.entry;
         let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
-        let record_date = entry_date_from_timestamp(&entry.timestamp)
-            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?
-            .to_string();
+        // 先用舊邏輯驗證 timestamp 格式合法（維持既有的匯入把關行為），
+        // 實際寫入的日期則用本地時區轉換，避免匯入的資料重蹈 UTC 歸日 bug。
+        entry_date_from_timestamp(&entry.timestamp)
+            .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
+        let record_date = local_date_from_timestamp(&entry.timestamp);
         let generated_source_id =
             build_usage_entry_import_source_id(assistant, &record_date, &entry);
 
@@ -7797,6 +7912,198 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
+    fn date_from_timestamp_in_tz_converts_utc_to_target_offset() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        // UTC 16:31 前一天 = 本地(UTC+8) 00:31 當天。
+        assert_eq!(
+            date_from_timestamp_in_tz("2026-09-21T16:31:41.160Z", &tz),
+            "2026-09-22"
+        );
+    }
+
+    #[test]
+    fn date_from_timestamp_in_tz_handles_exact_midnight_boundary() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(
+            date_from_timestamp_in_tz("2026-09-21T16:00:00Z", &tz),
+            "2026-09-22"
+        );
+        // 差一秒還沒跨過本地午夜，應留在前一天。
+        assert_eq!(
+            date_from_timestamp_in_tz("2026-09-21T15:59:59Z", &tz),
+            "2026-09-21"
+        );
+    }
+
+    #[test]
+    fn date_from_timestamp_in_tz_parses_without_fractional_seconds() {
+        // copilot normalize_copilot_app_timestamp 產出的格式：無小數秒。
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(
+            date_from_timestamp_in_tz("2026-09-21T16:00:00Z", &tz),
+            "2026-09-22"
+        );
+    }
+
+    #[test]
+    fn date_from_timestamp_in_tz_falls_back_on_unparseable_input() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(
+            date_from_timestamp_in_tz("not-a-timestamp", &tz),
+            "not-a-time"
+        );
+        assert_eq!(date_from_timestamp_in_tz("", &tz), "unknown");
+    }
+
+    #[test]
+    fn date_from_timestamp_in_tz_trims_surrounding_whitespace_before_parsing() {
+        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        // entry_date_from_timestamp（用於匯入路徑的格式驗證）會 trim；這裡也必須
+        // trim，否則帶空白的合法 timestamp 會在驗證階段被判定為有效，卻在這裡解
+        // 析失敗、退回截斷成骯髒字串的 fallback（例如 " 2026-09-2"）。
+        assert_eq!(
+            date_from_timestamp_in_tz(" 2026-09-21T16:31:41.160Z ", &tz),
+            "2026-09-22"
+        );
+        assert_eq!(
+            date_from_timestamp_in_tz("2026-09-21T16:31:41.160Z\n", &tz),
+            "2026-09-22"
+        );
+    }
+
+    #[test]
+    fn rerun_local_timezone_date_backfill_covers_rows_added_after_first_backfill() {
+        // 斷言值改用 local_date_from_timestamp 現算，不寫死日期字串，避免測試
+        // 依賴執行機器（尤其 CI runner）的系統時區必須是 UTC+8 才能通過。
+        let timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(timestamp);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap(); // backfill migration 第一次執行，marker 寫入。
+
+        // 模擬 migrate_old_databases 把舊資料庫的資料「原樣」複製進來：此時
+        // marker 已經存在，若沒有重跑機制，這筆錯誤 UTC 日期會永久保留。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', ?, '2026-09-21', 'migrated-old-db-session', 1)",
+            params![timestamp],
+        )
+        .unwrap();
+
+        rerun_local_timezone_date_backfill(&conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'migrated-old-db-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, expected_date);
+        // 這台機器時區有偏移時，能額外證明真的「改到了」而不是巧合維持原值；
+        // 機器時區剛好是 UTC 時，本地日期與 UTC 日期本來就相同，此檢查略過。
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊資料庫原樣複製的 UTC 日期");
+        }
+    }
+
+    #[test]
+    fn init_db_backfills_local_timezone_dates_once() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // UTC 16:31 前一天 == 本地(UTC+8) 00:31 當天；舊 bug 把 date 寫成 UTC 日期。
+        let seed = [
+            (
+                "codex",
+                "seed-codex",
+                "2026-09-21T16:31:41.160Z",
+                "2026-09-21",
+            ),
+            (
+                "claude",
+                "seed-claude",
+                "2026-09-21T17:00:00Z",
+                "2026-09-21",
+            ),
+            (
+                "copilot",
+                "seed-copilot",
+                "2026-09-21T18:00:00Z",
+                "2026-09-21",
+            ),
+            ("grok", "seed-grok", "2026-09-21T19:00:00Z", "2026-09-21"),
+            ("pi", "seed-pi", "2026-09-21T20:00:00Z", "2026-09-21"),
+            // 白天發生、本地與 UTC 同一天，不該被 migration 誤動。
+            (
+                "codex",
+                "seed-codex-noop",
+                "2026-09-21T02:00:00Z",
+                "2026-09-21",
+            ),
+        ];
+        for (assistant, session_id, timestamp, old_date) in seed {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, turn_no
+                 ) VALUES (?, ?, ?, ?, 1)",
+                params![assistant, timestamp, old_date, session_id],
+            )
+            .unwrap();
+        }
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+
+        let get_date = |session_id: &str| -> String {
+            conn.query_row(
+                "SELECT date FROM usage_entries WHERE session_id = ?",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // 雙重驗證，避免測試淪為同義反覆：
+        // 1) migration 算出的值必須等於「正確的轉換函式」算出的值（wiring 正確）。
+        // 2) 對確實會跨日的案例，migration 後的值必須「不再等於」種子裡刻意寫錯
+        //    的舊 UTC 日期──這一點不依賴呼叫任何轉換函式，直接證明 UPDATE 真的
+        //    發生過，不是 migration 邏輯整個被跳過或誤判成「不需要改」。
+        // 第 2 點的斷言只在測試機本地時區不是 UTC 時才有意義（否則本地日期與
+        // UTC 日期本來就相同）；CI runner 通常固定 UTC，這裡改成條件式檢查，
+        // 避免測試依賴機器時區、在 CI 上必定失敗。
+        let local_offset_secs = chrono::Local::now().offset().local_minus_utc();
+        for (assistant, session_id, timestamp, old_date) in seed {
+            let expected = local_date_from_timestamp(timestamp);
+            let actual = get_date(session_id);
+            assert_eq!(actual, expected, "{}/{}", assistant, session_id);
+            if session_id != "seed-codex-noop" && local_offset_secs != 0 {
+                assert_ne!(
+                    actual, old_date,
+                    "{}/{} 應被 migration 更正，不應停留在錯誤的 UTC 日期",
+                    assistant, session_id
+                );
+            }
+        }
+
+        let marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker_count, 1);
+    }
+
+    #[test]
     fn vscode_sync_signature_includes_debug_log_size_and_mtime() {
         let root = std::env::temp_dir().join(format!(
             "tui-vscode-sync-signature-{}-{}",
@@ -8299,6 +8606,43 @@ mod tests {
             )
             .unwrap();
         assert_eq!(imported_rows, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_writes_local_timezone_date() {
+        // UTC 前一天 16:31 == 本地 (UTC+8) 當天 00:31。舊 bug 會把匯入後的 date
+        // 寫成 UTC 的 "2026-09-21"；正確行為應寫成本地的 "2026-09-22"。斷言值
+        // 改用 local_date_from_timestamp 現算，不依賴測試機時區必須是 UTC+8。
+        let timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(timestamp);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.timestamp = timestamp.to_string();
+        record.entry.session_id = "import-local-midnight".to_string();
+        record.import_source_id = Some("import-local-midnight-record".to_string());
+
+        import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-09-22",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'import-local-midnight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, expected_date);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
     }
 
     #[test]
@@ -9415,6 +9759,60 @@ mod tests {
     }
 
     #[test]
+    fn sync_codex_usage_logs_writes_local_timezone_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // 斷言值改用 local_date_from_timestamp 現算，不依賴測試機時區必須是
+        // UTC+8，避免在 CI（通常固定 UTC）上必定失敗。
+        let event_timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(event_timestamp);
+
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-local-date-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        // UTC 前一天 16:31 == 本地 (UTC+8) 當天 00:31。舊 bug 會把 date 寫成
+        // UTC 的 "2026-09-21"；正確行為應寫成本地的 "2026-09-22"。
+        let sessions_dir = codex_dir.join("sessions/2026/09/22");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let session_path =
+            sessions_dir.join("rollout-2026-09-22T00-31-16-local-midnight-session.jsonl");
+        let content = r#"{"timestamp":"2026-09-21T16:31:16.336Z","type":"session_meta","payload":{"session_id":"local-midnight-session","cwd":"/tmp/project","cli_version":"0.155.1","model":"gpt-5.5"}}
+{"timestamp":"2026-09-21T16:31:41.160Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
+"#;
+        fs::write(&session_path, content).unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'local-midnight-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+
+        assert_eq!(date, expected_date);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+    }
+
+    #[test]
     fn sync_codex_usage_logs_preserves_parent_and_subagent_sessions() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -9714,6 +10112,52 @@ mod tests {
     }
 
     #[test]
+    fn sync_claude_usage_logs_writes_local_timezone_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // 斷言值改用 local_date_from_timestamp 現算，不依賴測試機時區必須是
+        // UTC+8，避免在 CI（通常固定 UTC）上必定失敗。
+        let event_timestamp = "2026-09-21T16:45:00.000Z";
+        let expected_date = local_date_from_timestamp(event_timestamp);
+
+        let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
+        let claude_dir = temp_jsonl_path("claude-local-date-sync").with_extension("");
+        let projects_dir = claude_dir.join("projects/test-project");
+        fs::create_dir_all(&projects_dir).unwrap();
+        let session_path = projects_dir.join("session-local-midnight.jsonl");
+        // UTC 前一天 16:45 == 本地 (UTC+8) 當天 00:45。舊 bug 會把 date 寫成
+        // UTC 的 "2026-09-21"；正確行為應寫成本地的 "2026-09-22"。
+        let content = r#"{"type":"assistant","sessionId":"session-local-midnight","timestamp":"2026-09-21T16:45:00.000Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"output_tokens":5}}}
+"#;
+        fs::write(&session_path, content).unwrap();
+        std::env::set_var("CLAUDE_DIR", &claude_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_claude_usage_logs(&mut conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries
+                 WHERE assistant_type = 'claude' AND session_id = 'session-local-midnight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        if let Some(value) = old_claude_dir {
+            std::env::set_var("CLAUDE_DIR", value);
+        } else {
+            std::env::remove_var("CLAUDE_DIR");
+        }
+        fs::remove_dir_all(claude_dir).unwrap();
+
+        assert_eq!(date, expected_date);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+    }
+
+    #[test]
     fn parse_cursor_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
         let path = temp_jsonl_path("cursor-session-name");
         let content = r#"{"role":"user","message":{"content":"第一條提示"}}
@@ -9733,6 +10177,48 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
+    }
+
+    #[test]
+    fn local_timestamp_string_from_system_time_uses_local_timezone_not_utc() {
+        // 用固定的 SystemTime（不依賴檔案系統 mtime 或執行測試當下的真實時鐘），
+        // 確保測試結果穩定，不會因為「剛好在本地白天執行測試」而在 UTC 環境下
+        // 巧合通過、卻在真正跨日的凌晨時段失去偵測力。
+        // UTC 2026-09-21T16:31:41Z：對 UTC+8 而言已經跨到本地隔天 00:31:41。
+        let fixed_utc = chrono::DateTime::parse_from_rfc3339("2026-09-21T16:31:41Z").unwrap();
+        let modified: std::time::SystemTime = fixed_utc.into();
+
+        let result = local_timestamp_string_from_system_time(modified);
+
+        let expected = fixed_utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(result, expected);
+        // 機器時區有偏移時，額外證明真的轉了本地時區，不是巧合維持 UTC 值。
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert!(!result.starts_with("2026-09-21"));
+        }
+    }
+
+    #[test]
+    fn parse_cursor_session_file_falls_back_to_mtime_when_no_timestamp_tag() {
+        // 沒有 user 訊息帶 <timestamp> 標籤時，退回用檔案 mtime 當 timestamp。
+        // 時區轉換的正確性已由 local_timestamp_string_from_system_time_* 獨立
+        // 驗證，這裡只驗證 fallback 路徑真的被觸發、且格式合法可被
+        // cursor_date_from_timestamp 解析。
+        let path = temp_jsonl_path("cursor-mtime-fallback");
+        let content = r#"{"role":"user","message":{"content":"沒有 timestamp 標籤"}}
+{"role":"assistant","message":{"content":"回覆"}}
+"#;
+        fs::write(&path, content).unwrap();
+        let entries =
+            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
+                .unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(entries.len(), 1);
+        assert!(cursor_date_from_timestamp(&entries[0].entry.timestamp).is_some());
     }
 
     #[test]
@@ -16952,7 +17438,11 @@ mod tests {
         assert!((reported_cost - 0.00024).abs() < f64::EPSILON);
         assert_eq!(reasoning_effort.as_deref(), Some("High"));
 
-        let date_rows = get_usage_entries_by_date(&conn, "2024-03-09", "grok").unwrap();
+        // grok turn_completed 事件 timestamp 為 unix epoch 1710000002 =
+        // UTC 2024-03-09T16:00:02Z。斷言值改用 local_date_from_timestamp
+        // 現算，不寫死日期字面值，避免在 CI（通常固定 UTC）上失敗。
+        let expected_date = local_date_from_timestamp("2024-03-09T16:00:02Z");
+        let date_rows = get_usage_entries_by_date(&conn, &expected_date, "grok").unwrap();
         assert_eq!(date_rows.len(), 1);
         assert_eq!(
             date_rows[0]
@@ -16984,14 +17474,14 @@ mod tests {
             Some(0.00024)
         );
 
-        let exported = export_usage_day_entries(&conn, "grok", "2024-03-09").unwrap();
+        let exported = export_usage_day_entries(&conn, "grok", &expected_date).unwrap();
         assert_eq!(exported.len(), 1);
         let mut imported_conn = Connection::open_in_memory().unwrap();
         init_db(&imported_conn).unwrap();
         import_usage_day_entries(
             &mut imported_conn,
             "grok",
-            "2024-03-09",
+            &expected_date,
             exported,
             UsageImportMetadata::default(),
         )
@@ -17184,14 +17674,18 @@ mod tests {
         assert!(turn_models.contains("Grok 4.5"));
         assert!(turn_models.contains("Grok Build 0.1"));
 
-        let exported = export_usage_day_entries(&conn, "grok", "2024-03-09").unwrap();
+        // turn_completed 事件 timestamp 為 unix epoch 1710000003 =
+        // UTC 2024-03-09T16:00:03Z。斷言值改用 local_date_from_timestamp
+        // 現算，不寫死日期字面值，避免在 CI（通常固定 UTC）上失敗。
+        let expected_date = local_date_from_timestamp("2024-03-09T16:00:03Z");
+        let exported = export_usage_day_entries(&conn, "grok", &expected_date).unwrap();
         assert_eq!(exported.len(), 2);
         let mut imported_conn = Connection::open_in_memory().unwrap();
         init_db(&imported_conn).unwrap();
         let import_summary = import_usage_day_entries(
             &mut imported_conn,
             "grok",
-            "2024-03-09",
+            &expected_date,
             exported,
             UsageImportMetadata::default(),
         )

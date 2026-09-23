@@ -311,7 +311,6 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
         } else {
             timestamp
         };
-        let date = ts.get(0..10).unwrap_or("1970-01-01").to_string();
         // Provide both tokens and delta_tokens as same snapshot per call, with delta = stats
         results.push(UsageEntry {
             timestamp: ts.clone(),
@@ -339,7 +338,6 @@ pub(crate) fn parse_session_usage_file(path: &Path) -> Result<Vec<UsageEntry>, S
             agent_role: None,
             reasoning_effort: None,
         });
-        let _ = date;
     }
 
     Ok(results)

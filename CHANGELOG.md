@@ -4,6 +4,141 @@
 
 ## [未發行]
 
+## [1.0.6] - 2026-09-23
+
+### 修正
+
+- 修正 Windows 依 README 執行 `irm https://raw.githubusercontent.com/doggy8088/TokenUsageInsights/main/scripts/get.ps1 | iex` 時直接出現 `Missing closing ')'`（`子運算式中缺少結尾 ')'`）ParserError、installer 完全無法啟動的問題（Issue #62）：`scripts/get.ps1` 開頭的 UTF-8 BOM 會被 `irm` 保留成字串第一個字元 `U+FEFF`，PowerShell 剖析器不把它當成空白，`<#` 因此不被視為區塊註解開頭，說明文字被當成程式碼剖析。`[scriptblock]::Create((irm ...)) -Service` 與 `Invoke-Expression "& { $script } ..."` 兩種 README 記載的帶參數寫法同樣受影響。`get.ps1` 現已改存為不含 BOM、且只包含 ASCII 字元的檔案（原本唯一的非 ASCII 內容是註解中的產品名稱），因此不論經由 `irm` 取得或下載後在 Windows PowerShell 5.1 以 `.\get.ps1` 執行，剖析結果都一致。
+
+### 測試
+
+- 新增 `tests/get-ps1-bootstrap.test.ps1`：以 `irm` 的方式把 `get.ps1` 的位元組解碼成字串（不剝除 BOM），再依 README 記載的 `irm | iex`、`[scriptblock]::Create` 與 `Invoke-Expression "& { $script } ..."` 三種方式剖析，並檢查檔案不含 BOM 且只包含 ASCII。原有的 `Parser::ParseFile` 檢查讀檔時會自動剝除 BOM，因此先前的 CI 無法發現此問題。此測試已納入 Release workflow 的 installer lint 步驟，並由 installer 檢查 workflow 在 PR 觸及 `get.ps1` 時執行。
+
+### 相容性
+
+- 僅 `scripts/get.ps1` 的檔案編碼與一行註解改變，參數與安裝流程不變；未變更資料庫結構與環境變數。`install.ps1`、`run-service.ps1` 等以檔案形式執行的腳本仍保留 UTF-8 BOM，以維持 Windows PowerShell 5.1 的中文訊息解析。
+
+## [1.0.5] - 2026-09-23
+
+### 新增與改善
+
+- 新增 GPT-6 Sol 與 GPT-6 Luna 的 Global、Cursor 定價規則，涵蓋 272K 長上下文門檻及 Batch/Flex 費率；看板可依模型名稱與上下文長度估算 Token 成本。
+
+### 相容性
+
+- 本次僅新增模型定價資料與對應測試，不涉及資料庫結構、環境變數或安裝流程變更。
+
+## [1.0.4] - 2026-09-23
+
+### 修正
+
+- 修正 `scripts/install.sh --service` 在 Linux 產生的 systemd 使用者服務單元把 `WorkingDirectory` 以雙引號包住的問題（Issue #59）：systemd 取用該值時不會剝除引號，會將引號視為路徑的一部分，並以 `WorkingDirectory= path is not absolute` 拒絕載入單元，導致透過 `get.sh --service` 安裝或更新後服務無法啟動。`WorkingDirectory` 現在以未加引號、且只轉義規格符（`%` → `%%`）的形式輸出，`ExecStart` 仍保留雙引號；重新執行 installer 會就地修正既有單元。
+
+### 測試
+
+- 新增 `tests/install-systemd.test.sh`：以 stub 取代 `uname` 與 `systemctl`，在暫存目錄中執行真正的 `scripts/install.sh --service`，驗證產生的單元內容（`WorkingDirectory` 未加引號且為絕對路徑、`ExecStart` 保留雙引號、`%` 正確轉義、由舊版加引號單元升級後仍保留 `PORT` 與 `HOST`），並確認 `shell/token-usage-insights.service` 範本同樣不加引號；環境中若有 `systemd-analyze` 時，會額外執行 `systemd-analyze --user verify` 驗證產生的單元。此測試已納入 Release workflow，並由新增的 installer 檢查 workflow 在 PR 觸及安裝腳本時執行。
+
+### 相容性
+
+- 重新執行 `get.sh --service` 或 `install.sh --service` 即會就地覆寫既有單元，帶引號的舊 `WorkingDirectory` 會自動修正，無須手動 `sed -i`；使用者自訂的 `PORT`、`HOST` 與 `Environment` 設定仍會沿用。
+- 未變更資料庫結構、環境變數與安裝流程；僅 Linux `--service` 產生的 systemd 單元內容不同。
+
+## [1.0.3] - 2026-09-22
+
+> 註：先前的 `v1.0.2` 標籤因 Release workflow 的 Windows 測試失敗而未產生任何 Release 成品，本節內容與該測試修正一併以 `v1.0.3` 發佈；`v1.0.2` 標籤維持原狀，未移動或刪除。
+
+### 新增與改善
+
+- 新增 Grok 4.7 定價規則（`pricing.csv`），涵蓋 200k 上下文門檻的短／長上下文費率、Low／Medium／High／Extra High 推理層級，以及價格為一般版 2 倍的 Fast 模式，共 30 筆 xAI API 規則（輸入 2.00／4.00、快取輸入 0.50／1.00、輸出 6.00／12.00，Fast 模式為兩倍）。
+- 看板可辨識 Grok 4.7 的模型 ID（`grok-4.7`、`grok-4.7-latest`），並依推理層級顯示為「Grok 4.7 (High)」等名稱；xAI 的最高推理層級 `xhigh` 以「Extra High」呈現。
+- 新增 Fast 模式辨識（`grok-4.7-fast`、`grok-4.7-fast-latest`），模型名稱顯示為「Grok 4.7 Fast」並套用 2 倍費率，避免 Fast 模式用量被以一般版價格低估。
+
+### 修正
+
+- 修正 Codex Session 在 `~/.codex/sessions` 與 `~/.codex/archived_sessions` 之間移動、或同一 Session 同時存在多個 rollout 檔案時，看板數字每隔幾秒在兩組數值間反覆跳動的問題（Issue #54）。
+- 修正 Codex 同步可能誤刪匯入資料的問題：rollout 身分遷移與本地 transcript 清除流程現在一律排除 `import_source_id` / `import_batch_id` 非空的資料列，匯入批次的生命週期不再被本機檔案同步影響。
+- 修正非 rollout 檔名的 `.jsonl`（例如 `notes.jsonl`、`history.jsonl`）被誤判為 rollout 身分而可能誤刪同名資料列的問題；現在僅接受 `rollout-` 前綴的檔名。
+- 修正重複 rollout 副本的清除與 canonical 檔案的寫入分屬不同交易、導致讀取端可能觀察到短暫空窗的問題；副本清除已納入同一個交易，canonical 檔案為空、解析失敗，或檔案仍在寫入而含有無法解析的行時，都不會先行刪除既有資料與副本。
+- 修正匯入資料列與本機 rollout 資料列佔用同一唯一鍵時，本機同步會因唯一鍵衝突而整批回滾、導致該 rollout 較新回合永遠無法寫入並每隔數秒重試失敗的問題；本機寫入改為 `INSERT OR IGNORE`，同鍵的匯入資料優先保留，其餘回合仍正常寫入。
+- 修正舊版匯出檔（未含 `usage_identity`）匯入後與本機 rollout 資料列以不同身分並存、同一回合被重複計算的問題；匯入時會由 transcript 路徑推導 rollout 身分，身分遷移也會為既有匯入資料列補上身分（附 `NOT EXISTS` 保護，避免唯一鍵衝突中斷遷移）。
+- 撤銷 Codex 匯入批次時會一併清除受影響 rollout 的同步狀態，下一次同步會重新解析該 rollout，將讓位給匯入資料的本機資料列補回。
+- 修正舊匯出檔（未含 `source_kind`）匯入 Codex 資料時，因來源類型預設為 `legacy` 而無法與本機的 `codex-desktop` / `codex-cli` 資料列落在同一個唯一鍵、同一回合仍被重複計算的問題；匯入時會沿用本機既有資料列的來源類型，讓匯入列正確去重。
+- 修正身分遷移的孤兒清除可能把僅有匯入資料的 Session 視為已追蹤，而誤刪本機無 transcript 路徑的舊資料列的問題；孤兒判定現在只採計本機資料列。
+- 修正匯出檔帶有 `legacy` 來源類型時仍無法與本機資料列去重的問題；匯入時只要來源類型不是可辨識的 Codex 類型，就會改用本機既有資料列的來源類型。
+- 修正 rollout 先匯入、後才被本機同步解析時，因來源類型不同而多出一筆重複資料列的問題；本機同步現在會讓位給同一 rollout 與回合的匯入資料，即使來源類型不同。
+- 修正「本機是否已存有某個 rollout」的判斷把匯入資料列一併算入的問題；同步狀態現在只反映本機資料列，全部回合都由匯入批次提供的 rollout 會以既有的空內容標記記錄狀態，避免每個同步週期重複解析，撤銷匯入後下一次同步即補回本機資料列。
+- 修正 canonical 檔案因正在寫入或損毀而無法完整解析時，仍可能被視為該 rollout 的唯一來源的問題；此時若副本能完整解析且涵蓋更多回合，會改由該副本提供資料，避免新資料庫永久漏掉整個 rollout 的用量。
+- 修正只解析到部分內容的 rollout 仍會以「已同步」狀態記錄、進而在後續週期被當成可安全刪除副本的問題；解析不完整的狀態不再觸發副本清除，直到 canonical 檔案能完整解析。
+- 修正 rollout 身分判定未檢查副檔名，導致同名的非 `.jsonl` 檔案（例如 `rollout-x.txt`）與真正的 `rollout-x.jsonl` 共用身分而可能互相清除資料的問題；現在只接受 `.jsonl` 副檔名（不分大小寫）。
+- 修正舊版本遺留的跨來源重複資料列在該 rollout 的同步狀態已是最新時仍會永久重複計算的問題；身分遷移現在會清除與匯入資料屬於同一回合的本機資料列，讓同鍵的匯入資料優先保留。
+- 修正身分遷移的孤兒資料清除未比對來源類型、可能把其他來源類型中同樣沒有 transcript 路徑的資料列一併刪除的問題；孤兒判定現在限定相同的 `source_kind`。
+- 修正匯入時查詢本機既有資料列來源類型的語句未帶 `usage_identity <> ''`、無法命中部分索引的問題；大型資料庫改走 `idx_assistant_usage_identity`，避免逐筆掃描 `idx_assistant_type` 或 `idx_assistant_transcript_path`。
+- 修正 rollout 身分遷移在大型資料庫上耗時過久的效能問題：遷移的三個相互關聯子查詢原先無法使用部分索引、退化成每個資料列各掃描一次全部 Codex 資料列，179,312 筆的資料庫會卡在同步中數十分鐘以上；遷移期間改為建立兩個非部分索引供其尋址並於交易內移除，同一資料庫的首次同步實測 74 秒完成。
+- 修正 Codex 同步測試在 Windows 上以混合路徑分隔符號（`sessions/2026/09/11`）建立測試目錄，導致字串比對與 collector 實際寫入的原生分隔符號不一致、Release workflow 的 Windows 測試（330 passed / 36 failed）失敗而阻斷 `v1.0.2` 發佈的問題；測試改以逐層 `join` 建立路徑，三個平台的行為與資料列寫入路徑拼法一致。產品邏輯本身不受影響。
+
+### 資料影響
+
+- Grok Build 解析器版本提升至 `migration:grok_parser_v8`，啟動時會重新解析既有的 Grok Session，讓先前以原始模型 ID（例如 `grok-4.7`）儲存的資料列改用新的顯示名稱與價格規則；重解析僅更新模型、推理層級與未回報成本的估算值，不會刪除 Session 或歷史資料。
+- `usage_entries` 既有的 `usage_identity` 欄位（1.0.0 導入，預設空字串不需人工調整）自本次起由 Codex 的 rollout 檔案以檔名寫入穩定身分；啟動時會自動執行一次性遷移 `migration:codex_rollout_identity_v1`，回填既有資料並清除已無對應檔案的孤兒資料列（僅影響 `assistant_type = 'codex'` 且非匯入的資料列）。
+- 新增部分索引 `idx_assistant_usage_identity`（`WHERE usage_identity <> ''`）以加速身分範圍的刪除；大型資料庫可顯著降低同步時的刪除耗時。
+- 身分遷移另行建立兩個暫時索引（`tmp_codex_rollout_identity_guard`、`tmp_codex_rollout_import_identity`）並在同一交易內移除，遷移結束後資料庫結構與先前相同。
+- 手動匯入的資料列（`import_source_id` / `import_batch_id` 非空）改由匯入批次管理：本機 Codex transcript 同步不再刪除或改寫其 `usage_identity`，rollout 遷移亦不會將其視為孤兒資料清除；「本機已存有此 rollout」的判定與重複副本清除也只採計本機資料列。
+
+### 相容性
+
+- 同一 Session ID 的不同 rollout 檔案（續傳分段）改為各自保留資料列，報表由既有 Session 身分模型自動合併，每日、每月、年度、模型明細與時間軸的計算結果維持一致或更完整。
+- 匯出／匯入格式新增選用的 `usage_identity` 欄位；缺少該欄位的既有匯出檔仍可正常匯入。
+
+
+## [1.0.1] - 2026-09-20
+
+### 新增與改善
+
+- 新增 `mcode`（MiniMax Code）Agent 類型。看板會掃描 `~/.minimax/v2/sessions` 下的 Session 目錄，合併 `messages.jsonl` 與 `snapshots/*.jsonl`、依 `message_id` 去重且以 `message.timestamp` 排序後，呈現 Token 用量、模型分布、工作目錄分布、Session 清單與完整時間軸。
+- 工作目錄與 Session 名稱以唯讀方式取自 MiniMax Code 執行期的 `runtime-state.sqlite`（`local_runtime_sessions.workspace_dir` 與 `title`），不寫入或修改該資料庫；若資料庫或資料表不存在，Session 仍可正常匯入，僅缺少工作目錄與名稱。
+- 新增 `MCODE_DIR` 與 `MCODE_STATE_DB` 環境變數，可分別自訂 MiniMax Code 資料目錄與執行期資料庫路徑。
+
+### 變更
+
+- 服務常駐安裝腳本（`install.sh`、`install.ps1`）與更新流程的關鍵環境變數清單納入 `MCODE_DIR`、`MCODE_STATE_DB`，確保自訂路徑在服務重啟時仍可正確帶入。
+
+### 資料影響
+
+- MiniMax Code 的 Session 以 `assistant_type = 'mcode'`、`source_kind = 'mcode-session'` 寫入既有 `usage_entries` 資料表，無需額外資料庫結構遷移。
+- MiniMax Code 本地日誌未提供費用欄位（`cost.total` 一律為 0），費用改以 Session 回報的 Token 數量對照 `pricing.csv` 模型單價估算；`pricing.csv` 未新增任何項目。
+
+### 相容性
+
+- 本次不涉及資料庫結構、HTTP API 或既有資料來源的變更；既有 Agent 的同步邏輯與資料不受影響。新增的 `MCODE_DIR`、`MCODE_STATE_DB` 均為選用環境變數，未設定時沿用 MiniMax Code 的預設路徑。
+
+## [1.0.0] - 2026-09-14
+
+### 新增與改善
+
+- 看板側邊欄底部新增固定且水平置中的版本與日期標示；版本由後端 `GET /api/version` 讀取 Cargo 套件版本，終端機啟動橫幅亦使用相同來源，後續版本升級不需再修改前端字串。
+- 建立完整 Session 身分模型，以助理類型、來源類型、來源目錄與 Session ID 隔離每日、每月、年度報表、模型明細、USER prompt 搜尋、工作目錄篩選、時間軸與 K 線成本，讓不同來源的同名 Session 可正確並存。
+
+### 變更
+
+- 將報表彙整、Session 身分、檔案解析、詳情重建與搜尋邏輯拆分為專責模組，統一日期查詢解碼、JSONL 掃描、路徑安全驗證、最新記錄決勝與 delta 用量彙總規則；HTTP handler 維持輸入驗證與回應轉換責任。
+- 使用量匯出會保留 `source_dir_key` 與選用的 `usage_identity`；匯入會以完整來源身分建立穩定識別碼，既有未包含新欄位的匯出檔仍可匯入。
+
+### 修正
+
+- 修正不同助理、來源類型或 Copilot App 目錄共用 Session ID 時，資料可能在報表、清單、搜尋、抽屜、圖表或匯入流程被合併、覆寫或靜默略過的問題；Copilot App 時間軸現在只會解析資料列所屬且由本機同步登錄的來源目錄。
+- 修正累計型用量的 Session 跨越月份或年份時，各期間桶重複加總累計值而放大 Token 與費用的問題；delta 型來源維持逐筆加總。
+- 限制無資料狀態卡片的 Agent 圖示尺寸，避免 Antigravity 與 GitHub Copilot 點陣圖依原始尺寸覆蓋主要內容。
+
+### 資料影響
+
+- SQLite 啟動時會自動建立 `usage_source_directories` 資料表，以助理、來源類型與來源目錄鍵保存本機已驗證路徑，供 Copilot App 詳情與搜尋精確定位；不刪除或重寫既有使用量資料。
+- 匯出 JSON 新增選用的 `usage_identity` 欄位並保留既有 `source_dir_key`；舊版匯出檔與既有匯入批次維持相容。
+
+### 相容性
+
+- 新增 `GET /api/version` 並在每日原始用量項目加入助理身分，皆為附加資訊；既有 HTTP 路由、CLI 參數、環境變數、資料來源目錄與 Release 資產格式維持相容。
+- 本次沒有破壞性變更；資料庫新增表由啟動流程自動建立，不需人工遷移。
+
 ## [0.9.9] - 2026-09-14
 
 ### 新增與改善
@@ -640,7 +775,12 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...HEAD
+[1.0.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3
+[1.0.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.9...v1.0.0
 [0.9.9]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.8...v0.9.9
 [0.9.8]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.5...v0.9.8
 [0.9.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v0.9.4...v0.9.5

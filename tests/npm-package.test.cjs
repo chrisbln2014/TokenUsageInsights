@@ -101,6 +101,38 @@ test('does not rely on dependency install scripts under npm 12', () => {
   assert.match(readFileSync(join(__dirname, '..', 'npm', 'cli.cjs'), 'utf8'), /installBinary/);
 });
 
+test('empty-state assistant logos have bounded stylesheet dimensions', () => {
+  const appSource = readFileSync(join(__dirname, '..', 'static', 'app.js'), 'utf8');
+  const componentCss = readFileSync(join(__dirname, '..', 'static', 'css', 'components.css'), 'utf8');
+  assert.match(appSource, /getAssistantLogoHtml\(resolvedAssistant, 'empty-agent-logo'\)/);
+
+  const rule = componentCss.match(/\.welcome-setup-card\s+\.empty-agent-logo\s*\{([^}]*)\}/s);
+  assert.ok(rule, 'empty-state assistant logo needs a dedicated CSS rule');
+  assert.match(rule[1], /inline-size:\s*2\.5rem/);
+  assert.match(rule[1], /block-size:\s*2\.5rem/);
+  assert.match(rule[1], /object-fit:\s*contain/);
+});
+
+test('keeps the release label visible at the bottom of the sidebar', () => {
+  const indexHtml = readFileSync(join(__dirname, '..', 'static', 'index.html'), 'utf8');
+  const appSource = readFileSync(join(__dirname, '..', 'static', 'app.js'), 'utf8');
+  const redesignCss = readFileSync(join(__dirname, '..', 'static', 'css', 'redesign.css'), 'utf8');
+  assert.match(indexHtml, /<span id="app-version">v—<\/span>/);
+  assert.doesNotMatch(indexHtml, /v1\.0\.0/);
+  assert.match(appSource, /fetch\('\/api\/version', \{ cache: 'no-store' \}\)/);
+  assert.match(appSource, /versionElement\.textContent = `v\$\{version\}`/);
+
+  const scrollAreaRule = redesignCss.match(/\.sidebar-scroll-area\s*\{([^}]*)\}/s);
+  assert.ok(scrollAreaRule, 'sidebar content needs an independent scroll area');
+  assert.match(scrollAreaRule[1], /flex:\s*1 1 auto/);
+  assert.match(scrollAreaRule[1], /overflow-y:\s*auto/);
+
+  const versionRule = redesignCss.match(/\.sidebar-version\s*\{([^}]*)\}/s);
+  assert.ok(versionRule, 'sidebar version label needs a dedicated CSS rule');
+  assert.match(versionRule[1], /text-align:\s*center/);
+  assert.match(versionRule[1], /flex:\s*0 0 auto/);
+});
+
 test('release asset verification reports all failed URLs', async () => {
   const error = await verifyReleaseAssets({
     version: '1.2.3',

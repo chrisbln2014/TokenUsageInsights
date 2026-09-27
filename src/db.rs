@@ -307,6 +307,14 @@ const COPILOT_CWD_BACKFILL_MIGRATION_KEY: &str = "migration:copilot_cwd_backfill
 /// the marker is set on success so re-runs are a no-op.
 const LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY: &str = "migration:local_timezone_date_v1";
 
+/// One-time backfill correcting `usage_entries.date` for rows the v1 backfill
+/// (above) could not have covered because it predates both the `mcode`
+/// assistant and local-timezone-aware imports: rows with
+/// `assistant_type = 'mcode'` or a non-NULL `import_batch_id`. Same
+/// recompute-from-`timestamp` approach as v1, restricted to that narrower
+/// row set. Idempotent: the marker is set on success so re-runs are a no-op.
+const LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY: &str = "migration:local_timezone_date_v2";
+
 #[derive(Default)]
 enum InitialUserPromptState {
     #[default]
@@ -1319,6 +1327,54 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
         )
         .map_err(|error| format!("記錄時區日期回填遷移失敗: {error}"))?;
+    }
+
+    let local_timezone_date_v2_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+    if !local_timezone_date_v2_migration_done {
+        let rows: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, timestamp, date FROM usage_entries
+                     WHERE assistant_type = 'mcode' OR import_batch_id IS NOT NULL",
+                )
+                .map_err(|error| format!("準備時區日期回填 v2 查詢失敗: {error}"))?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|error| format!("執行時區日期回填 v2 查詢失敗: {error}"))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("讀取時區日期回填 v2 資料失敗: {error}"))?
+        };
+
+        for (id, timestamp, old_date) in rows {
+            let new_date = local_date_from_timestamp(&timestamp);
+            if new_date != old_date {
+                conn.execute(
+                    "UPDATE usage_entries SET date = ?1 WHERE id = ?2",
+                    params![new_date, id],
+                )
+                .map_err(|error| format!("更新時區日期回填 v2 資料失敗 (id={id}): {error}"))?;
+            }
+        }
+
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, 1, 0)",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+        )
+        .map_err(|error| format!("記錄時區日期回填 v2 遷移失敗: {error}"))?;
     }
 
     Ok(())
@@ -7123,6 +7179,208 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker_count, 1);
+    }
+
+    #[test]
+    fn init_db_v2_backfill_is_noop_without_mcode_or_imports() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap(); // 第一次執行：v1、v2 marker 都會寫入。
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+        )
+        .unwrap();
+        let v1_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_marker_count, 1, "前置狀態應是「v1 已跑過、v2 還沒跑過」");
+
+        // 這筆是 v1 已經跑過之後才插入的一般 codex 列，UTC 日期故意寫錯，用來
+        // 驗證 v2 的 WHERE 條件不會誤動非 mcode、非匯入的資料。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-21T16:31:41.160Z', '2026-09-21', 'v2-noop-codex', 1)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap(); // 觸發 v2 回填。
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'v2-noop-codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            date, "2026-09-21",
+            "v2 只該處理 mcode 或匯入列，不該動到一般 codex 列"
+        );
+
+        let v2_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v2_marker_count, 1, "v2 marker 執行後應存在");
+    }
+
+    #[test]
+    fn init_db_v2_backfill_fixes_utc_dated_mcode_row() {
+        // 斷言值改用 local_date_from_timestamp 現算，避免測試依賴執行機器
+        // 的系統時區必須是 UTC+8 才能通過（跟 v1 測試的作法一致）。
+        let timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(timestamp);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+        )
+        .unwrap();
+        let v1_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_marker_count, 1);
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('mcode', ?, '2026-09-21', 'v2-mcode-row', 1)",
+            params![timestamp],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'v2-mcode-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, expected_date);
+        // 機器時區有偏移時，才能額外證明真的「改到了」而不是巧合維持原值；
+        // 機器時區剛好是 UTC 時，本地日期與 UTC 日期本來就相同，略過此檢查。
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(
+                date, "2026-09-21",
+                "mcode 列應被 v2 更正，不應停留在錯誤的 UTC 日期"
+            );
+        }
+    }
+
+    #[test]
+    fn init_db_v2_backfill_fixes_utc_dated_imported_cursor_row() {
+        let timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(timestamp);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+        )
+        .unwrap();
+        let v1_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_marker_count, 1);
+
+        // import_batch_id 非 NULL，代表這是透過匯入功能寫入的。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, import_batch_id
+             ) VALUES ('cursor', ?, '2026-09-21', 'v2-imported-cursor-row', 1, 'b1')",
+            params![timestamp],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'v2-imported-cursor-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, expected_date);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(
+                date, "2026-09-21",
+                "匯入的 cursor 列應被 v2 更正，不應停留在錯誤的 UTC 日期"
+            );
+        }
+    }
+
+    #[test]
+    fn init_db_v2_backfill_leaves_local_cursor_row_untouched() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![LOCAL_TIMEZONE_DATE_BACKFILL_V2_MIGRATION_KEY],
+        )
+        .unwrap();
+        let v1_marker_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
+                params![LOCAL_TIMEZONE_DATE_BACKFILL_MIGRATION_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v1_marker_count, 1);
+
+        // import_batch_id 為 NULL，代表這是本機同步寫入的，date 本來就是對的
+        // （已經是本地時區），v2 不該去動它。
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('cursor', '2024-01-01T23:30:00-07:00', '2024-01-01', 'v2-local-cursor-row', 1)",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'v2-local-cursor-row'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // 斷言值用字面常數而非 local_date_from_timestamp 現算：這個時間戳在
+        // UTC+8 換算後會變成 2024-01-02，若這裡改用該函式現算「期望值」，就算
+        // v2 的 WHERE 條件寫得過寬誤動了這一列，測試也會綠燈，測不出東西。這條
+        // 測試要驗證的是「v2 完全不該碰這一列」，期望值必須是插入時的原值。
+        assert_eq!(
+            date, "2024-01-01",
+            "import_batch_id 為 NULL 的本機同步列，date 本來就是對的，v2 不該改動"
+        );
     }
 
     #[test]

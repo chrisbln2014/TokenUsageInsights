@@ -728,6 +728,7 @@ fn build_snapshot_router(static_dir: &PathBuf) -> Router {
     };
 
     Router::new()
+        .route("/api/version", get(get_app_version))
         .route("/api/:assistant/dates", get(snapshot::get_available_dates))
         .route("/api/:assistant/setup-info", get(snapshot::get_setup_info))
         .route(
@@ -829,6 +830,7 @@ mod tests {
         // (前端呼叫方法, app.js 解析出的路徑, snapshot 模式是否刻意不支援)
         // 路徑中的 x 為 app.js 模板變數；assistant 為 x 時，資料端點應回 400 而非 501
         let expectations = [
+            (Method::GET, "/api/version", false),
             (Method::GET, "/api/x/dates", false),
             (Method::GET, "/api/x/months", false),
             (Method::GET, "/api/x/years", false),
@@ -893,6 +895,26 @@ mod tests {
                 );
             }
         }
+
+        // snapshot 模式下 /api/version 必須是真正可用的端點（非 501），且版本號來自
+        // CARGO_PKG_VERSION，與正式模式的 /api/version 行為一致
+        let version_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(version_response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(version_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
     }
 
     #[tokio::test]

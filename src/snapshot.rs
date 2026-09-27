@@ -18,7 +18,7 @@ use crate::handlers::{
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_REFRESH_SECONDS: u64 = 300;
-const ASSISTANTS: [&str; 9] = [
+const ASSISTANTS: [&str; 10] = [
     "antigravity",
     "copilot",
     "codex",
@@ -28,6 +28,7 @@ const ASSISTANTS: [&str; 9] = [
     "pi",
     "omp",
     "muse",
+    "mcode",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,13 +4,14 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-const ASSISTANTS: [&str; 9] = [
+const ASSISTANTS: [&str; 10] = [
     "antigravity",
     "claude",
     "codex",
     "copilot",
     "cursor",
     "grok",
+    "mcode",
     "muse",
     "omp",
     "pi",
@@ -38,6 +39,7 @@ fn isolated_command(root: &Path, insights_dir: &Path) -> Command {
         .env("INSIGHTS_DIR", insights_dir)
         .env("TOKEN_USAGE_INSIGHTS_AUTO_UPDATE", "0")
         .env("CURSOR_STATE_DB", empty_sources.join("state.vscdb"))
+        .env("MCODE_STATE_DB", empty_sources.join("mcode-state.db"))
         .env_remove("TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT")
         .env_remove("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH")
         .env_remove("TOKEN_USAGE_INSIGHTS_DATA_SOURCE")
@@ -53,6 +55,7 @@ fn isolated_command(root: &Path, insights_dir: &Path) -> Command {
         "PI_DIR",
         "OMP_DIR",
         "MUSE_DIR",
+        "MCODE_DIR",
         "VSCODE_USER_DATA_DIR",
         "VSCODE_PORTABLE_DATA_DIR",
         "APPDATA",

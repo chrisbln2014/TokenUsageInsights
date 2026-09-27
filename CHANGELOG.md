@@ -4,12 +4,24 @@
 
 ## [未發行]
 
+### 變更
+
+- 整合 upstream v1.0.6（新增 mcode／MiniMax Code 助理支援與 `/api/version` 端點等上游變更）
+  至本 fork 的合併分支。
+
+### 新增與改善
+
+- Cloud Run 唯讀 snapshot 模式路由補齊 `/api/version`（回傳與正式模式一致的 `CARGO_PKG_VERSION`）
+  與 mcode 助理，避免這次整合 upstream 後 snapshot 部署落後正式模式。
+
 ### 修正
 
 - 修正 Codex、Claude、Copilot（App／CLI Agent／VS Code Chat）、Grok、Pi、OMP、Muse 等助理的
   每日統計在本地時間午夜前後（UTC+8 為 00:00~07:59）被歸到前一天的問題：同步邏輯原本直接截取
   UTC timestamp 字串當日期，未轉換成本地時區；CLI／API 匯入路徑亦有同樣問題。Cursor 在對話缺少
   `<timestamp>` 標籤、退回用檔案修改時間當 fallback 時也一併修正。
+- 時區修復範圍延伸到 mcode 與 Cursor 備用時間戳（檔案 mtime／現在時間）路徑，並新增 v2 回填，
+  補上僅套用 v1 回填時遺漏、或在修復前就已匯入的資料。
 
 ### 資料影響
 
@@ -17,6 +29,11 @@
   移日期歸屬，token 總量不變）；若本機仍有舊版獨立資料庫待遷移，遷移完成後也會一併涵蓋。Cursor
   的歷史資料不在回填範圍內（正常路徑與例外回退路徑寫入的資料格式相同，無法安全區分來源，強制回
   填有把正常資料誤判、錯移一天的風險）。
+
+### 已知問題
+
+- 前端（`static/app.js`、`static/chart-utils.js`）目前仍以 UTC 切分「日」的邊界，與本次後端寫入
+  點改為本地時區的修復不完全一致；此問題刻意排除在本次範圍外，留待後續任務處理。
 
 ## [1.0.6] - 2026-09-23
 

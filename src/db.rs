@@ -7749,6 +7749,29 @@ mod tests {
     }
 
     #[test]
+    fn insert_vscode_usage_entry_writes_local_timezone_date() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut entry = sample_import_record().entry;
+        entry.timestamp = "2026-09-21T16:31:41.160Z".to_string();
+        entry.session_id = "vscode-local-midnight".to_string();
+        let tx = conn.transaction().unwrap();
+        insert_vscode_usage_entry(&tx, &entry).unwrap();
+        tx.commit().unwrap();
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE session_id = 'vscode-local-midnight'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, local_date_from_timestamp("2026-09-21T16:31:41.160Z"));
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+    }
+
+    #[test]
     fn import_preserves_copilot_source_directories_and_multi_model_rows() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -8005,6 +8028,87 @@ mod tests {
         .unwrap();
         assert_eq!(second.imported, 0);
         assert_eq!(second.skipped_duplicates, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_local_timezone_reimport_of_midnight_record_is_deduplicated() {
+        // 審查重點第 3 項：重新匯入同一份午夜前後的匯出檔，第二次不能產生重複列
+        // ——匯入 ID 用的是本地日期，跟 date 欄位算法必須一致。
+        let timestamp = "2026-09-21T16:31:41.160Z";
+        let expected_date = local_date_from_timestamp(timestamp);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut record = sample_import_record();
+        record.import_source_id = None; // 繞過人工指定 ID，走自動產生的 ID 邏輯。
+        record.entry.timestamp = timestamp.to_string();
+        record.entry.session_id = "import-local-timezone-reimport".to_string();
+
+        let first = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            &expected_date,
+            vec![record.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(first.imported, 1);
+        assert_eq!(first.skipped_duplicates, 0);
+
+        let second = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            &expected_date,
+            vec![record.clone()],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 1, "重新匯入同一份紀錄必須被去重");
+
+        let count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries WHERE session_id = 'import-local-timezone-reimport'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let (date, usage_identity, stored_source_id): (String, String, String) = conn
+            .query_row(
+                "SELECT date, usage_identity, import_source_id
+                 FROM usage_entries WHERE session_id = 'import-local-timezone-reimport'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(date, expected_date);
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+
+        let expected_source_id = build_usage_entry_import_source_id(
+            "codex",
+            &expected_date,
+            &record.entry,
+            Some(&usage_identity),
+        );
+        assert_eq!(stored_source_id, expected_source_id);
+
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            let utc_source_id = build_usage_entry_import_source_id(
+                "codex",
+                "2026-09-21",
+                &record.entry,
+                Some(&usage_identity),
+            );
+            assert_ne!(
+                stored_source_id, utc_source_id,
+                "匯入 ID 不應退化成用 UTC 日期算出來的值"
+            );
+        }
     }
 
     #[test]
@@ -11736,6 +11840,100 @@ mod tests {
     }
 
     #[test]
+    fn sync_copilot_app_usage_logs_writes_local_timezone_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
+
+        let base_dir = temp_jsonl_path("copilot-app-local-timezone").with_extension("");
+        let app_dir = base_dir.join("copilot-app");
+        fs::create_dir_all(&app_dir).unwrap();
+
+        let session_store = Connection::open(app_dir.join("session-store.db")).unwrap();
+        session_store
+            .execute(
+                "CREATE TABLE assistant_usage_events (
+                    id INTEGER PRIMARY KEY,
+                    session_id TEXT,
+                    turn_index INTEGER,
+                    model TEXT,
+                    agent_id TEXT,
+                    initiator TEXT,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    cache_read_tokens INTEGER,
+                    cache_write_tokens INTEGER,
+                    reasoning_tokens INTEGER,
+                    duration_ms INTEGER,
+                    reasoning_effort TEXT,
+                    created_at TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+
+        // created_at 只寫一筆 UTC 前一天 16:31，會經由 normalize_copilot_app_timestamp
+        // 轉成 "2026-09-21T16:31:41Z"，本地 (UTC+8) 是 9/22 00:31。
+        let session_id = "app-session-local-midnight";
+        session_store
+            .execute(
+                "INSERT INTO assistant_usage_events
+                    (id, session_id, turn_index, model,
+                     input_tokens, output_tokens,
+                     cache_read_tokens, cache_write_tokens,
+                     reasoning_tokens, duration_ms,
+                     reasoning_effort, created_at)
+                 VALUES (1, ?, 0, 'gpt-5', 100, 10, 0, 0, 0, 100, 'medium', ?)",
+                params![session_id, "2026-09-21 16:31:41"],
+            )
+            .unwrap();
+
+        let data_db = Connection::open(app_dir.join("data.db")).unwrap();
+        data_db
+            .execute(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    title TEXT
+                 )",
+                [],
+            )
+            .unwrap();
+        data_db
+            .execute(
+                "INSERT INTO sessions (id, title) VALUES (?, 'Local Midnight Session')",
+                params![session_id],
+            )
+            .unwrap();
+
+        std::env::set_var("COPILOT_APP_DIR", &app_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        sync_copilot_app_usage_logs(&mut conn).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries
+                 WHERE assistant_type = 'copilot' AND source_kind = 'copilot-app'
+                   AND session_id = ?",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, local_date_from_timestamp("2026-09-21T16:31:41.160Z"));
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+
+        if let Some(value) = old_app_dir {
+            std::env::set_var("COPILOT_APP_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_APP_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
     fn sync_copilot_app_usage_logs_populates_cwd_from_session_store() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_app_dir = std::env::var("COPILOT_APP_DIR").ok();
@@ -14769,6 +14967,95 @@ mod tests {
         assert_eq!(sub2.tokens_output, 9223);
         assert_eq!(sub2.tokens_reasoning, 660);
         assert_eq!(sub2.tokens_cache_read, 0);
+
+        if let Some(value) = old_dir {
+            std::env::set_var("COPILOT_DIR", value);
+        } else {
+            std::env::remove_var("COPILOT_DIR");
+        }
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn sync_copilot_cli_agent_usage_logs_writes_local_timezone_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_dir = std::env::var("COPILOT_DIR").ok();
+
+        let base_dir = temp_jsonl_path("cli-reconcile-local-timezone").with_extension("");
+        let app_dir = base_dir.join("copilot");
+        fs::create_dir_all(&app_dir).unwrap();
+        let session_id = "f33b0404-e2dc-48ff-aa55-25a700b8fa7e";
+        let store = build_cli_reconciler_fixture(&app_dir, &[], &[session_id]);
+
+        // agent 總量 = 淨輸入 + cache_read + output（db.rs:3425-3428），
+        // 淨輸入 = 原始 input - cache_read，所以總量 = 原始 input + output，
+        // 跟 cache_read 無關。這裡 cache_read = 0，N = input + output = 1500。
+        let input: i64 = 1000;
+        let output: i64 = 500;
+        let n: i64 = input + output;
+
+        insert_cli_event(
+            &store,
+            CliEventIdentity {
+                id: 1,
+                session_id,
+                model: "DP4P",
+                agent_id: None,
+                initiator: None,
+            },
+            CliEventTokens {
+                input,
+                output,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+                duration_ms: 100,
+            },
+            "2026-09-21 16:31:41",
+        );
+
+        std::env::set_var("COPILOT_DIR", &app_dir);
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // hook 總量必須等於 agent 總量，否則 reconciler 會判定 hook 領先、
+        // 保留 hook 列（db.rs:3455），根本不會走到受測的 local_date_from_timestamp
+        // 寫入點。
+        seed_cli_hook_row(&conn, session_id, n);
+
+        sync_copilot_cli_agent_usage_logs(&mut conn).unwrap();
+
+        let rows = read_cli_agent_rows(&conn, session_id);
+        assert_eq!(rows.len(), 1, "only the main agent row should be written");
+        assert_eq!(rows[0].tokens_total, n);
+
+        // 光靠上面的斷言還分不出寫入的是 agent 列還是被保留的 hook 列（兩者
+        // source_kind 都是 copilot-cli），所以再確認時間戳確實來自 agent 事件。
+        let ts: String = conn
+            .query_row(
+                "SELECT timestamp FROM usage_entries WHERE session_id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ts.starts_with("2026-09-21T16:31:41"),
+            "應為 agent 事件的時間戳，實際為 {ts}"
+        );
+
+        let dates: Vec<String> = conn
+            .prepare("SELECT DISTINCT date FROM usage_entries WHERE session_id = ?1")
+            .unwrap()
+            .query_map([session_id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            dates,
+            vec![local_date_from_timestamp("2026-09-21T16:31:41.160Z")]
+        );
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(dates[0], "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
 
         if let Some(value) = old_dir {
             std::env::set_var("COPILOT_DIR", value);

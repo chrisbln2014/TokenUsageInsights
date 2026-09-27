@@ -4945,7 +4945,7 @@ fn insert_usage_entries(
                 source_kind,
                 usage_identity,
                 entry.timestamp,
-                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                local_date_from_timestamp(&entry.timestamp),
                 entry.session_id,
                 entry.session_name.as_deref(),
                 entry.transcript_path.as_deref(),
@@ -18097,6 +18097,43 @@ mod tests {
     }
 
     #[test]
+    fn sync_pi_usage_logs_writes_local_timezone_date() {
+        let root = temp_jsonl_path("pi-sync-local-date");
+        let session_dir = root
+            .join("agent")
+            .join("sessions")
+            .join("--tmp--pi-project");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("2024-12-03T14-00-00_abc.jsonl"),
+            concat!(
+                r#"{"type":"session","version":3,"id":"pi-sess-1","timestamp":"2024-12-03T14:00:00.000Z","cwd":"/tmp/pi-project"}"#, "\n",
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello"}}"#, "\n",
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-09-21T16:31:41.160Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":100,"output":50,"cacheRead":10,"totalTokens":150,"cost":{"total":0.0031}},"stopReason":"stop"}}"#, "\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_pi_usage_logs(&mut conn, &root).unwrap();
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE assistant_type = 'pi' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, local_date_from_timestamp("2026-09-21T16:31:41.160Z"));
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sync_omp_usage_logs_persists_turn_with_omp_source_kind() {
         let root = temp_jsonl_path("omp-sync");
         let session_dir = root
@@ -18549,6 +18586,83 @@ mod tests {
             sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
         });
         assert_eq!(mcode_synced_rows(&conn).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_writes_local_timezone_date() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-local-date");
+        let session_dir = mcode_test_session_dir(&root);
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_790_008_301_160,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE assistant_type = 'mcode' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, local_date_from_timestamp("2026-09-21T16:31:41.160Z"));
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_keeps_unknown_date_for_missing_timestamp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-missing-timestamp");
+        let session_dir = mcode_test_session_dir(&root);
+        // Hand-written record with the `message.timestamp` field removed
+        // (upstream's `mcode_test_assistant_record` helper cannot produce
+        // this shape; see mcode.rs `record_timestamp`, which reads
+        // `message.timestamp`).
+        let record_without_timestamp = r#"{"message_id":"msg-1","turn_id":"turn_1","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"provider":"custom_provider:llmshare","model":"deepseek-v4.1-flash","usage":{"input":3000,"output":200,"cacheRead":1000,"cacheWrite":0,"totalTokens":4200,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}}"#;
+        // Must use write_mcode_lines (not fs::write) so the file ends with a
+        // trailing newline; otherwise the mcode parser treats the last line
+        // as still being written and skips the whole record.
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[record_without_timestamp.to_string()],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let sync_result = with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2"))
+        });
+        assert!(
+            sync_result.is_ok(),
+            "a missing timestamp must not abort the sync: {sync_result:?}"
+        );
+
+        let date: String = conn
+            .query_row(
+                "SELECT date FROM usage_entries WHERE assistant_type = 'mcode' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(date, "unknown");
 
         let _ = fs::remove_dir_all(root);
     }

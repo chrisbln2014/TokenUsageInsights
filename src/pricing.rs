@@ -11,7 +11,7 @@ pub struct PricingRule {
     pub output_price: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PricingEntry {
     pub model_name: String,
     pub deployment_type: String,
@@ -22,8 +22,49 @@ pub struct PricingEntry {
     pub batch_api_price: String,
 }
 
-pub fn load_pricing_rules() -> Vec<PricingRule> {
-    let mut rules = Vec::new();
+fn fallback_pricing_entries() -> Vec<PricingEntry> {
+    vec![
+        PricingEntry {
+            model_name: "Gemini 3.5 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.50,
+            cache_input_price: 0.375,
+            output_price: 9.00,
+            batch_api_price: "0.75/0.1875/4.50".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 1.5 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.075,
+            cache_input_price: 0.01875,
+            output_price: 0.30,
+            batch_api_price: "0.0375/0.009375/0.15".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 1.5 Pro".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 1.25,
+            cache_input_price: 0.3125,
+            output_price: 5.00,
+            batch_api_price: "0.625/0.15625/2.50".to_string(),
+        },
+        PricingEntry {
+            model_name: "Gemini 2.0 Flash".to_string(),
+            deployment_type: "Google AI".to_string(),
+            unit: "1M Tokens".to_string(),
+            input_price: 0.10,
+            cache_input_price: 0.025,
+            output_price: 0.40,
+            batch_api_price: "0.05/0.0125/0.20".to_string(),
+        },
+    ]
+}
+
+pub fn load_pricing_entries() -> Vec<PricingEntry> {
+    let mut entries = Vec::new();
     let file_path =
         crate::paths::find_resource("pricing.csv").unwrap_or_else(|| PathBuf::from("pricing.csv"));
     if let Ok(file) = File::open(&file_path) {
@@ -36,45 +77,37 @@ pub fn load_pricing_rules() -> Vec<PricingRule> {
                     let input_price = parts[3].trim().parse::<f64>().unwrap_or(0.0);
                     let cache_input_price = parts[4].trim().parse::<f64>().unwrap_or(0.0);
                     let output_price = parts[5].trim().parse::<f64>().unwrap_or(0.0);
-                    rules.push(PricingRule {
+                    entries.push(PricingEntry {
                         model_name: parts[0].trim().to_string(),
+                        deployment_type: parts[1].trim().to_string(),
+                        unit: parts[2].trim().to_string(),
                         input_price,
                         cache_input_price,
                         output_price,
+                        batch_api_price: parts
+                            .get(6)
+                            .map_or_else(|| "N/A".to_string(), |value| value.trim().to_string()),
                     });
                 }
             }
         }
     }
-    if rules.is_empty() {
-        rules = vec![
-            PricingRule {
-                model_name: "Gemini 3.5 Flash".to_string(),
-                input_price: 1.50,
-                cache_input_price: 0.375,
-                output_price: 9.00,
-            },
-            PricingRule {
-                model_name: "Gemini 1.5 Flash".to_string(),
-                input_price: 0.075,
-                cache_input_price: 0.01875,
-                output_price: 0.30,
-            },
-            PricingRule {
-                model_name: "Gemini 1.5 Pro".to_string(),
-                input_price: 1.25,
-                cache_input_price: 0.3125,
-                output_price: 5.00,
-            },
-            PricingRule {
-                model_name: "Gemini 2.0 Flash".to_string(),
-                input_price: 0.10,
-                cache_input_price: 0.025,
-                output_price: 0.40,
-            },
-        ];
+    if entries.is_empty() {
+        return fallback_pricing_entries();
     }
-    rules
+    entries
+}
+
+pub fn load_pricing_rules() -> Vec<PricingRule> {
+    load_pricing_entries()
+        .into_iter()
+        .map(|entry| PricingRule {
+            model_name: entry.model_name,
+            input_price: entry.input_price,
+            cache_input_price: entry.cache_input_price,
+            output_price: entry.output_price,
+        })
+        .collect()
 }
 
 /// 載入價格規則並完成一次性的標籤解析，供大量聚合的 API 重複使用。
@@ -594,6 +627,61 @@ mod tests {
     }
 
     #[test]
+    fn gpt_6_sol_and_luna_context_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for (model_name, input_price, cached_price, output_price) in [
+            ("GPT-6 Sol", 2.00, 0.20, 10.00),
+            ("GPT-6 Sol (<272k)", 2.00, 0.20, 10.00),
+            ("gpt-6-sol", 2.00, 0.20, 10.00),
+            ("GPT-6-Sol", 2.00, 0.20, 10.00),
+            ("GPT-6 Luna", 0.10, 0.01, 0.50),
+            ("GPT-6 Luna (<272k)", 0.10, 0.01, 0.50),
+            ("gpt-6-luna", 0.10, 0.01, 0.50),
+            ("GPT-6-Luna", 0.10, 0.01, 0.50),
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 50_000, 50_000, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (100_000.0 / 1_000_000.0) * input_price
+                + (50_000.0 / 1_000_000.0) * cached_price
+                + (50_000.0 / 1_000_000.0) * output_price;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected short-context cost for {model_name}: {cost}"
+            );
+        }
+
+        for (model_name, input_price, cached_price, output_price) in [
+            ("GPT-6 Sol", 4.00, 0.40, 15.00),
+            ("GPT-6 Sol (>272k)", 4.00, 0.40, 15.00),
+            ("gpt-6-sol", 4.00, 0.40, 15.00),
+            ("GPT-6-Sol", 4.00, 0.40, 15.00),
+            ("GPT-6 Luna", 0.20, 0.02, 0.75),
+            ("GPT-6 Luna (>272k)", 0.20, 0.02, 0.75),
+            ("gpt-6-luna", 0.20, 0.02, 0.75),
+            ("GPT-6-Luna", 0.20, 0.02, 0.75),
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 300_000, 50_000, 50_000, 0, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (300_000.0 / 1_000_000.0) * input_price
+                + (50_000.0 / 1_000_000.0) * cached_price
+                + (50_000.0 / 1_000_000.0) * output_price;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected long-context cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_daybreak_blue_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
@@ -1050,6 +1138,57 @@ mod tests {
             assert!(
                 (long_context - 12.804).abs() < 1e-12,
                 "unexpected long-context cost for {model_name}: {long_context}"
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_grok_47_pricing_uses_context_tiers_and_fast_mode_multiplier() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "grok-4.7",
+            "Grok 4.7 (Low)",
+            "Grok 4.7 (Medium)",
+            "Grok 4.7 (High)",
+            "Grok 4.7 (Extra High)",
+        ] {
+            let short_context =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 1_000_000, 100_000, 0, 0)
+                    .unwrap();
+            let long_context =
+                calculate_usage_cost(&rules, Some(model_name), 201_000, 1_000_000, 0, 0, 0)
+                    .unwrap();
+
+            assert!(
+                (short_context - 6.25).abs() < 1e-12,
+                "unexpected short-context cost for {model_name}: {short_context}"
+            );
+            assert!(
+                (long_context - 12.804).abs() < 1e-12,
+                "unexpected long-context cost for {model_name}: {long_context}"
+            );
+        }
+
+        for model_name in [
+            "grok-4.7-fast",
+            "Grok 4.7 Fast",
+            "Grok 4.7 Fast (Extra High)",
+        ] {
+            let short_context =
+                calculate_usage_cost(&rules, Some(model_name), 100_000, 1_000_000, 100_000, 0, 0)
+                    .unwrap();
+            let long_context =
+                calculate_usage_cost(&rules, Some(model_name), 201_000, 1_000_000, 0, 0, 0)
+                    .unwrap();
+
+            assert!(
+                (short_context - 12.5).abs() < 1e-12,
+                "unexpected short-context fast cost for {model_name}: {short_context}"
+            );
+            assert!(
+                (long_context - 25.608).abs() < 1e-12,
+                "unexpected long-context fast cost for {model_name}: {long_context}"
             );
         }
     }

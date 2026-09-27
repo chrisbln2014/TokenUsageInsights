@@ -1,4 +1,4 @@
-import { parseUsageTimestamp } from './chart-utils.js?v=7';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 function getSessionSortValue(session, sortColumn) {
   const value = session?.[sortColumn];
@@ -20,4 +20,30 @@ export function compareSessionRows(a, b, sortColumn, sortDirection) {
   }
 
   return sortDirection === 'asc' ? comparison : -comparison;
+}
+
+export function matchesSessionIdentity(session, identity) {
+  return sessionIdentityKey(session) === sessionIdentityKey(identity);
+}
+
+export function sessionIdentityKey(session) {
+  return JSON.stringify([
+    session?.assistant_type || '',
+    session?.source_kind || '',
+    session?.source_dir_key || '',
+    session?.session_id || '',
+  ]);
+}
+
+export function parentSessionIdentityKey(session) {
+  if (!session?.parent_session_id) return null;
+  return sessionIdentityKey({
+    ...session,
+    session_id: session.parent_session_id,
+  });
+}
+
+export function filterEntriesBySessionIdentity(entries, sessions) {
+  const sessionKeys = new Set((sessions || []).map(sessionIdentityKey));
+  return (entries || []).filter(entry => sessionKeys.has(sessionIdentityKey(entry)));
 }

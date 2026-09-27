@@ -29,16 +29,17 @@ const HELP_TEXT: &str = r#"Token 戰情室：看板、使用量匯入 / 匯出�
   token-usage-insights update
   token-usage-insights update --check
   token-usage-insights update --force
-  token-usage-insights update --target-version v0.9.9
+  token-usage-insights update --target-version v1.0.0
 
 參數:
   -c, --check                 僅檢查是否有新版本，不進行下載與安裝
   -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
-  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.9）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
 
 共用參數:
-  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse
-                     亦可使用 claude-code / claude_code / claudecode（會正規化為 claude）
+  --agent <name>      助理名稱: antigravity / copilot / codex / claude / cursor / grok / pi / omp / muse / mcode
+                     亦可使用 claude-code / claude_code / claudecode（會正規化為 claude），
+                     或以 minimax-code / minimax_code / mcode 指定 MiniMax Code
 
 匯出:
   token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
@@ -554,7 +555,7 @@ fn print_update_help() {
 參數:
   -c, --check                 僅檢查是否有新版本，不進行下載與安裝
   -f, --force                 強制重新下載並覆蓋現有安裝（即使已是最新版本）
-  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v0.9.9）
+  -v, --target-version <TAG>  指定安裝特定版本標籤（例如 v1.0.0）
   -h, --help                  顯示此說明
 "#
     );
@@ -689,6 +690,8 @@ fn normalize_assistant_name(assistant: &str) -> String {
         "muse" | "muse-code" | "muse_code" | "musecode" | "code-muse" | "code_muse" => {
             "muse".to_string()
         }
+        "mcode" | "minimax-code" | "minimax_code" | "minimaxcode" | "mini-max-code"
+        | "mini_max_code" => "mcode".to_string(),
         _ => normalized,
     }
 }
@@ -712,7 +715,16 @@ fn validate_import_source_assistant(
 fn is_supported_assistant(assistant: &str) -> bool {
     matches!(
         normalize_assistant_name(assistant).as_str(),
-        "antigravity" | "copilot" | "codex" | "claude" | "cursor" | "grok" | "pi" | "omp" | "muse"
+        "antigravity"
+            | "copilot"
+            | "codex"
+            | "claude"
+            | "cursor"
+            | "grok"
+            | "pi"
+            | "omp"
+            | "muse"
+            | "mcode"
     )
 }
 
@@ -766,7 +778,7 @@ fn print_export_help() {
   token-usage-insights export --agent <name> --date YYYY[-MM[-DD]] --out <path>
 
 參數:
-  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp/muse）
+  --agent <name>    助理名稱（antigravity/copilot/codex/claude/cursor/grok/pi/omp/muse/mcode）
   --date <period>     匯出年份、月份或日期
   --out <path>      輸出檔案路徑，不指定則輸出到 stdout
   --help, -h        顯示此說明

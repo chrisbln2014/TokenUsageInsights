@@ -1,11 +1,40 @@
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
+
+mod claude;
+mod codex;
+mod cursor;
+
+use claude::{find_claude_session_files, parse_claude_session_file};
+use codex::{find_codex_session_files, parse_codex_session_file_with_diagnostics};
+pub(crate) use cursor::parse_cursor_timestamp;
+use cursor::sync_cursor_usage_logs;
+
+fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                files.extend(find_jsonl_files(&path));
+            } else if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct TokenStats {
@@ -67,11 +96,30 @@ pub struct UsageEntry {
     pub reasoning_effort: Option<String>,
 }
 
+/// A usage entry together with the assistant and calendar date selected by a
+/// period query. Keeping these values named prevents month/year reporting from
+/// depending on positional tuple conventions.
+#[derive(Debug, Clone)]
+pub struct DatedUsageEntry {
+    pub entry: UsageEntry,
+    pub assistant_type: String,
+    pub date: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct UsageDayExportRecord {
     #[serde(flatten)]
     pub entry: UsageEntry,
     pub import_source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_identity: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageDayRecordWithAssistant {
+    pub record: UsageDayExportRecord,
+    pub assistant_type: String,
+    pub date: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -110,52 +158,76 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-// Claude Code helper structs
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ClaudeUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cache_creation_input_tokens: u64,
-    #[serde(default)]
-    cache_read_input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    cache_creation: ClaudeCacheCreation,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct ClaudeCacheCreation {
-    #[serde(default)]
-    ephemeral_5m_input_tokens: u64,
-    #[serde(default)]
-    ephemeral_1h_input_tokens: u64,
-}
-
-// Codex helper structs shared by the CLI and Desktop session formats.
-#[derive(Debug, Clone, Default, Deserialize)]
-struct CodexTokenUsage {
-    #[serde(default)]
-    input_tokens: u64,
-    #[serde(default)]
-    cached_input_tokens: u64,
-    #[serde(default)]
-    cache_write_input_tokens: u64,
-    #[serde(default)]
-    output_tokens: u64,
-    #[serde(default)]
-    reasoning_output_tokens: u64,
-    #[serde(default)]
-    total_tokens: u64,
-}
-
 const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
+const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
 const CODEX_DESKTOP_SOURCE_KIND: &str = "codex-desktop";
 const CODEX_OTHER_SOURCE_KIND: &str = "codex-other";
 const CODEX_EMPTY_TRANSCRIPT_SYNC_TIME: i64 = -1;
+
+/// Temporary indexes that only the rollout identity migration uses.
+///
+/// The permanent unique indexes are partial (`WHERE source_dir_key IS NULL`),
+/// and SQLite cannot prove that predicate from the migration's correlated
+/// subqueries, so it degraded to scanning every Codex row of the
+/// `assistant_type` for each outer row. The migration therefore builds
+/// non-partial indexes for its own lookups and drops them before committing.
+const CODEX_ROLLOUT_IDENTITY_GUARD_INDEX: &str = "tmp_codex_rollout_identity_guard";
+const CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS tmp_codex_rollout_identity_guard
+     ON usage_entries(assistant_type, source_kind, session_id, turn_no, usage_identity)";
+const CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX: &str = "tmp_codex_rollout_import_identity";
+const CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL: &str =
+    "CREATE INDEX IF NOT EXISTS tmp_codex_rollout_import_identity
+     ON usage_entries(assistant_type, usage_identity, session_id, turn_no)";
+const CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL: &str = "UPDATE usage_entries
+     SET usage_identity = ?
+     WHERE assistant_type = 'codex'
+       AND transcript_path = ?
+       AND usage_identity = ''
+       AND NOT EXISTS (
+            SELECT 1 FROM usage_entries AS marked
+            WHERE marked.id <> usage_entries.id
+              AND marked.assistant_type = usage_entries.assistant_type
+              AND marked.source_kind = usage_entries.source_kind
+              AND marked.session_id = usage_entries.session_id
+              AND marked.turn_no = usage_entries.turn_no
+              AND marked.usage_identity = ?)";
+const CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL: &str = "DELETE FROM usage_entries
+     WHERE assistant_type = 'codex'
+       AND usage_identity = ''
+       AND COALESCE(transcript_path, '') = ''
+       AND import_source_id IS NULL
+       AND import_batch_id IS NULL
+       AND EXISTS (
+            SELECT 1 FROM usage_entries AS tracked
+            WHERE tracked.assistant_type = 'codex'
+              AND tracked.session_id = usage_entries.session_id
+              AND tracked.source_kind = usage_entries.source_kind
+              AND tracked.usage_identity <> ''
+              AND tracked.import_source_id IS NULL
+              AND tracked.import_batch_id IS NULL
+       )";
+const CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL: &str = "DELETE FROM usage_entries
+     WHERE assistant_type = 'codex'
+       AND import_source_id IS NULL
+       AND import_batch_id IS NULL
+       AND usage_identity <> ''
+       AND EXISTS (
+            SELECT 1 FROM usage_entries AS imported
+            WHERE imported.assistant_type = usage_entries.assistant_type
+              AND imported.usage_identity = usage_entries.usage_identity
+              AND imported.session_id = usage_entries.session_id
+              AND imported.turn_no = usage_entries.turn_no
+              AND (imported.import_source_id IS NOT NULL
+                   OR imported.import_batch_id IS NOT NULL)
+       )";
+
+/// Every Codex rollout transcript is named `rollout-<timestamp>-<session>
+/// [_<rollout>].jsonl`. Other files can live in the same directories, so only
+/// this prefix may become a rollout identity.
+const CODEX_ROLLOUT_FILE_PREFIX: &str = "rollout-";
 const COPILOT_SOURCE_KIND_MIGRATION_KEY: &str = "migration:copilot_source_kind_v1";
 
 /// Source kind written for usage entries originating from the Copilot App
@@ -179,7 +251,7 @@ const CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY: &str = "migration:cursor_model_att
 const CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY: &str = "migration:cursor_cache_tokens_unknown_v1";
 const CURSOR_AGENT_SOURCE_KIND: &str = "cursor-agent";
 const CURSOR_IDE_SOURCE_KIND: &str = "cursor-ide";
-const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v7";
+const GROK_PARSER_MIGRATION_KEY: &str = "migration:grok_parser_v8";
 const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
     "migration:grok_parser_v1",
     "migration:grok_model_normalization_v2",
@@ -187,6 +259,7 @@ const LEGACY_GROK_PARSER_MIGRATION_KEYS: &[&str] = &[
     "migration:grok_parser_v4",
     "migration:grok_parser_v5",
     "migration:grok_parser_v6",
+    "migration:grok_parser_v7",
 ];
 
 /// Source kind written for usage entries originating from the Copilot CLI
@@ -369,8 +442,13 @@ fn build_import_token_signature(tokens: &Option<TokenStats>) -> String {
     }
 }
 
-fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &UsageEntry) -> String {
-    let signature = format!(
+fn build_usage_entry_import_source_id(
+    assistant: &str,
+    date: &str,
+    entry: &UsageEntry,
+    usage_identity: Option<&str>,
+) -> String {
+    let mut signature = format!(
         "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         assistant,
         date,
@@ -388,6 +466,20 @@ fn build_usage_entry_import_source_id(assistant: &str, date: &str, entry: &Usage
         build_import_token_signature(&entry.tokens),
         build_import_token_signature(&entry.delta_tokens)
     );
+
+    let source_kind = entry
+        .source_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("legacy");
+    let source_dir_key = entry.source_dir_key.as_deref().unwrap_or_default().trim();
+    let usage_identity = usage_identity.unwrap_or_default().trim();
+    if source_kind != "legacy" || !source_dir_key.is_empty() || !usage_identity.is_empty() {
+        signature.push_str(&format!(
+            "|source_kind={source_kind}|source_dir_key={source_dir_key}|usage_identity={usage_identity}"
+        ));
+    }
     format!("{:016x}", hash_fnv1a_64(&signature))
 }
 
@@ -523,6 +615,33 @@ pub fn get_muse_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+pub fn get_mcode_dir() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("MCODE_DIR") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".minimax").join("v2"))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// MiniMax Code's runtime ledger. It lives beside the session directory but is
+/// resolved independently of `MCODE_DIR` (mirroring
+/// [`get_cursor_state_db_path`]) so a redirected session root does not silently
+/// repoint the ledger.
+pub fn get_mcode_state_db_path() -> PathBuf {
+    if let Some(path) = crate::paths::env_path("MCODE_STATE_DB") {
+        return path;
+    }
+    dirs::home_dir()
+        .map(|home| {
+            home.join(".minimax")
+                .join("v2")
+                .join("sqlite")
+                .join("runtime-state.sqlite")
+        })
+        .unwrap_or_else(|| PathBuf::from("runtime-state.sqlite"))
+}
+
 fn move_file_with_copy_fallback(source: &Path, destination: &Path) -> Result<(), String> {
     if let Err(rename_error) = fs::rename(source, destination) {
         let copied = fs::copy(source, destination).map_err(|copy_error| {
@@ -596,7 +715,7 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS usage_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok', 'pi', 'omp'
+            assistant_type TEXT NOT NULL, -- 'antigravity', 'copilot', 'codex', 'claude', 'cursor', 'grok', 'pi', 'omp', 'muse', 'mcode'
             timestamp TEXT NOT NULL,
             date TEXT NOT NULL,
             session_id TEXT NOT NULL,
@@ -645,6 +764,18 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         [],
     )
     .map_err(|e| format!("建立 usage_entries 表失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS usage_source_directories (
+            assistant_type TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_dir_key TEXT NOT NULL,
+            dir_path BLOB NOT NULL,
+            PRIMARY KEY (assistant_type, source_kind, source_dir_key)
+        )",
+        [],
+    )
+    .map_err(|e| format!("建立 usage_source_directories 表失敗: {e}"))?;
 
     // Ensure reasoning_effort column is present in case database already exists
     let _ = conn.execute(
@@ -817,6 +948,17 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
             e
         )
     })?;
+
+    // Collectors that assign a non-empty usage_identity (Copilot per-model
+    // rows and Codex rollout transcripts) replace their rows by identity, so
+    // the identity lookup must not scan the whole table.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_usage_identity
+         ON usage_entries(assistant_type, usage_identity)
+         WHERE usage_identity <> ''",
+        [],
+    )
+    .map_err(|e| format!("建立來源身分索引 idx_assistant_usage_identity 失敗: {}", e))?;
 
     let _ = conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uidx_assistant_import_source_id ON usage_entries(assistant_type, import_source_id) WHERE import_source_id IS NOT NULL",
@@ -1753,394 +1895,6 @@ fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
-fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_codex_session_files(&path));
-            } else if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
-                files.push(path);
-            }
-        }
-    }
-    files
-}
-
-fn codex_content_to_text(content: &serde_json::Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.replace('\r', "").replace('\n', " ");
-    }
-
-    let mut parts = Vec::new();
-    if let Some(items) = content.as_array() {
-        for item in items {
-            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                "input_text" | "output_text" | "text" => {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.replace('\r', "").replace('\n', " "));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    parts.join(" ")
-}
-
-fn codex_source_kind_from_metadata(payload: &serde_json::Value) -> &'static str {
-    let originator = payload
-        .get("originator")
-        .and_then(|value| value.as_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    if originator.contains("desktop") {
-        return CODEX_DESKTOP_SOURCE_KIND;
-    }
-    if matches!(
-        originator.as_str(),
-        "codex-tui" | "codex_cli_rs" | "codex_exec"
-    ) {
-        return CODEX_CLI_SOURCE_KIND;
-    }
-
-    match payload.get("source").and_then(|value| value.as_str()) {
-        Some("cli" | "exec") => CODEX_CLI_SOURCE_KIND,
-        _ => CODEX_OTHER_SOURCE_KIND,
-    }
-}
-
-fn codex_usage_to_stats(usage: CodexTokenUsage) -> TokenStats {
-    let cache_read = usage.cached_input_tokens;
-    let cache_write = usage.cache_write_input_tokens;
-    let input = usage.input_tokens.saturating_sub(cache_read);
-    let output = usage.output_tokens;
-    let total = if usage.total_tokens > 0 {
-        usage.total_tokens
-    } else {
-        input.saturating_add(cache_read).saturating_add(output)
-    };
-
-    TokenStats {
-        input,
-        output,
-        cache_read: Some(cache_read),
-        cache_write: Some(cache_write),
-        cache_write_5m: None,
-        cache_write_1h: None,
-        reasoning: Some(usage.reasoning_output_tokens),
-        total,
-    }
-}
-
-fn codex_usage_delta_to_stats(
-    previous: Option<&CodexTokenUsage>,
-    current: &CodexTokenUsage,
-) -> TokenStats {
-    let (
-        input_tokens,
-        cached_input_tokens,
-        cache_write_input_tokens,
-        output_tokens,
-        reasoning_output_tokens,
-    ) = match previous {
-        Some(previous)
-            if current.input_tokens >= previous.input_tokens
-                && current.cached_input_tokens >= previous.cached_input_tokens
-                && current.cache_write_input_tokens >= previous.cache_write_input_tokens
-                && current.output_tokens >= previous.output_tokens
-                && current.reasoning_output_tokens >= previous.reasoning_output_tokens =>
-        {
-            (
-                current.input_tokens - previous.input_tokens,
-                current.cached_input_tokens - previous.cached_input_tokens,
-                current.cache_write_input_tokens - previous.cache_write_input_tokens,
-                current.output_tokens - previous.output_tokens,
-                current.reasoning_output_tokens - previous.reasoning_output_tokens,
-            )
-        }
-        _ => (
-            current.input_tokens,
-            current.cached_input_tokens,
-            current.cache_write_input_tokens,
-            current.output_tokens,
-            current.reasoning_output_tokens,
-        ),
-    };
-
-    let cache_read = cached_input_tokens;
-    let cache_write = cache_write_input_tokens;
-    let input = input_tokens.saturating_sub(cache_read);
-    let output = output_tokens;
-    let total = input_tokens.saturating_add(output);
-
-    TokenStats {
-        input,
-        output,
-        cache_read: Some(cache_read),
-        cache_write: Some(cache_write),
-        cache_write_5m: None,
-        cache_write_1h: None,
-        reasoning: Some(reasoning_output_tokens),
-        total,
-    }
-}
-
-fn parse_codex_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
-    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
-    let reader = BufReader::new(file);
-    let fallback_session_id = filepath
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("unknown-session")
-        .trim_start_matches("rollout-")
-        .to_string();
-
-    let mut events = Vec::new();
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-            events.push(event);
-        }
-    }
-
-    let mut session_id = fallback_session_id.clone();
-    let mut session_name_selector = InitialUserPromptSelector::default();
-    let mut session_cwd: Option<String> = None;
-    let mut session_version: Option<String> = None;
-    let mut parent_session_id: Option<String> = None;
-    let mut agent_nickname: Option<String> = None;
-    let mut agent_role: Option<String> = None;
-    let mut current_model = "GPT-5.3-Codex".to_string();
-    let mut reasoning_effort: Option<String> = None;
-    let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
-    let mut session_identity_locked = false;
-
-    for event in &events {
-        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let payload = match event.get("payload") {
-            Some(payload) => payload,
-            None => continue,
-        };
-        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        if event_type == "session_meta" {
-            let detected_source_kind = codex_source_kind_from_metadata(payload);
-            if source_kind == CODEX_OTHER_SOURCE_KIND
-                || detected_source_kind == CODEX_DESKTOP_SOURCE_KIND
-            {
-                source_kind = detected_source_kind.to_string();
-            }
-            if !session_identity_locked {
-                if let Some(id) = payload
-                    .get("id")
-                    .and_then(|id| id.as_str())
-                    .filter(|id| !id.is_empty())
-                    .or_else(|| {
-                        payload
-                            .get("session_id")
-                            .and_then(|id| id.as_str())
-                            .filter(|id| !id.is_empty())
-                    })
-                {
-                    session_id = id.to_string();
-                    session_identity_locked = true;
-                }
-            }
-            session_cwd = payload
-                .get("cwd")
-                .and_then(|cwd| cwd.as_str())
-                .map(|cwd| cwd.to_string())
-                .or(session_cwd);
-            session_version = payload
-                .get("cli_version")
-                .and_then(|version| version.as_str())
-                .map(|version| version.to_string())
-                .or(session_version);
-            parent_session_id = payload
-                .get("parent_thread_id")
-                .and_then(|id| id.as_str())
-                .map(|id| id.to_string())
-                .or(parent_session_id);
-            agent_nickname = payload
-                .get("agent_nickname")
-                .and_then(|name| name.as_str())
-                .map(|name| name.to_string())
-                .or(agent_nickname);
-            agent_role = payload
-                .get("agent_role")
-                .and_then(|role| role.as_str())
-                .map(|role| role.to_string())
-                .or(agent_role);
-            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
-                current_model = model.to_string();
-            }
-        } else if event_type == "turn_context" {
-            session_cwd = payload
-                .get("cwd")
-                .and_then(|cwd| cwd.as_str())
-                .map(|cwd| cwd.to_string())
-                .or(session_cwd);
-            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
-                current_model = model.to_string();
-            }
-            reasoning_effort = payload
-                .get("effort")
-                .or_else(|| payload.get("reasoning_effort"))
-                .and_then(|effort| effort.as_str())
-                .map(|effort| effort.to_string())
-                .or(reasoning_effort);
-        }
-
-        match (event_type, payload_type) {
-            ("event_msg", "user_message") => {
-                if let Some(message) = payload.get("message").and_then(|message| message.as_str()) {
-                    session_name_selector.observe_user_prompt(message);
-                }
-            }
-            ("response_item", "message")
-                if payload.get("role").and_then(|role| role.as_str()) == Some("user") =>
-            {
-                if let Some(content) = payload.get("content") {
-                    session_name_selector.observe_user_prompt(&codex_content_to_text(content));
-                }
-            }
-            ("event_msg", "agent_message")
-            | ("response_item", "function_call" | "function_call_output") => {
-                session_name_selector.observe_non_user_message();
-            }
-            ("response_item", "message")
-                if payload.get("role").and_then(|role| role.as_str()) == Some("assistant") =>
-            {
-                session_name_selector.observe_non_user_message();
-            }
-            _ => {}
-        }
-    }
-
-    let session_name = session_name_selector.into_name();
-    let completed_task_duration_ms = events
-        .iter()
-        .filter_map(|event| {
-            if event.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-                return None;
-            }
-            let payload = event.get("payload")?;
-            if payload.get("type").and_then(|value| value.as_str()) != Some("task_complete") {
-                return None;
-            }
-            payload.get("duration_ms").and_then(|value| value.as_u64())
-        })
-        .fold(None::<u64>, |total, duration_ms| {
-            Some(total.unwrap_or_default().saturating_add(duration_ms))
-        });
-
-    if parent_session_id.as_deref() == Some(session_id.as_str()) {
-        parent_session_id = None;
-    }
-
-    let mut results = Vec::new();
-    let mut model_for_turn = current_model.clone();
-    let mut effort_for_turn = reasoning_effort.clone();
-    let mut previous_total_usage: Option<CodexTokenUsage> = None;
-
-    for event in events {
-        let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        let timestamp = event
-            .get("timestamp")
-            .and_then(|timestamp| timestamp.as_str())
-            .unwrap_or("")
-            .to_string();
-        let payload = match event.get("payload") {
-            Some(payload) => payload,
-            None => continue,
-        };
-        let payload_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
-
-        if event_type == "turn_context" {
-            if let Some(model) = payload.get("model").and_then(|model| model.as_str()) {
-                model_for_turn = model.to_string();
-            }
-            effort_for_turn = payload
-                .get("effort")
-                .or_else(|| payload.get("reasoning_effort"))
-                .and_then(|effort| effort.as_str())
-                .map(|effort| effort.to_string())
-                .or(effort_for_turn);
-            continue;
-        }
-
-        if event_type != "event_msg" || payload_type != "token_count" {
-            continue;
-        }
-
-        let info = match payload.get("info") {
-            Some(info) => info,
-            None => continue,
-        };
-        let total_usage = match info
-            .get("total_token_usage")
-            .cloned()
-            .and_then(|value| serde_json::from_value::<CodexTokenUsage>(value).ok())
-        {
-            Some(usage) => usage,
-            None => continue,
-        };
-        let delta_tokens = codex_usage_delta_to_stats(previous_total_usage.as_ref(), &total_usage);
-        previous_total_usage = Some(total_usage.clone());
-
-        let context = info
-            .get("model_context_window")
-            .and_then(|window| window.as_u64())
-            .map(|window| ContextStats {
-                current_context_tokens: None,
-                displayed_context_limit: Some(window),
-                current_context_used_percentage: None,
-            });
-
-        results.push(UsageEntry {
-            timestamp,
-            session_id: session_id.clone(),
-            session_name: session_name
-                .clone()
-                .or_else(|| Some(fallback_session_id.clone())),
-            transcript_path: Some(filepath.to_string_lossy().into_owned()),
-            cwd: session_cwd.clone(),
-            version: session_version.clone(),
-            turn_no: (results.len() + 1) as u32,
-            model: Some(model_for_turn.clone()),
-            model_id: Some(model_for_turn.clone()),
-            tokens: Some(codex_usage_to_stats(total_usage)),
-            delta_tokens: Some(delta_tokens),
-            context,
-            cost: completed_task_duration_ms.map(|duration_ms| CostStats {
-                total_api_duration_ms: Some(duration_ms as f64),
-                total_duration_ms: None,
-                total_premium_requests: None,
-                reported_cost_usd: None,
-            }),
-            source_kind: Some(source_kind.clone()),
-            source_dir_key: None,
-            parent_session_id: parent_session_id.clone(),
-            agent_nickname: agent_nickname.clone(),
-            agent_role: agent_role.clone(),
-            reasoning_effort: effort_for_turn.clone(),
-        });
-    }
-
-    Ok(results)
-}
-
 fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
     let parser_migration_done: bool = conn
         .query_row(
@@ -2216,6 +1970,109 @@ fn run_codex_source_kind_migration(conn: &mut Connection) -> Result<(), String> 
         .map_err(|error| format!("Codex 來源分類遷移 COMMIT 失敗: {error}"))
 }
 
+/// Attach every stored Codex row to the rollout transcript it came from.
+///
+/// Rows written before rollout identities existed could only be matched by
+/// `transcript_path`, which changes as soon as Codex moves a session between
+/// `sessions` and `archived_sessions`. Backfilling the identity keeps those
+/// rows attached to their rollout while the sync rewrites them.
+fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), String> {
+    let migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
+            params![CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if migration_done {
+        return Ok(());
+    }
+
+    let untracked_paths = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND usage_identity = ''
+                   AND transcript_path IS NOT NULL",
+            )
+            .map_err(|error| format!("準備讀取未標記 Codex transcript 失敗: {error}"))?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("讀取未標記 Codex transcript 失敗: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("解析未標記 Codex transcript 失敗: {error}"))?
+    };
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Codex rollout 身分遷移 BEGIN 失敗: {error}"))?;
+
+    // The correlated guards below only reach the temporary indexes; without
+    // them a large `usage_entries` table turns this migration into one scan of
+    // every Codex row per outer row.
+    for create_index_sql in [
+        CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL,
+        CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL,
+    ] {
+        tx.execute(create_index_sql, [])
+            .map_err(|error| format!("建立 Codex rollout 身分遷移索引失敗: {error}"))?;
+    }
+
+    for stored_path in untracked_paths {
+        let Some(identity) = codex_rollout_identity(&stored_path) else {
+            continue;
+        };
+        // Imported rows are marked as well: without an identity an older import
+        // would no longer match the locally synced rows of the same rollout and
+        // the same turn would be counted twice. The `NOT EXISTS` guard keeps a
+        // row that would collide with an already marked row untouched instead of
+        // failing the whole migration.
+        tx.execute(
+            CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL,
+            params![identity, stored_path, identity],
+        )
+        .map_err(|error| format!("標記 Codex rollout 身分失敗: {error}"))?;
+    }
+
+    // Rows without a transcript path cannot belong to any transcript, so a
+    // session that is tracked by a rollout transcript of the same source
+    // supersedes them. The source kind is part of the session identity, so a
+    // tracked rollout of another source kind says nothing about these rows.
+    // Imported rows are excluded from both sides: they are keyed by
+    // `import_source_id`, have no local transcript, and must stay until the
+    // import is rolled back.
+    tx.execute(CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL, [])
+        .map_err(|error| format!("清除未追蹤的 Codex 舊資料失敗: {error}"))?;
+
+    // Imports own their turns, so a locally stored row that duplicates an
+    // imported row of the same rollout, session and turn disappears once both
+    // rows carry the identity. This resolves the duplicates that older releases
+    // left behind when an imported row and a locally synced row of the same turn
+    // disagreed about the source kind and therefore never collided.
+    tx.execute(CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL, [])
+        .map_err(|error| format!("清除與匯入重複的 Codex 資料失敗: {error}"))?;
+
+    for drop_index_sql in [
+        format!("DROP INDEX IF EXISTS {CODEX_ROLLOUT_IDENTITY_GUARD_INDEX}"),
+        format!("DROP INDEX IF EXISTS {CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX}"),
+    ] {
+        tx.execute(&drop_index_sql, [])
+            .map_err(|error| format!("移除 Codex rollout 身分遷移索引失敗: {error}"))?;
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+         VALUES (?, 1, 0)",
+        params![CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY],
+    )
+    .map_err(|error| format!("記錄 Codex rollout 身分遷移失敗: {error}"))?;
+    tx.commit()
+        .map_err(|error| format!("Codex rollout 身分遷移 COMMIT 失敗: {error}"))
+}
+
 fn portable_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -2223,6 +2080,96 @@ fn portable_relative_path(root: &Path, path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn register_usage_source_directory(
+    conn: &Connection,
+    assistant: &str,
+    source_kind: &str,
+    source_dir_key: &str,
+    directory: &Path,
+) -> Result<(), String> {
+    let encoded_directory = encode_registered_path(directory);
+    conn.execute(
+        "INSERT INTO usage_source_directories (
+            assistant_type, source_kind, source_dir_key, dir_path
+         ) VALUES (?, ?, ?, ?)
+         ON CONFLICT(assistant_type, source_kind, source_dir_key)
+         DO UPDATE SET dir_path = excluded.dir_path",
+        params![assistant, source_kind, source_dir_key, encoded_directory,],
+    )
+    .map_err(|error| format!("記錄使用量來源目錄失敗: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn get_usage_source_directory(
+    conn: &Connection,
+    assistant: &str,
+    source_kind: &str,
+    source_dir_key: &str,
+) -> Result<Option<PathBuf>, String> {
+    let encoded = conn
+        .query_row(
+            "SELECT dir_path
+         FROM usage_source_directories
+         WHERE assistant_type = ? AND source_kind = ? AND source_dir_key = ?",
+            params![assistant, source_kind, source_dir_key],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("查詢使用量來源目錄失敗: {error}"))?;
+    encoded
+        .map(|bytes| {
+            decode_registered_path(bytes)
+                .ok_or_else(|| "已登錄的使用量來源目錄格式無效".to_string())
+        })
+        .transpose()
+}
+
+#[cfg(unix)]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(unix)]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+#[cfg(windows)]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(windows)]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        return None;
+    }
+    let path = std::ffi::OsString::from_wide(
+        &chunks
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>(),
+    );
+    Some(PathBuf::from(path))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn encode_registered_path(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
+    String::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 /// Sync token usage from the Copilot App (Tauri desktop application).
@@ -2256,6 +2203,13 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
     let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
+    register_usage_source_directory(
+        conn,
+        "copilot",
+        COPILOT_APP_SOURCE_KIND,
+        &source_key,
+        &canonical_app_dir,
+    )?;
     let cursor_key_prefix = format!("{}{}::", COPILOT_APP_CURSOR_PREFIX, source_key);
 
     // `data.db.sessions` is the authoritative registry for Copilot App
@@ -3919,12 +3873,19 @@ fn group_codex_transcript_paths(
     grouped_paths
 }
 
+/// Stored transcript paths of the local Codex rows, grouped by their normalized
+/// spelling. Imported rows are excluded: they carry the path of the machine the
+/// export came from and are owned by the import batch, so they must not make a
+/// local transcript look like it is already stored.
 fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<String>>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT DISTINCT transcript_path
              FROM usage_entries
-             WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL",
+             WHERE assistant_type = 'codex'
+               AND transcript_path IS NOT NULL
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
         )
         .map_err(|error| format!("準備讀取 Codex transcript 路徑失敗: {error}"))?;
     let rows = stmt
@@ -3936,6 +3897,199 @@ fn load_codex_transcript_paths(conn: &Connection) -> Result<HashMap<String, Vec<
         paths.push(path);
     }
     Ok(group_codex_transcript_paths(paths, cfg!(windows)))
+}
+
+/// Stable identity of one Codex rollout transcript.
+///
+/// Codex writes every transcript as
+/// `rollout-<timestamp>-<session>[_<rollout>].jsonl` and keeps that file name
+/// when it moves a session from `sessions` to `archived_sessions`. The file
+/// name therefore identifies one transcript across directory moves, keeps
+/// continuation segments of one session apart, and collapses copied
+/// transcripts of the same rollout into a single identity.
+///
+/// Only that documented prefix yields an identity. Other `.jsonl` files can
+/// live in the Codex directories, and an imported row can carry a path from
+/// another machine, so adopting them as rollouts would let a later local file
+/// with the same name purge unrelated rows.
+fn codex_rollout_identity(path: &str) -> Option<String> {
+    let file_name = path.rsplit(['/', '\\']).next()?;
+    let (stem, extension) = file_name.rsplit_once('.')?;
+
+    // Codex always writes rollouts as `.jsonl`, so another extension (or none)
+    // can only come from an unrelated file that happens to share the name.
+    if !extension.eq_ignore_ascii_case("jsonl") {
+        return None;
+    }
+
+    let stem = stem.trim();
+
+    if !stem.starts_with(CODEX_ROLLOUT_FILE_PREFIX) {
+        return None;
+    }
+
+    Some(format!("rollout={stem}"))
+}
+
+/// One Codex transcript file together with the identity of its file name.
+#[derive(Debug, Clone)]
+struct CodexTranscript {
+    path: PathBuf,
+    identity: String,
+    size: u64,
+}
+
+fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
+    let mut transcripts = Vec::new();
+
+    for filepath in find_codex_session_files(dir) {
+        let Ok(metadata) = fs::metadata(&filepath) else {
+            continue;
+        };
+        let Some(identity) = codex_rollout_identity(&filepath.to_string_lossy()) else {
+            continue;
+        };
+
+        transcripts.push(CodexTranscript {
+            path: filepath,
+            identity,
+            size: metadata.len(),
+        });
+    }
+
+    transcripts
+}
+
+/// Rank transcripts that share one rollout identity so that the most complete
+/// copy wins: more content first, then the live `sessions` directory (Codex
+/// only moves a transcript to `archived_sessions` once it stops appending to
+/// it), and finally the path so the choice never depends on directory order.
+fn codex_transcript_canonical_rank(
+    sessions_dir: &Path,
+    transcript: &CodexTranscript,
+) -> (u64, bool, String) {
+    (
+        transcript.size,
+        transcript.path.starts_with(sessions_dir),
+        transcript.path.to_string_lossy().into_owned(),
+    )
+}
+
+/// Highest ranked copy of a rollout that parses completely *and* covers more
+/// turns than the canonical transcript could provide, or `None` when no copy can
+/// stand in for the canonical file.
+fn usable_codex_duplicate<'a>(
+    sessions_dir: &Path,
+    duplicates: &'a [CodexTranscript],
+    canonical_entries: usize,
+) -> Option<&'a CodexTranscript> {
+    duplicates
+        .iter()
+        .filter(|duplicate| {
+            matches!(
+                parse_codex_session_file_with_diagnostics(&duplicate.path),
+                Ok(parsed) if parsed.malformed_lines == 0
+                    && parsed.entries.len() > canonical_entries
+            )
+        })
+        .max_by_key(|duplicate| codex_transcript_canonical_rank(sessions_dir, duplicate))
+}
+
+/// Stored transcript path spellings whose rows must disappear once the
+/// canonical copy of a rollout has been written.
+fn stale_codex_copy_paths(
+    transcript_paths: &HashMap<String, Vec<String>>,
+    duplicates: &[CodexTranscript],
+) -> Vec<String> {
+    let mut stale_paths: Vec<String> = Vec::new();
+
+    for duplicate in duplicates {
+        let key = codex_transcript_path_key(&duplicate.path.to_string_lossy());
+        let Some(stored_paths) = transcript_paths.get(&key) else {
+            continue;
+        };
+
+        for stored_path in stored_paths {
+            if !stale_paths.contains(stored_path) {
+                stale_paths.push(stored_path.clone());
+            }
+        }
+    }
+
+    stale_paths
+}
+
+/// Drop the rows of rollout copies that lost the canonical choice. Imported
+/// rows are kept: they belong to the import batch, not to the local copy.
+fn remove_stale_codex_copy_rows(
+    tx: &rusqlite::Transaction<'_>,
+    stale_copy_paths: &[String],
+) -> Result<(), String> {
+    for stale_path in stale_copy_paths {
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'codex'
+               AND transcript_path = ?
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
+            params![stale_path],
+        )
+        .map_err(|error| format!("清除重複 Codex transcript 資料失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
+/// Remove every row of one rollout before its transcript is rewritten: rows
+/// carrying the rollout identity (written from another location or by an older
+/// parser), rows stored under a previous spelling of the path, rows of copies
+/// that lost the canonical choice, and rows written before rollout identities
+/// existed. Imported rows are excluded everywhere so a local transcript never
+/// deletes data that belongs to an import batch.
+fn purge_codex_transcript_rows(
+    tx: &rusqlite::Transaction<'_>,
+    identity: &str,
+    transcript_path: &str,
+    known_transcript_paths: Option<&Vec<String>>,
+    stale_copy_paths: &[String],
+) -> Result<(), String> {
+    // `usage_identity <> ''` keeps the partial identity index usable.
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex'
+           AND usage_identity <> ''
+           AND usage_identity = ?
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
+        params![identity],
+    )
+    .map_err(|error| format!("清空舊 Codex rollout 資料失敗: {error}"))?;
+
+    for existing_path in known_transcript_paths.into_iter().flatten() {
+        tx.execute(
+            "DELETE FROM usage_entries
+             WHERE assistant_type = 'codex'
+               AND transcript_path = ?
+               AND import_source_id IS NULL
+               AND import_batch_id IS NULL",
+            params![existing_path],
+        )
+        .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
+    }
+
+    remove_stale_codex_copy_rows(tx, stale_copy_paths)?;
+
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = 'codex'
+           AND transcript_path = ?
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
+        params![transcript_path],
+    )
+    .map_err(|error| format!("清空舊 Codex transcript 資料失敗: {error}"))?;
+
+    Ok(())
 }
 
 fn codex_transcript_needs_sync(
@@ -3957,396 +4111,327 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
+    run_codex_rollout_identity_migration(conn)?;
 
-    let mut files = Vec::new();
-    for directory in [
-        codex_dir.join("sessions"),
-        codex_dir.join("archived_sessions"),
-    ] {
-        files.extend(find_codex_session_files(&directory));
-    }
-    files.sort();
+    let sessions_dir = codex_dir.join("sessions");
+    let mut transcripts = collect_codex_transcripts(&sessions_dir);
+    transcripts.extend(collect_codex_transcripts(
+        &codex_dir.join("archived_sessions"),
+    ));
 
-    if files.is_empty() {
+    if transcripts.is_empty() {
         return Ok(());
+    }
+
+    transcripts.sort_by(|left, right| left.path.cmp(&right.path));
+
+    // Codex keeps the transcript file name when a session moves between
+    // `sessions` and `archived_sessions`, so one file name identifies one
+    // rollout across moves. Copies of the same rollout share an identity and
+    // are synced once, while continuation segments of one session keep their
+    // own identities and stay side by side instead of deleting each other on
+    // every sync pass.
+    let mut transcripts_by_identity: BTreeMap<String, Vec<CodexTranscript>> = BTreeMap::new();
+    for transcript in transcripts {
+        transcripts_by_identity
+            .entry(transcript.identity.clone())
+            .or_default()
+            .push(transcript);
     }
 
     let transcript_paths = load_codex_transcript_paths(conn)?;
 
-    for filepath in files {
-        let state_path = portable_relative_path(&codex_dir, &filepath);
-        let state_key = format!("codex:{}", state_path);
-
-        let last_synced_state: Option<(u64, i64)> = conn
-            .query_row(
-                "SELECT last_synced_size, last_synced_time
-                 FROM sync_state
-                 WHERE filename = ?",
-                params![state_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
+    for (identity, group) in transcripts_by_identity {
+        let Some(canonical) = group
+            .iter()
+            .max_by_key(|transcript| codex_transcript_canonical_rank(&sessions_dir, transcript))
+            .cloned()
+        else {
+            continue;
         };
-        let current_size = metadata.len();
-        let transcript_path = filepath.to_string_lossy().into_owned();
-        let transcript_path_key = codex_transcript_path_key(&transcript_path);
-        let known_transcript_paths = transcript_paths.get(&transcript_path_key);
-        let transcript_is_current = known_transcript_paths.is_some();
 
-        if codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
-            let parsed_entries = match parse_codex_session_file(&filepath) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", filepath, e);
-                    continue;
-                }
-            };
+        // Copies of the same rollout are dropped inside the canonical write's
+        // transaction, so a reader never observes the rollout without rows and
+        // a failed or empty canonical file leaves the copies intact.
+        let duplicates: Vec<CodexTranscript> = group
+            .iter()
+            .filter(|entry| entry.path != canonical.path)
+            .cloned()
+            .collect();
 
-            if parsed_entries.is_empty() {
-                conn.execute(
-                    "INSERT OR REPLACE INTO sync_state
-                     (filename, last_synced_size, last_synced_time)
-                     VALUES (?, ?, ?)",
-                    params![
-                        state_key,
-                        current_size as i64,
-                        CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
-                    ],
-                )
-                .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
-                continue;
-            }
-
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
-
-            if let Some(existing_paths) = known_transcript_paths {
-                for existing_path in existing_paths {
-                    tx.execute(
-                        "DELETE FROM usage_entries
-                         WHERE assistant_type = 'codex' AND transcript_path = ?",
-                        params![existing_path],
-                    )
-                    .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
-                }
-            } else {
-                tx.execute(
-                    "DELETE FROM usage_entries
-                     WHERE assistant_type = 'codex' AND transcript_path = ?",
-                    params![transcript_path],
-                )
-                .map_err(|e| format!("清空舊 Codex transcript 資料失敗: {}", e))?;
-            }
-
-            let session_ids: HashSet<String> = parsed_entries
-                .iter()
-                .map(|entry| entry.session_id.clone())
-                .collect();
-            for session_id in session_ids {
-                tx.execute(
-                    "DELETE FROM usage_entries WHERE assistant_type = 'codex' AND session_id = ?",
-                    params![session_id],
-                )
-                .map_err(|e| format!("清空舊 Codex Session 資料失敗: {}", e))?;
-            }
-
-            let mut success = true;
-            for entry in &parsed_entries {
-                let tokens = entry.tokens.as_ref();
-                let delta = entry.delta_tokens.as_ref();
-                let cost = entry.cost.as_ref();
-
-                let insert_res = tx.execute(
-                    "INSERT INTO usage_entries (
-                        assistant_type, source_kind, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        "codex",
-                        entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
-                        entry.timestamp,
-                        local_date_from_timestamp(&entry.timestamp),
-                        entry.session_id,
-                        entry.session_name.as_deref(),
-                        entry.transcript_path.as_deref(),
-                        entry.cwd.as_deref(),
-                        entry.version.as_deref(),
-                        entry.turn_no as i64,
-                        entry.model.as_deref(),
-                        entry.model_id.as_deref(),
-                        tokens.map(|t| t.input as i64),
-                        tokens.map(|t| t.output as i64),
-                        tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        tokens.map(|t| t.total as i64),
-                        delta.map(|t| t.input as i64),
-                        delta.map(|t| t.output as i64),
-                        delta.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        delta.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        delta.map(|t| t.total as i64),
-                        cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
-                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                        entry.parent_session_id.as_deref(),
-                        entry.agent_nickname.as_deref(),
-                        entry.agent_role.as_deref(),
-                        entry.reasoning_effort.as_deref()
-                    ],
-                );
-
-                if let Err(e) = insert_res {
-                    eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
-                    success = false;
-                    break;
-                }
-            }
-
-            if success {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-
-                let update_state_res = tx.execute(
-                    "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-                    params![state_key, current_size as i64, now],
-                );
-
-                if update_state_res.is_ok() {
-                    if let Err(e) = tx.commit() {
-                        eprintln!("Transaction COMMIT 失敗: {}", e);
-                    }
-                }
-            }
-        }
+        sync_codex_transcript(
+            conn,
+            &codex_dir,
+            &identity,
+            &canonical,
+            &transcript_paths,
+            &duplicates,
+            true,
+        )?;
     }
 
     Ok(())
 }
 
-fn find_claude_session_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_claude_session_files(&path));
-            } else if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
-                files.push(path);
-            }
+/// Sync one Codex rollout transcript, replacing every row of that rollout.
+fn sync_codex_transcript(
+    conn: &mut Connection,
+    codex_dir: &Path,
+    identity: &str,
+    transcript: &CodexTranscript,
+    transcript_paths: &HashMap<String, Vec<String>>,
+    duplicates: &[CodexTranscript],
+    allow_fallback: bool,
+) -> Result<(), String> {
+    let state_path = portable_relative_path(codex_dir, &transcript.path);
+    let state_key = format!("codex:{}", state_path);
+
+    let last_synced_state: Option<(u64, i64)> = conn
+        .query_row(
+            "SELECT last_synced_size, last_synced_time
+             FROM sync_state
+             WHERE filename = ?",
+            params![state_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .ok();
+
+    let current_size = transcript.size;
+    let transcript_path = transcript.path.to_string_lossy().into_owned();
+    let transcript_path_key = codex_transcript_path_key(&transcript_path);
+    let known_transcript_paths = transcript_paths.get(&transcript_path_key);
+    let transcript_is_current = known_transcript_paths.is_some();
+    let stale_copy_paths = stale_codex_copy_paths(transcript_paths, duplicates);
+    // The empty marker also covers transcripts that only parsed partially, so a
+    // state that carries it must never justify dropping the copies: the rows
+    // stored for them may be the only complete record of the rollout.
+    let state_is_complete = !matches!(
+        last_synced_state,
+        Some((_, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME))
+    );
+
+    if !codex_transcript_needs_sync(current_size, last_synced_state, transcript_is_current) {
+        // The canonical transcript is already stored, so copies that were
+        // synced before it won the canonical choice can be dropped safely.
+        if transcript_is_current && state_is_complete && !stale_copy_paths.is_empty() {
+            let tx = conn
+                .transaction()
+                .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
+            remove_stale_codex_copy_rows(&tx, &stale_copy_paths)?;
+            tx.commit()
+                .map_err(|error| format!("Transaction COMMIT 失敗: {error}"))?;
+        }
+        return Ok(());
+    }
+
+    let parsed = parse_codex_session_file_with_diagnostics(&transcript.path);
+
+    if let Err(error) = &parsed {
+        eprintln!("解析 Codex 會話檔案 {:?} 失敗: {}", transcript.path, error);
+    }
+
+    let parsed_completely = matches!(&parsed, Ok(parsed) if parsed.malformed_lines == 0);
+    let has_usage = matches!(&parsed, Ok(parsed) if !parsed.entries.is_empty());
+
+    // The canonical choice prefers the longest file, which can be a transcript
+    // that is still being written or is damaged, while a copy of it still holds
+    // the complete usage. With no local rows stored yet there is nothing to
+    // protect, so the usage is taken from the copy that parses cleanly and covers
+    // more turns instead of recording the rollout as incomplete.
+    if allow_fallback && !transcript_is_current && (!has_usage || !parsed_completely) {
+        let canonical_entries = match &parsed {
+            Ok(parsed) => parsed.entries.len(),
+            Err(_) => 0,
+        };
+        let sessions_dir = codex_dir.join("sessions");
+        if let Some(fallback) = usable_codex_duplicate(&sessions_dir, duplicates, canonical_entries)
+        {
+            let remaining: Vec<CodexTranscript> = duplicates
+                .iter()
+                .filter(|duplicate| duplicate.path != fallback.path)
+                .cloned()
+                .collect();
+            return sync_codex_transcript(
+                conn,
+                codex_dir,
+                identity,
+                fallback,
+                transcript_paths,
+                &remaining,
+                false,
+            );
         }
     }
-    files
-}
 
-fn claude_content_to_text(content: &serde_json::Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.replace('\r', "").replace('\n', " ");
+    let parsed = match parsed {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(()),
+    };
+
+    if parsed.entries.is_empty() {
+        // The rollout has no usage yet, so existing rows (including copies)
+        // stay until the transcript carries data.
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_state
+             (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![
+                state_key,
+                current_size as i64,
+                CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+            ],
+        )
+        .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
+        return Ok(());
     }
 
-    let mut parts = Vec::new();
-    if let Some(items) = content.as_array() {
-        for item in items {
-            match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                "text" => {
-                    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.replace('\r', "").replace('\n', " "));
-                    }
-                }
-                "tool_result" => {
-                    if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
-                        parts.push(text.replace('\r', "").replace('\n', " "));
-                    }
-                }
-                _ => {}
-            }
-        }
+    // A transcript with unreadable lines was caught mid-write or is damaged, so
+    // the parsed entries may be a prefix of the real usage. Replacing the stored
+    // rows in that state would drop the turns that only the other copies still
+    // hold, so the parsed entries are added without clearing anything.
+    let parsed_completely = parsed.malformed_lines == 0;
+
+    let tx = conn
+        .transaction()
+        .map_err(|error| format!("Transaction BEGIN 失敗: {error}"))?;
+
+    if parsed_completely {
+        purge_codex_transcript_rows(
+            &tx,
+            identity,
+            &transcript_path,
+            known_transcript_paths,
+            &stale_copy_paths,
+        )?;
     }
-    parts.join(" ")
-}
 
-fn parse_claude_session_file(filepath: &Path) -> Result<Vec<UsageEntry>, String> {
-    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
-    let reader = BufReader::new(file);
-    let fallback_session_id = filepath
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("unknown-session")
-        .to_string();
+    let mut success = true;
+    let mut wrote_local_rows = false;
+    // Turns this rollout already covers through an import batch must not be
+    // written again by the local parse. The check ignores the source kind: an
+    // import created before the rollout existed locally keeps its `legacy` kind,
+    // and the purge above only ever removes local rows, so a surviving row of
+    // this identity belongs to an import that owns its turn. `usage_identity <> ''`
+    // keeps the partial identity index usable.
+    let imported_turns: HashSet<i64> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND usage_identity <> ''
+                   AND usage_identity = ?
+                   AND (import_source_id IS NOT NULL OR import_batch_id IS NOT NULL)",
+            )
+            .map_err(|error| format!("準備讀取 Codex 匯入回合失敗: {error}"))?;
+        let rows = stmt
+            .query_map(params![identity], |row| row.get::<_, i64>(0))
+            .map_err(|error| format!("讀取 Codex 匯入回合失敗: {error}"))?;
+        rows.collect::<Result<HashSet<_>, _>>()
+            .map_err(|error| format!("解析 Codex 匯入回合失敗: {error}"))?
+    };
 
-    let mut session_name_selector = InitialUserPromptSelector::default();
-    let mut session_cwd: Option<String> = None;
-    let mut session_version: Option<String> = None;
-    let mut seen_response_keys = HashSet::new();
-    let mut results = Vec::new();
+    for entry in &parsed.entries {
+        let tokens = entry.tokens.as_ref();
+        let delta = entry.delta_tokens.as_ref();
+        let cost = entry.cost.as_ref();
 
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-        let event: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        if session_cwd.is_none() {
-            session_cwd = event
-                .get("cwd")
-                .and_then(|cwd| cwd.as_str())
-                .map(|cwd| cwd.to_string());
-        }
-        if session_version.is_none() {
-            session_version = event
-                .get("version")
-                .and_then(|version| version.as_str())
-                .map(|version| version.to_string());
-        }
-
-        let message = match event.get("message") {
-            Some(message) => message,
-            None => continue,
-        };
-        let role = message
-            .get("role")
-            .and_then(|role| role.as_str())
-            .unwrap_or("");
-
-        if role == "user" {
-            if let Some(content) = message.get("content") {
-                let has_tool_result = content.as_array().is_some_and(|items| {
-                    items.iter().any(|item| {
-                        item.get("type").and_then(|item_type| item_type.as_str())
-                            == Some("tool_result")
-                    })
-                });
-                if has_tool_result {
-                    session_name_selector.observe_non_user_message();
-                } else {
-                    session_name_selector.observe_user_prompt(&claude_content_to_text(content));
-                }
-            }
+        if imported_turns.contains(&(entry.turn_no as i64)) {
             continue;
         }
 
-        if role != "assistant" {
-            continue;
+        // A surviving imported row of the same rollout owns this turn, so the
+        // local write yields to it instead of failing the unique index and
+        // rolling back the whole transaction (which would stall the sync of
+        // every later turn of this rollout as well).
+        let insert_res = tx.execute(
+            "INSERT OR IGNORE INTO usage_entries (
+                assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
+                duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "codex",
+                entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
+                identity,
+                entry.timestamp,
+                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                entry.session_id,
+                entry.session_name.as_deref(),
+                entry.transcript_path.as_deref(),
+                entry.cwd.as_deref(),
+                entry.version.as_deref(),
+                entry.turn_no as i64,
+                entry.model.as_deref(),
+                entry.model_id.as_deref(),
+                tokens.map(|t| t.input as i64),
+                tokens.map(|t| t.output as i64),
+                tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
+                tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
+                tokens.map(|t| t.total as i64),
+                delta.map(|t| t.input as i64),
+                delta.map(|t| t.output as i64),
+                delta.and_then(|t| t.cache_read.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
+                delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
+                delta.and_then(|t| t.reasoning.map(|v| v as i64)),
+                delta.map(|t| t.total as i64),
+                cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
+                cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
+                entry.parent_session_id.as_deref(),
+                entry.agent_nickname.as_deref(),
+                entry.agent_role.as_deref(),
+                entry.reasoning_effort.as_deref()
+            ],
+        );
+
+        let inserted_rows = match insert_res {
+            Ok(inserted_rows) => inserted_rows,
+            Err(e) => {
+                eprintln!("寫入 Codex 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
+                success = false;
+                break;
+            }
+        };
+
+        if inserted_rows > 0 {
+            wrote_local_rows = true;
         }
-        session_name_selector.observe_non_user_message();
-
-        let usage_value = match message.get("usage") {
-            Some(usage) => usage.clone(),
-            None => continue,
-        };
-        let usage = match serde_json::from_value::<ClaudeUsage>(usage_value) {
-            Ok(usage) => usage,
-            Err(_) => continue,
-        };
-
-        let response_key = event
-            .get("requestId")
-            .and_then(|id| id.as_str())
-            .or_else(|| message.get("id").and_then(|id| id.as_str()))
-            .or_else(|| event.get("uuid").and_then(|id| id.as_str()))
-            .unwrap_or("");
-        if response_key.is_empty() || !seen_response_keys.insert(response_key.to_string()) {
-            continue;
-        }
-
-        let timestamp = event
-            .get("timestamp")
-            .and_then(|timestamp| timestamp.as_str())
-            .unwrap_or("")
-            .to_string();
-        let session_id = event
-            .get("sessionId")
-            .and_then(|id| id.as_str())
-            .unwrap_or(&fallback_session_id)
-            .to_string();
-        let cwd = event
-            .get("cwd")
-            .and_then(|cwd| cwd.as_str())
-            .map(|cwd| cwd.to_string())
-            .or_else(|| session_cwd.clone());
-        let version = event
-            .get("version")
-            .and_then(|version| version.as_str())
-            .map(|version| version.to_string())
-            .or_else(|| session_version.clone());
-        let model = message
-            .get("model")
-            .and_then(|model| model.as_str())
-            .map(|model| model.to_string());
-
-        let input = usage.input_tokens;
-        let cache_read = usage.cache_read_input_tokens;
-        let reported_cache_write = usage.cache_creation_input_tokens;
-        let explicit_cache_write_5m = usage.cache_creation.ephemeral_5m_input_tokens;
-        let cache_write_1h = usage.cache_creation.ephemeral_1h_input_tokens;
-        let explicit_cache_write = explicit_cache_write_5m.saturating_add(cache_write_1h);
-        let cache_write = reported_cache_write.max(explicit_cache_write);
-        let cache_write_5m = explicit_cache_write_5m
-            .saturating_add(reported_cache_write.saturating_sub(explicit_cache_write));
-        let output = usage.output_tokens;
-        let total = input
-            .saturating_add(cache_read)
-            .saturating_add(cache_write)
-            .saturating_add(output);
-        let tokens = TokenStats {
-            input,
-            output,
-            cache_read: Some(cache_read),
-            cache_write: Some(cache_write),
-            cache_write_5m: Some(cache_write_5m),
-            cache_write_1h: Some(cache_write_1h),
-            reasoning: None,
-            total,
-        };
-
-        results.push(UsageEntry {
-            timestamp,
-            session_id,
-            session_name: session_name_selector
-                .selected_name()
-                .map(str::to_string)
-                .or_else(|| Some(fallback_session_id.clone())),
-            transcript_path: Some(filepath.to_string_lossy().into_owned()),
-            cwd,
-            version,
-            turn_no: (results.len() + 1) as u32,
-            model: model.clone(),
-            model_id: model,
-            tokens: Some(tokens.clone()),
-            delta_tokens: Some(tokens),
-            context: None,
-            cost: None,
-            source_kind: None,
-            source_dir_key: None,
-            parent_session_id: None,
-            agent_nickname: None,
-            agent_role: None,
-            reasoning_effort: None,
-        });
     }
 
-    Ok(results)
+    if success {
+        // A complete parse whose rows are stored (or were already stored) is the
+        // only state that counts as synced. Anything else — the rollout has no
+        // usage yet, or the file was caught mid-write — carries the marker that
+        // means "nothing complete stored yet", which keeps the next passes from
+        // re-parsing the file and stops a damaged transcript from being treated
+        // as a safe replacement for its copies.
+        let last_synced_time = if parsed_completely && (wrote_local_rows || transcript_is_current) {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        } else {
+            CODEX_EMPTY_TRANSCRIPT_SYNC_TIME
+        };
+
+        let update_state_res = tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, last_synced_time],
+        );
+
+        if update_state_res.is_ok() {
+            if let Err(e) = tx.commit() {
+                eprintln!("Transaction COMMIT 失敗: {}", e);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn migrate_legacy_claude_usage_entries(conn: &Connection) -> Result<usize, String> {
@@ -4526,1154 +4611,6 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                         "寫入 Claude Code 資料庫失敗 (turn_no {}): {}",
                         entry.turn_no, e
                     );
-                    success = false;
-                    break;
-                }
-            }
-
-            if success {
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs() as i64;
-
-                let update_state_res = tx.execute(
-                    "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
-                    params![state_key, current_size as i64, now],
-                );
-
-                if update_state_res.is_ok() {
-                    if let Err(e) = tx.commit() {
-                        eprintln!("Transaction COMMIT 失敗: {}", e);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-pub fn parse_cursor_timestamp(s: &str) -> String {
-    let parts: Vec<&str> = s.split(" (UTC").collect();
-    if parts.is_empty() {
-        return s.to_string();
-    }
-    let dt_part = parts[0].trim();
-    let dt_str = if let Some(comma_idx) = dt_part.find(',') {
-        dt_part[comma_idx + 1..].trim()
-    } else {
-        dt_part
-    };
-
-    let formats = [
-        "%b %e, %Y, %l:%M %p",
-        "%b %d, %Y, %I:%M %p",
-        "%b %d, %Y, %l:%M %p",
-        "%b %e, %Y, %I:%M %p",
-        "%Y-%m-%d %H:%M:%S",
-    ];
-
-    for fmt in &formats {
-        if let Ok(naive_dt) = chrono::NaiveDateTime::parse_from_str(dt_str, fmt) {
-            if parts.len() > 1 {
-                let tz_str = parts[1].trim_end_matches(')');
-                let hours_str = if tz_str.contains(':') {
-                    tz_str.split(':').next().unwrap_or("0")
-                } else {
-                    tz_str
-                };
-                if let Ok(hours) = hours_str.parse::<i32>() {
-                    if let Some(offset) = chrono::FixedOffset::east_opt(hours * 3600) {
-                        use chrono::TimeZone;
-                        let local_dt = offset.from_local_datetime(&naive_dt);
-                        if let chrono::LocalResult::Single(dt_tz) = local_dt {
-                            return dt_tz.to_rfc3339();
-                        }
-                    }
-                }
-            }
-            return naive_dt.format("%Y-%m-%d %H:%M:%S").to_string();
-        }
-    }
-
-    s.to_string()
-}
-
-fn find_cursor_session_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                files.extend(find_cursor_session_files(&path));
-            } else if path.is_file()
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
-            {
-                files.push(path);
-            }
-        }
-    }
-    files
-}
-
-fn cursor_content_to_text(content: &serde_json::Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.to_string();
-    }
-    let mut parts = Vec::new();
-    if let Some(items) = content.as_array() {
-        for item in items {
-            let itype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            if itype == "text" {
-                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    parts.push(text.to_string());
-                }
-            }
-        }
-    }
-    parts.join(" ")
-}
-
-fn cursor_response_signature(content: &serde_json::Value) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(text) = content.as_str() {
-        if !text.is_empty() {
-            parts.push(serde_json::json!(["text", text]));
-        }
-    } else {
-        for item in content.as_array()? {
-            match item.get("type").and_then(|value| value.as_str()) {
-                Some("text") => {
-                    if let Some(text) = item
-                        .get("text")
-                        .or_else(|| item.get("data"))
-                        .and_then(|value| value.as_str())
-                        .filter(|value| !value.is_empty())
-                    {
-                        parts.push(serde_json::json!(["text", text]));
-                    }
-                }
-                Some("tool_use") => {
-                    let Some(name) = item.get("name").and_then(|value| value.as_str()) else {
-                        continue;
-                    };
-                    parts.push(serde_json::json!([
-                        "tool",
-                        name,
-                        item.get("input")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null)
-                    ]));
-                }
-                Some("tool-call") => {
-                    let Some(name) = item.get("toolName").and_then(|value| value.as_str()) else {
-                        continue;
-                    };
-                    parts.push(serde_json::json!([
-                        "tool",
-                        name,
-                        item.get("args").cloned().unwrap_or(serde_json::Value::Null)
-                    ]));
-                }
-                _ => {}
-            }
-        }
-    }
-    if parts.is_empty() {
-        return None;
-    }
-    let serialized = serde_json::to_string(&parts).ok()?;
-    Some(format!(
-        "{:016x}",
-        hash_fnv1a_64(&format!("cursor-response-v2:{serialized}"))
-    ))
-}
-
-fn cursor_model_from_provider_options(value: &serde_json::Value) -> Option<String> {
-    value
-        .get("providerOptions")
-        .and_then(|provider_options| provider_options.get("cursor"))
-        .and_then(|cursor| cursor.get("modelName"))
-        .and_then(|model| model.as_str())
-        .map(str::trim)
-        .filter(|model| !model.is_empty() && model.len() <= 200)
-        .map(str::to_string)
-}
-
-fn parse_cursor_agent_kv_model_signature(raw: &[u8]) -> Option<(String, String)> {
-    let event: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    if event.get("role").and_then(|value| value.as_str()) != Some("assistant") {
-        return None;
-    }
-    let content = event
-        .get("content")
-        .or_else(|| event.pointer("/message/content"))?;
-    let mut models = HashSet::new();
-    if let Some(model) = cursor_model_from_provider_options(&event) {
-        models.insert(model);
-    }
-    if let Some(items) = content.as_array() {
-        for item in items {
-            if let Some(model) = cursor_model_from_provider_options(item) {
-                models.insert(model);
-            }
-        }
-    }
-    if models.len() != 1 {
-        return None;
-    }
-    Some((
-        cursor_response_signature(content)?,
-        models.into_iter().next()?,
-    ))
-}
-
-fn cursor_model_source_id(path: &Path) -> String {
-    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let normalized = resolved.to_string_lossy().replace('\\', "/");
-    #[cfg(windows)]
-    let normalized = normalized.to_lowercase();
-    format!("{:016x}", hash_fnv1a_64(&normalized))
-}
-
-fn cursor_mode_source_kind(mode: Option<&str>) -> Option<String> {
-    match mode {
-        Some("agent") => Some(CURSOR_AGENT_SOURCE_KIND.to_string()),
-        Some("ide") => Some(CURSOR_IDE_SOURCE_KIND.to_string()),
-        _ => None,
-    }
-}
-
-fn cursor_date_from_timestamp(timestamp: &str) -> Option<&str> {
-    let date = timestamp.get(..10)?;
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
-    Some(date)
-}
-
-/// 供 `parse_cursor_session_file` 在找不到 `<timestamp>` 標籤時，用檔案 mtime
-/// 當作 fallback timestamp。必須轉本地時區（而非 UTC）再格式化，因為
-/// `cursor_date_from_timestamp` 只單純截取這個字串前 10 碼當日期，不會再做任
-/// 何時區換算。
-fn local_timestamp_string_from_system_time(modified: std::time::SystemTime) -> String {
-    let datetime: chrono::DateTime<chrono::Local> = modified.into();
-    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
-fn run_cursor_model_attribution_migration(conn: &mut Connection) -> Result<(), String> {
-    let already_applied: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
-            params![CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if already_applied {
-        return Ok(());
-    }
-
-    let tx = conn
-        .transaction()
-        .map_err(|error| format!("啟動 Cursor 模型歸因遷移失敗: {error}"))?;
-    tx.execute(
-        "UPDATE usage_entries
-         SET model = 'Unknown Model', model_id = 'Unknown Model'
-         WHERE assistant_type = 'cursor'
-           AND (model IS NULL OR model = '' OR model = 'Cursor Agent')",
-        [],
-    )
-    .map_err(|error| format!("重設 Cursor 籠統模型名稱失敗: {error}"))?;
-    tx.execute(
-        "DELETE FROM sync_state
-         WHERE filename LIKE 'cursor:%'
-            OR filename LIKE 'cursor-agent-kv:%'
-            OR filename LIKE 'cursor-composer-data:%'",
-        [],
-    )
-    .map_err(|error| format!("重設 Cursor 同步狀態失敗: {error}"))?;
-    tx.execute(
-        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
-         VALUES (?, 1, 0)",
-        params![CURSOR_MODEL_ATTRIBUTION_MIGRATION_KEY],
-    )
-    .map_err(|error| format!("記錄 Cursor 模型歸因遷移失敗: {error}"))?;
-    tx.commit()
-        .map_err(|error| format!("提交 Cursor 模型歸因遷移失敗: {error}"))
-}
-
-fn run_cursor_cache_tokens_unknown_migration(conn: &mut Connection) -> Result<(), String> {
-    let already_applied: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = ?)",
-            params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-    if already_applied {
-        return Ok(());
-    }
-
-    let tx = conn
-        .transaction()
-        .map_err(|error| format!("啟動 Cursor 快取 Token 遷移失敗: {error}"))?;
-    tx.execute(
-        "UPDATE usage_entries
-         SET tokens_cache_read = NULL,
-             tokens_cache_write = NULL,
-             tokens_cache_write_5m = NULL,
-             tokens_cache_write_1h = NULL,
-             delta_cache_read = NULL,
-             delta_cache_write = NULL,
-             delta_cache_write_5m = NULL,
-             delta_cache_write_1h = NULL
-         WHERE assistant_type = 'cursor'
-           AND COALESCE(tokens_cache_read, 0) = 0
-           AND COALESCE(tokens_cache_write, 0) = 0
-           AND COALESCE(tokens_cache_write_5m, 0) = 0
-           AND COALESCE(tokens_cache_write_1h, 0) = 0
-           AND COALESCE(delta_cache_read, 0) = 0
-           AND COALESCE(delta_cache_write, 0) = 0
-           AND COALESCE(delta_cache_write_5m, 0) = 0
-           AND COALESCE(delta_cache_write_1h, 0) = 0",
-        [],
-    )
-    .map_err(|error| format!("將 Cursor 快取 Token 標記為未知失敗: {error}"))?;
-    tx.execute(
-        "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
-         VALUES (?, 1, 0)",
-        params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
-    )
-    .map_err(|error| format!("記錄 Cursor 快取 Token 遷移失敗: {error}"))?;
-    tx.commit()
-        .map_err(|error| format!("提交 Cursor 快取 Token 遷移失敗: {error}"))
-}
-
-fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open_with_flags(
-        state_db_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
-    let has_cursor_disk_kv: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'cursorDiskKV'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))?;
-    if !has_cursor_disk_kv {
-        return Err("Cursor state.vscdb 缺少 cursorDiskKV 表".to_string());
-    }
-    Ok(conn)
-}
-
-fn cursor_state_max_rowid(conn: &Connection) -> Result<i64, String> {
-    conn.query_row(
-        "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
-        [],
-        |row| row.get(0),
-    )
-    .map_err(|error| format!("讀取 Cursor cursorDiskKV 最大 rowid 失敗: {error}"))
-}
-
-fn sync_cursor_model_signatures(
-    conn: &mut Connection,
-    state_db_path: &Path,
-) -> Result<String, String> {
-    let source_id = cursor_model_source_id(state_db_path);
-    let state_key = format!("cursor-agent-kv:v2:{source_id}");
-    let source_conn = open_cursor_state_db(state_db_path)?;
-    let max_rowid = cursor_state_max_rowid(&source_conn)?;
-    let stored_rowid: i64 = conn
-        .query_row(
-            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-            params![state_key],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let reset_cache = max_rowid < stored_rowid;
-    let start_rowid = if reset_cache { 0 } else { stored_rowid };
-
-    let mut mappings = Vec::new();
-    if max_rowid > start_rowid {
-        let mut statement = source_conn
-            .prepare(
-                "SELECT CAST(value AS BLOB)
-                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
-                 WHERE rowid > ? AND rowid <= ?
-                   AND key >= 'agentKv:blob:' AND key < 'agentKv:blob;'
-                   AND instr(CAST(value AS TEXT), '\"modelName\"') > 0",
-            )
-            .map_err(|error| format!("準備 Cursor agentKv 查詢失敗: {error}"))?;
-        let mut rows = statement
-            .query(params![start_rowid, max_rowid])
-            .map_err(|error| format!("查詢 Cursor agentKv 失敗: {error}"))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| format!("讀取 Cursor agentKv 記錄失敗: {error}"))?
-        {
-            let raw: Vec<u8> = match row.get(0) {
-                Ok(raw) => raw,
-                Err(_) => continue,
-            };
-            if let Some(mapping) = parse_cursor_agent_kv_model_signature(&raw) {
-                mappings.push(mapping);
-            }
-        }
-    }
-    drop(source_conn);
-
-    if reset_cache || max_rowid > start_rowid {
-        let has_mapping_changes = !mappings.is_empty();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("啟動 Cursor 模型簽章同步失敗: {error}"))?;
-        if reset_cache {
-            tx.execute(
-                "DELETE FROM cursor_model_signatures WHERE source_id = ?",
-                params![source_id],
-            )
-            .map_err(|error| format!("重設 Cursor 模型簽章快取失敗: {error}"))?;
-            tx.execute(
-                "UPDATE usage_entries
-                 SET model = 'Unknown Model', model_id = 'Unknown Model'
-                 WHERE assistant_type = 'cursor'
-                   AND model_signature IS NOT NULL",
-                [],
-            )
-            .map_err(|error| format!("清除過期 Cursor 模型歸因失敗: {error}"))?;
-            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
-                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
-        }
-        for (signature, model) in mappings {
-            tx.execute(
-                "INSERT INTO cursor_model_signatures (
-                    source_id, signature, model, is_ambiguous
-                 ) VALUES (?, ?, ?, 0)
-                 ON CONFLICT(source_id, signature) DO UPDATE SET
-                    is_ambiguous = CASE
-                        WHEN cursor_model_signatures.model = excluded.model
-                        THEN cursor_model_signatures.is_ambiguous
-                        ELSE 1
-                    END",
-                params![source_id, signature, model],
-            )
-            .map_err(|error| format!("寫入 Cursor 模型簽章快取失敗: {error}"))?;
-        }
-        if reset_cache || has_mapping_changes {
-            tx.execute(
-                "UPDATE usage_entries
-                 SET model = 'Unknown Model', model_id = 'Unknown Model'
-                 WHERE assistant_type = 'cursor'
-                   AND model_signature IS NOT NULL
-                   AND EXISTS (
-                        SELECT 1 FROM cursor_model_signatures signatures
-                        WHERE signatures.source_id = ?
-                          AND signatures.signature = usage_entries.model_signature
-                          AND signatures.is_ambiguous = 1
-                   )",
-                params![source_id],
-            )
-            .map_err(|error| format!("清除歧義 Cursor 模型歸因失敗: {error}"))?;
-            tx.execute(
-                "UPDATE usage_entries
-                 SET model = (
-                        SELECT signatures.model FROM cursor_model_signatures signatures
-                        WHERE signatures.source_id = ?
-                          AND signatures.signature = usage_entries.model_signature
-                          AND signatures.is_ambiguous = 0
-                     ),
-                     model_id = (
-                        SELECT signatures.model FROM cursor_model_signatures signatures
-                        WHERE signatures.source_id = ?
-                          AND signatures.signature = usage_entries.model_signature
-                          AND signatures.is_ambiguous = 0
-                     )
-                 WHERE assistant_type = 'cursor'
-                   AND model_signature IS NOT NULL
-                   AND EXISTS (
-                        SELECT 1 FROM cursor_model_signatures signatures
-                        WHERE signatures.source_id = ?
-                          AND signatures.signature = usage_entries.model_signature
-                          AND signatures.is_ambiguous = 0
-                   )",
-                params![source_id, source_id, source_id],
-            )
-            .map_err(|error| format!("回填 Cursor 模型歸因失敗: {error}"))?;
-        }
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        tx.execute(
-            "INSERT OR REPLACE INTO sync_state (
-                filename, last_synced_size, last_synced_time
-             ) VALUES (?, ?, ?)",
-            params![state_key, max_rowid, now],
-        )
-        .map_err(|error| format!("更新 Cursor agentKv 同步狀態失敗: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("提交 Cursor 模型簽章同步失敗: {error}"))?;
-    }
-
-    Ok(source_id)
-}
-
-fn load_cursor_model_signatures(
-    conn: &Connection,
-    source_id: &str,
-) -> Result<HashMap<String, String>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT signature, model
-             FROM cursor_model_signatures
-             WHERE source_id = ? AND is_ambiguous = 0",
-        )
-        .map_err(|error| format!("準備讀取 Cursor 模型簽章快取失敗: {error}"))?;
-    let rows = statement
-        .query_map(params![source_id], |row| Ok((row.get(0)?, row.get(1)?)))
-        .map_err(|error| format!("讀取 Cursor 模型簽章快取失敗: {error}"))?;
-    let mut mappings = HashMap::new();
-    for row in rows {
-        let (signature, model) =
-            row.map_err(|error| format!("解析 Cursor 模型簽章快取失敗: {error}"))?;
-        mappings.insert(signature, model);
-    }
-    Ok(mappings)
-}
-
-fn load_cursor_ambiguous_model_signatures(
-    conn: &Connection,
-    source_id: &str,
-) -> Result<HashSet<String>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT signature
-             FROM cursor_model_signatures
-             WHERE source_id = ? AND is_ambiguous = 1",
-        )
-        .map_err(|error| format!("準備讀取 Cursor 歧義模型簽章失敗: {error}"))?;
-    let rows = statement
-        .query_map(params![source_id], |row| row.get(0))
-        .map_err(|error| format!("讀取 Cursor 歧義模型簽章失敗: {error}"))?;
-    let mut signatures = HashSet::new();
-    for row in rows {
-        signatures.insert(row.map_err(|error| format!("解析 Cursor 歧義模型簽章失敗: {error}"))?);
-    }
-    Ok(signatures)
-}
-
-#[derive(Clone, Debug, Default)]
-struct CursorSessionMetadata {
-    cwd: Option<String>,
-    mode: Option<String>,
-    model: Option<String>,
-}
-
-fn parse_cursor_session_metadata(key: &str, raw: &[u8]) -> Option<(String, CursorSessionMetadata)> {
-    let value: serde_json::Value = serde_json::from_slice(raw).ok()?;
-    let session_id = value
-        .get("composerId")
-        .and_then(|item| item.as_str())
-        .or_else(|| key.strip_prefix("composerData:"))
-        .map(str::trim)
-        .filter(|item| !item.is_empty() && item.len() <= 200)?
-        .to_string();
-    let cwd = value
-        .pointer("/workspaceIdentifier/uri/fsPath")
-        .or_else(|| value.pointer("/workspaceIdentifier/fsPath"))
-        .or_else(|| value.pointer("/workspaceIdentifier/uri/path"))
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty() && item.len() <= 4096)
-        .map(str::to_string);
-    let unified_mode = value
-        .get("unifiedMode")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty());
-    let is_agentic = value.get("isAgentic").and_then(|item| item.as_bool());
-    let mode = if is_agentic == Some(false)
-        || unified_mode.is_some_and(|item| !item.eq_ignore_ascii_case("agent"))
-    {
-        Some("ide".to_string())
-    } else if is_agentic == Some(true)
-        || unified_mode.is_some_and(|item| item.eq_ignore_ascii_case("agent"))
-    {
-        Some("agent".to_string())
-    } else {
-        None
-    };
-    let model = value
-        .pointer("/modelConfig/modelName")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| {
-            !item.is_empty()
-                && item.len() <= 200
-                && !item.eq_ignore_ascii_case("default")
-                && !item.eq_ignore_ascii_case("auto")
-                && !item.eq_ignore_ascii_case("unknown model")
-        })
-        .map(str::to_string);
-
-    if cwd.is_none() && mode.is_none() && model.is_none() {
-        return None;
-    }
-    Some((session_id, CursorSessionMetadata { cwd, mode, model }))
-}
-
-fn sync_cursor_session_metadata(
-    conn: &mut Connection,
-    state_db_path: &Path,
-) -> Result<String, String> {
-    let source_id = cursor_model_source_id(state_db_path);
-    let state_key = format!("cursor-composer-data:v3:{source_id}");
-    let source_conn = open_cursor_state_db(state_db_path)?;
-    let max_rowid = cursor_state_max_rowid(&source_conn)?;
-    let stored_rowid: i64 = conn
-        .query_row(
-            "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-            params![state_key],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let reset_cache = max_rowid < stored_rowid;
-    let start_rowid = if reset_cache { 0 } else { stored_rowid };
-
-    let mut metadata_rows = Vec::new();
-    if max_rowid > start_rowid {
-        let mut statement = source_conn
-            .prepare(
-                "SELECT key, CAST(value AS BLOB)
-                 FROM cursorDiskKV INDEXED BY sqlite_autoindex_cursorDiskKV_1
-                 WHERE rowid > ? AND rowid <= ?
-                   AND key >= 'composerData:' AND key < 'composerData;'",
-            )
-            .map_err(|error| format!("準備 Cursor composerData 查詢失敗: {error}"))?;
-        let mut rows = statement
-            .query(params![start_rowid, max_rowid])
-            .map_err(|error| format!("查詢 Cursor composerData 失敗: {error}"))?;
-        while let Some(row) = rows
-            .next()
-            .map_err(|error| format!("讀取 Cursor composerData 記錄失敗: {error}"))?
-        {
-            let key: String = match row.get(0) {
-                Ok(key) => key,
-                Err(_) => continue,
-            };
-            let raw: Vec<u8> = match row.get(1) {
-                Ok(raw) => raw,
-                Err(_) => continue,
-            };
-            if let Some(metadata) = parse_cursor_session_metadata(&key, &raw) {
-                metadata_rows.push(metadata);
-            }
-        }
-    }
-    drop(source_conn);
-
-    if reset_cache || max_rowid > start_rowid {
-        let has_metadata_changes = !metadata_rows.is_empty();
-        let tx = conn
-            .transaction()
-            .map_err(|error| format!("啟動 Cursor Session 中繼資料同步失敗: {error}"))?;
-        if reset_cache {
-            tx.execute(
-                "DELETE FROM cursor_session_metadata WHERE source_id = ?",
-                params![source_id],
-            )
-            .map_err(|error| format!("重設 Cursor Session 中繼資料快取失敗: {error}"))?;
-            tx.execute("DELETE FROM sync_state WHERE filename LIKE 'cursor:%'", [])
-                .map_err(|error| format!("重設 Cursor 逐字稿同步狀態失敗: {error}"))?;
-        }
-        for (session_id, metadata) in metadata_rows {
-            tx.execute(
-                "INSERT INTO cursor_session_metadata (
-                    source_id, session_id, cwd, mode, model
-                 ) VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT(source_id, session_id) DO UPDATE SET
-                    cwd = COALESCE(excluded.cwd, cursor_session_metadata.cwd),
-                    mode = COALESCE(excluded.mode, cursor_session_metadata.mode),
-                    model = COALESCE(excluded.model, cursor_session_metadata.model)",
-                params![
-                    source_id,
-                    session_id,
-                    metadata.cwd,
-                    metadata.mode,
-                    metadata.model
-                ],
-            )
-            .map_err(|error| format!("寫入 Cursor Session 中繼資料快取失敗: {error}"))?;
-        }
-        if reset_cache || has_metadata_changes {
-            tx.execute(
-                "UPDATE usage_entries
-                 SET cwd = (
-                        SELECT metadata.cwd FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                     )
-                 WHERE assistant_type = 'cursor'
-                   AND EXISTS (
-                        SELECT 1 FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                          AND metadata.cwd IS NOT NULL
-                          AND metadata.cwd != ''
-                   )",
-                params![source_id, source_id],
-            )
-            .map_err(|error| format!("回填 Cursor 工作路徑失敗: {error}"))?;
-            tx.execute(
-                "DELETE FROM usage_entries
-                 WHERE rowid IN (
-                    SELECT legacy.rowid
-                    FROM usage_entries legacy
-                    JOIN cursor_session_metadata metadata
-                      ON metadata.source_id = ?
-                     AND metadata.session_id = legacy.session_id
-                    JOIN usage_entries classified
-                      ON classified.assistant_type = legacy.assistant_type
-                     AND classified.session_id = legacy.session_id
-                     AND classified.turn_no = legacy.turn_no
-                     AND classified.source_kind = CASE metadata.mode
-                        WHEN 'agent' THEN ?
-                        WHEN 'ide' THEN ?
-                     END
-                    WHERE legacy.assistant_type = 'cursor'
-                      AND legacy.source_kind = 'legacy'
-                 )",
-                params![source_id, CURSOR_AGENT_SOURCE_KIND, CURSOR_IDE_SOURCE_KIND],
-            )
-            .map_err(|error| format!("清除 Cursor legacy 重複記錄失敗: {error}"))?;
-            tx.execute(
-                "UPDATE usage_entries
-                 SET source_kind = CASE (
-                        SELECT metadata.mode FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                     )
-                        WHEN 'agent' THEN ?
-                        WHEN 'ide' THEN ?
-                        ELSE source_kind
-                     END
-                 WHERE assistant_type = 'cursor'
-                   AND EXISTS (
-                        SELECT 1 FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                          AND metadata.mode IN ('agent', 'ide')
-                   )",
-                params![
-                    source_id,
-                    CURSOR_AGENT_SOURCE_KIND,
-                    CURSOR_IDE_SOURCE_KIND,
-                    source_id
-                ],
-            )
-            .map_err(|error| format!("回填 Cursor Session 模式失敗: {error}"))?;
-            tx.execute(
-                "UPDATE usage_entries
-                 SET model = (
-                        SELECT metadata.model FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                     ),
-                     model_id = (
-                        SELECT metadata.model FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                     )
-                 WHERE assistant_type = 'cursor'
-                   AND EXISTS (
-                        SELECT 1 FROM cursor_session_metadata metadata
-                        WHERE metadata.source_id = ?
-                          AND metadata.session_id = usage_entries.session_id
-                          AND metadata.model IS NOT NULL
-                          AND metadata.model != ''
-                   )
-                   AND NOT EXISTS (
-                        SELECT 1 FROM cursor_model_signatures signatures
-                        WHERE signatures.source_id = ?
-                          AND signatures.signature = usage_entries.model_signature
-                   )",
-                params![source_id, source_id, source_id, source_id],
-            )
-            .map_err(|error| format!("回填 Cursor Session 模型 fallback 失敗: {error}"))?;
-        }
-
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        tx.execute(
-            "INSERT OR REPLACE INTO sync_state (
-                filename, last_synced_size, last_synced_time
-             ) VALUES (?, ?, ?)",
-            params![state_key, max_rowid, now],
-        )
-        .map_err(|error| format!("更新 Cursor composerData 同步狀態失敗: {error}"))?;
-        tx.commit()
-            .map_err(|error| format!("提交 Cursor Session 中繼資料同步失敗: {error}"))?;
-    }
-
-    Ok(source_id)
-}
-
-fn load_cursor_session_metadata(
-    conn: &Connection,
-    source_id: &str,
-) -> Result<HashMap<String, CursorSessionMetadata>, String> {
-    let mut statement = conn
-        .prepare(
-            "SELECT session_id, cwd, mode, model
-             FROM cursor_session_metadata
-             WHERE source_id = ?",
-        )
-        .map_err(|error| format!("準備讀取 Cursor Session 中繼資料失敗: {error}"))?;
-    let rows = statement
-        .query_map(params![source_id], |row| {
-            Ok((
-                row.get(0)?,
-                CursorSessionMetadata {
-                    cwd: row.get(1)?,
-                    mode: row.get(2)?,
-                    model: row.get(3)?,
-                },
-            ))
-        })
-        .map_err(|error| format!("讀取 Cursor Session 中繼資料失敗: {error}"))?;
-    let mut mappings = HashMap::new();
-    for row in rows {
-        let (session_id, metadata) =
-            row.map_err(|error| format!("解析 Cursor Session 中繼資料失敗: {error}"))?;
-        mappings.insert(session_id, metadata);
-    }
-    Ok(mappings)
-}
-
-struct CursorParsedEntry {
-    entry: UsageEntry,
-    model_signature: Option<String>,
-}
-
-fn parse_cursor_session_file(
-    filepath: &Path,
-    model_mappings: &HashMap<String, String>,
-    ambiguous_model_signatures: &HashSet<String>,
-    session_metadata: &HashMap<String, CursorSessionMetadata>,
-) -> Result<Vec<CursorParsedEntry>, String> {
-    let file = File::open(filepath).map_err(|e| format!("無法開啟檔案: {}", e))?;
-    let reader = BufReader::new(file);
-    let fallback_session_id = filepath
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("unknown-session")
-        .to_string();
-    let metadata = session_metadata.get(&fallback_session_id);
-    let session_cwd = metadata.and_then(|value| value.cwd.clone());
-    let source_kind = cursor_mode_source_kind(metadata.and_then(|value| value.mode.as_deref()));
-
-    let mut session_name_selector = InitialUserPromptSelector::default();
-    let mut results = Vec::new();
-
-    let mut current_timestamp = String::new();
-    let mut current_prompt = String::new();
-
-    for line_res in reader.lines() {
-        let line = match line_res {
-            Ok(line) => line,
-            Err(_) => continue,
-        };
-        let event: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-
-        let role = event.get("role").and_then(|r| r.as_str()).unwrap_or("");
-
-        if role == "user" {
-            let content_val = event.get("message").and_then(|m| m.get("content"));
-            let text = cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
-
-            let mut extracted_ts = String::new();
-            if let Some(start_idx) = text.find("<timestamp>") {
-                let actual_start = start_idx + "<timestamp>".len();
-                if let Some(end_idx) = text[actual_start..].find("</timestamp>") {
-                    extracted_ts = text[actual_start..(actual_start + end_idx)].to_string();
-                }
-            }
-
-            if !extracted_ts.is_empty() {
-                let parsed_timestamp = parse_cursor_timestamp(&extracted_ts);
-                if cursor_date_from_timestamp(&parsed_timestamp).is_some() {
-                    current_timestamp = parsed_timestamp;
-                }
-            }
-
-            let mut clean_prompt = text.clone();
-            if let Some(start_idx) = clean_prompt.find("<user_query>") {
-                let actual_start = start_idx + "<user_query>".len();
-                if let Some(end_idx) = clean_prompt[actual_start..].find("</user_query>") {
-                    clean_prompt = clean_prompt[actual_start..(actual_start + end_idx)].to_string();
-                }
-            }
-
-            current_prompt = clean_prompt.trim().to_string();
-            session_name_selector.observe_user_prompt(&current_prompt);
-        } else if role == "assistant" {
-            session_name_selector.observe_non_user_message();
-            let content_val = event.get("message").and_then(|m| m.get("content"));
-            let reply_text =
-                cursor_content_to_text(content_val.unwrap_or(&serde_json::Value::Null));
-            let current_model_signature =
-                cursor_response_signature(content_val.unwrap_or(&serde_json::Value::Null));
-            let current_model = match current_model_signature.as_ref() {
-                Some(signature) if ambiguous_model_signatures.contains(signature) => {
-                    "Unknown Model".to_string()
-                }
-                Some(signature) => model_mappings
-                    .get(signature)
-                    .cloned()
-                    .or_else(|| metadata.and_then(|value| value.model.clone()))
-                    .unwrap_or_else(|| "Unknown Model".to_string()),
-                None => metadata
-                    .and_then(|value| value.model.clone())
-                    .unwrap_or_else(|| "Unknown Model".to_string()),
-            };
-
-            if current_timestamp.is_empty() {
-                if let Ok(metadata) = filepath.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        current_timestamp = local_timestamp_string_from_system_time(modified);
-                    }
-                }
-            }
-            if current_timestamp.is_empty() {
-                current_timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-            }
-
-            let input_tokens = (current_prompt.len() / 4).max(10) as u64;
-            let output_tokens = (reply_text.len() / 4).max(10) as u64;
-            let total_tokens = input_tokens + output_tokens;
-
-            let tokens = TokenStats {
-                input: input_tokens,
-                output: output_tokens,
-                // Cursor transcripts do not expose cache token counts.
-                cache_read: None,
-                cache_write: None,
-                cache_write_5m: None,
-                cache_write_1h: None,
-                reasoning: None,
-                total: total_tokens,
-            };
-
-            results.push(CursorParsedEntry {
-                entry: UsageEntry {
-                    timestamp: current_timestamp.clone(),
-                    session_id: fallback_session_id.clone(),
-                    session_name: session_name_selector
-                        .selected_name()
-                        .map(str::to_string)
-                        .or_else(|| Some(fallback_session_id.clone())),
-                    transcript_path: Some(filepath.to_string_lossy().into_owned()),
-                    cwd: session_cwd.clone(),
-                    version: None,
-                    turn_no: (results.len() + 1) as u32,
-                    model: Some(current_model.clone()),
-                    model_id: Some(current_model.clone()),
-                    tokens: Some(tokens.clone()),
-                    delta_tokens: Some(tokens),
-                    context: None,
-                    cost: None,
-                    source_kind: source_kind.clone(),
-                    source_dir_key: None,
-                    parent_session_id: None,
-                    agent_nickname: None,
-                    agent_role: None,
-                    reasoning_effort: None,
-                },
-                model_signature: current_model_signature,
-            });
-        }
-    }
-
-    Ok(results)
-}
-
-fn sync_cursor_usage_logs(conn: &mut Connection, cursor_dir: &Path) -> Result<(), String> {
-    run_cursor_model_attribution_migration(conn)?;
-    run_cursor_cache_tokens_unknown_migration(conn)?;
-
-    let state_db_path = get_cursor_state_db_path();
-    let source_id = if state_db_path.exists() {
-        let source_id = cursor_model_source_id(&state_db_path);
-        if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
-            eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
-        }
-        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
-            eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
-        }
-        Some(source_id)
-    } else {
-        None
-    };
-    let model_mappings = if let Some(source_id) = source_id.as_deref() {
-        load_cursor_model_signatures(conn, source_id)?
-    } else {
-        HashMap::new()
-    };
-    let ambiguous_model_signatures = if let Some(source_id) = source_id.as_deref() {
-        load_cursor_ambiguous_model_signatures(conn, source_id)?
-    } else {
-        HashSet::new()
-    };
-    let session_metadata = if let Some(source_id) = source_id.as_deref() {
-        load_cursor_session_metadata(conn, source_id)?
-    } else {
-        HashMap::new()
-    };
-
-    let projects_dir = cursor_dir.join("projects");
-    if !projects_dir.exists() {
-        return Ok(());
-    }
-
-    let files = find_cursor_session_files(&projects_dir);
-
-    for filepath in files {
-        let state_path = filepath
-            .strip_prefix(cursor_dir)
-            .unwrap_or(&filepath)
-            .to_string_lossy()
-            .into_owned();
-        let state_key = format!("cursor:{}", state_path);
-
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
-            .unwrap_or(0u64);
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
-
-        if current_size != last_synced_size {
-            let parsed_entries = match parse_cursor_session_file(
-                &filepath,
-                &model_mappings,
-                &ambiguous_model_signatures,
-                &session_metadata,
-            ) {
-                Ok(entries) => entries,
-                Err(e) => {
-                    eprintln!("解析 Cursor 會話檔案 {:?} 失敗: {}", filepath, e);
-                    continue;
-                }
-            };
-
-            let tx = conn
-                .transaction()
-                .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
-
-            let session_ids: HashSet<String> = parsed_entries
-                .iter()
-                .map(|parsed| parsed.entry.session_id.clone())
-                .collect();
-            for session_id in session_ids {
-                let delete_res = tx.execute(
-                    "DELETE FROM usage_entries WHERE assistant_type = 'cursor' AND session_id = ?",
-                    params![session_id],
-                );
-
-                if let Err(e) = delete_res {
-                    eprintln!("清空舊 Cursor Session 資料失敗: {}", e);
-                    continue;
-                }
-            }
-
-            let mut success = true;
-            for parsed in &parsed_entries {
-                let entry = &parsed.entry;
-                let tokens = entry.tokens.as_ref();
-                let delta = entry.delta_tokens.as_ref();
-                let cost = entry.cost.as_ref();
-                let entry_date = cursor_date_from_timestamp(&entry.timestamp).ok_or_else(|| {
-                    format!(
-                        "Cursor Session {} 的時間戳記無有效日期: {}",
-                        entry.session_id, entry.timestamp
-                    )
-                })?;
-
-                let insert_res = tx.execute(
-                    "INSERT INTO usage_entries (
-                        assistant_type, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id, model_signature,
-                        tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-                        delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-                        duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, reasoning_effort, source_kind
-                    ) VALUES (
-                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?, ?, ?
-                    )",
-                    params![
-                        "cursor",
-                        entry.timestamp,
-                        entry_date,
-                        entry.session_id,
-                        entry.session_name.as_deref(),
-                        entry.transcript_path.as_deref(),
-                        entry.cwd.as_deref(),
-                        entry.version.as_deref(),
-                        entry.turn_no as i64,
-                        entry.model.as_deref(),
-                        entry.model_id.as_deref(),
-                        parsed.model_signature.as_deref(),
-                        tokens.map(|t| t.input as i64),
-                        tokens.map(|t| t.output as i64),
-                        tokens.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        tokens.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        tokens.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        tokens.map(|t| t.total as i64),
-                        delta.map(|t| t.input as i64),
-                        delta.map(|t| t.output as i64),
-                        delta.and_then(|t| t.cache_read.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_5m.map(|v| v as i64)),
-                        delta.and_then(|t| t.cache_write_1h.map(|v| v as i64)),
-                        delta.and_then(|t| t.reasoning.map(|v| v as i64)),
-                        delta.map(|t| t.total as i64),
-                        cost.and_then(|c| c.total_api_duration_ms.map(|d| d as i64)),
-                        cost.and_then(|c| c.total_premium_requests.map(|r| r as i64)),
-                        entry.parent_session_id.as_deref(),
-                        entry.agent_nickname.as_deref(),
-                        entry.agent_role.as_deref(),
-                        entry.reasoning_effort.as_deref(),
-                        entry.source_kind.as_deref().unwrap_or("cursor")
-                    ],
-                );
-
-                if let Err(e) = insert_res {
-                    eprintln!("寫入 Cursor 資料庫失敗 (turn_no {}): {}", entry.turn_no, e);
                     success = false;
                     break;
                 }
@@ -5930,70 +4867,13 @@ fn sync_pi_family_usage_logs(
         let tx = conn
             .transaction()
             .map_err(|error| format!("{assistant_label} transaction BEGIN 失敗: {error}"))?;
-        tx.execute(
-            "DELETE FROM usage_entries
-             WHERE assistant_type = ?1 AND transcript_path = ?2",
-            params![assistant_type, transcript_path],
-        )
-        .map_err(|error| format!("清除舊 {assistant_label} session 資料失敗: {error}"))?;
-
-        for entry in &parsed_entries {
-            let tokens = entry.tokens.as_ref();
-            let delta = entry.delta_tokens.as_ref();
-            let cost = entry.cost.as_ref();
-            let source_kind = entry.source_kind.as_deref().unwrap_or(assistant_type);
-            let usage_identity = entry
-                .model_id
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-                .map(|model| format!("model:{model}"))
-                .unwrap_or_default();
-            tx.execute(
-                "INSERT INTO usage_entries (
-                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
-                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
-                )",
-                params![
-                    assistant_type,
-                    source_kind,
-                    usage_identity,
-                    entry.timestamp,
-                    local_date_from_timestamp(&entry.timestamp),
-                    entry.session_id,
-                    entry.session_name.as_deref(),
-                    entry.transcript_path.as_deref(),
-                    entry.cwd.as_deref(),
-                    entry.version.as_deref(),
-                    entry.turn_no as i64,
-                    entry.model.as_deref(),
-                    entry.model_id.as_deref(),
-                    tokens.map(|value| value.input as i64),
-                    tokens.map(|value| value.output as i64),
-                    tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
-                    tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
-                    tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
-                    tokens.map(|value| value.total as i64),
-                    delta.map(|value| value.input as i64),
-                    delta.map(|value| value.output as i64),
-                    delta.and_then(|value| value.cache_read.map(|v| v as i64)),
-                    delta.and_then(|value| value.cache_write.map(|v| v as i64)),
-                    delta.and_then(|value| value.reasoning.map(|v| v as i64)),
-                    delta.map(|value| value.total as i64),
-                    cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
-                    cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
-                    cost.and_then(|value| value.reported_cost_usd),
-                    entry.reasoning_effort.as_deref(),
-                ],
-            )
-            .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
-        }
+        delete_usage_entries_for_transcript(
+            &tx,
+            assistant_type,
+            &transcript_path,
+            assistant_label,
+        )?;
+        insert_usage_entries(&tx, assistant_type, assistant_label, &parsed_entries)?;
 
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -6007,6 +4887,92 @@ fn sync_pi_family_usage_logs(
         .map_err(|error| format!("更新 {assistant_label} sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 {assistant_label} transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
+}
+
+/// Clears the previously imported rows of one transcript so a re-parse rebuilds
+/// the session idempotently instead of appending duplicates.
+fn delete_usage_entries_for_transcript(
+    tx: &rusqlite::Transaction<'_>,
+    assistant_type: &str,
+    transcript_path: &str,
+    assistant_label: &str,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM usage_entries
+         WHERE assistant_type = ?1 AND transcript_path = ?2",
+        params![assistant_type, transcript_path],
+    )
+    .map_err(|error| format!("清除舊 {assistant_label} session 資料失敗: {error}"))?;
+    Ok(())
+}
+
+/// Inserts parsed per-turn rows. Shared by every transcript collector whose
+/// assistant messages already carry a complete, self-contained token snapshot.
+fn insert_usage_entries(
+    tx: &rusqlite::Transaction<'_>,
+    assistant_type: &str,
+    assistant_label: &str,
+    entries: &[UsageEntry],
+) -> Result<(), String> {
+    for entry in entries {
+        let tokens = entry.tokens.as_ref();
+        let delta = entry.delta_tokens.as_ref();
+        let cost = entry.cost.as_ref();
+        let source_kind = entry.source_kind.as_deref().unwrap_or(assistant_type);
+        let usage_identity = entry
+            .model_id
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+            .map(|model| format!("model:{model}"))
+            .unwrap_or_default();
+        tx.execute(
+            "INSERT INTO usage_entries (
+                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
+                    tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
+                    delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?
+                )",
+            params![
+                assistant_type,
+                source_kind,
+                usage_identity,
+                entry.timestamp,
+                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                entry.session_id,
+                entry.session_name.as_deref(),
+                entry.transcript_path.as_deref(),
+                entry.cwd.as_deref(),
+                entry.version.as_deref(),
+                entry.turn_no as i64,
+                entry.model.as_deref(),
+                entry.model_id.as_deref(),
+                tokens.map(|value| value.input as i64),
+                tokens.map(|value| value.output as i64),
+                tokens.and_then(|value| value.cache_read.map(|v| v as i64)),
+                tokens.and_then(|value| value.cache_write.map(|v| v as i64)),
+                tokens.and_then(|value| value.reasoning.map(|v| v as i64)),
+                tokens.map(|value| value.total as i64),
+                delta.map(|value| value.input as i64),
+                delta.map(|value| value.output as i64),
+                delta.and_then(|value| value.cache_read.map(|v| v as i64)),
+                delta.and_then(|value| value.cache_write.map(|v| v as i64)),
+                delta.and_then(|value| value.reasoning.map(|v| v as i64)),
+                delta.map(|value| value.total as i64),
+                cost.and_then(|value| value.total_api_duration_ms.map(|v| v as i64)),
+                cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
+                cost.and_then(|value| value.reported_cost_usd),
+                entry.reasoning_effort.as_deref(),
+            ],
+        )
+        .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
     }
 
     Ok(())
@@ -6046,6 +5012,176 @@ pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Re
         muse_dir,
         crate::muse::parse_session_usage_file,
     )
+}
+
+/// Working directory and title of one MiniMax Code runtime session. Both are
+/// read from MiniMax Code's own runtime ledger instead of being guessed from
+/// prompt text.
+struct McodeRuntimeSessionMeta {
+    workspace_dir: Option<String>,
+    title: Option<String>,
+}
+
+/// Loads `session_id -> (workspace_dir, title)` from MiniMax Code's runtime
+/// SQLite ledger. A missing file or table is not an error: the sessions are
+/// still imported, just without the enrichment.
+fn load_mcode_runtime_session_meta(
+    state_db_path: &Path,
+) -> HashMap<String, McodeRuntimeSessionMeta> {
+    let mut meta = HashMap::new();
+    let Ok(conn) = Connection::open_with_flags(
+        state_db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return meta;
+    };
+    let _ = conn.busy_timeout(std::time::Duration::from_secs(2));
+
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_runtime_sessions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !table_exists {
+        return meta;
+    }
+
+    let Ok(mut statement) =
+        conn.prepare("SELECT session_id, workspace_dir, title FROM local_runtime_sessions")
+    else {
+        return meta;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    }) else {
+        return meta;
+    };
+    for (session_id, workspace_dir, title) in rows.flatten() {
+        meta.insert(
+            session_id,
+            McodeRuntimeSessionMeta {
+                workspace_dir,
+                title,
+            },
+        );
+    }
+    meta
+}
+
+/// Byte length of `path`, or `None` when its trailing JSONL record is still
+/// being written. MiniMax Code appends records, so a file not ending in a
+/// newline may grow; skipping it keeps the incremental fingerprint honest.
+fn complete_file_len(path: &Path) -> Option<u64> {
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return Some(0);
+    }
+    file.seek(SeekFrom::End(-1)).ok()?;
+    let mut last_byte = [0u8; 1];
+    file.read_exact(&mut last_byte).ok()?;
+    (last_byte[0] == b'\n').then_some(len)
+}
+
+/// MiniMax Code stores one session per dated directory and splits its
+/// transcript across `messages.jsonl` plus `snapshots/*.jsonl`, so the parse
+/// unit is the directory rather than a single file. The incremental
+/// fingerprint is therefore the combined size of the session's JSONL files,
+/// and the rebuild is scoped to the session's `messages.jsonl` path.
+pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> Result<(), String> {
+    let session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    // The runtime ledger is opened lazily and only when a session actually
+    // changed, so an uninstalled MiniMax Code runtime costs nothing.
+    let mut runtime_meta: Option<HashMap<String, McodeRuntimeSessionMeta>> = None;
+
+    for session_dir in session_dirs {
+        let files = crate::mcode::session_jsonl_files(&session_dir);
+        if files.is_empty() {
+            continue;
+        }
+
+        let mut current_size: u64 = 0;
+        let mut complete = true;
+        for file in &files {
+            match complete_file_len(file) {
+                Some(len) => current_size = current_size.saturating_add(len),
+                None => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        if !complete {
+            continue;
+        }
+
+        let state_name = portable_relative_path(mcode_dir, &session_dir);
+        let state_key = format!("mcode:{state_name}");
+        let last_synced_size: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
+                params![state_key],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        if current_size == last_synced_size {
+            continue;
+        }
+
+        let runtime_meta = runtime_meta
+            .get_or_insert_with(|| load_mcode_runtime_session_meta(&get_mcode_state_db_path()));
+        let session_id = crate::mcode::read_session_metadata(&session_dir);
+        let runtime_session = runtime_meta.get(&session_id);
+        let cwd = runtime_session
+            .and_then(|meta| meta.workspace_dir.as_deref())
+            .filter(|directory| !directory.trim().is_empty());
+        let session_name = runtime_session
+            .and_then(|meta| meta.title.as_deref())
+            .filter(|title| !title.trim().is_empty());
+
+        let parsed_entries =
+            match crate::mcode::parse_session_usage(&session_dir, cwd, session_name) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    eprintln!(
+                        "解析 MiniMax Code session 目錄 {:?} 失敗: {}",
+                        session_dir, error
+                    );
+                    continue;
+                }
+            };
+
+        let transcript_path = crate::mcode::session_transcript_path(&session_dir)
+            .to_string_lossy()
+            .into_owned();
+        let tx = conn
+            .transaction()
+            .map_err(|error| format!("MiniMax Code transaction BEGIN 失敗: {error}"))?;
+        delete_usage_entries_for_transcript(&tx, "mcode", &transcript_path, "MiniMax Code")?;
+        insert_usage_entries(&tx, "mcode", "MiniMax Code", &parsed_entries)?;
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, ?)",
+            params![state_key, current_size as i64, now],
+        )
+        .map_err(|error| format!("更新 MiniMax Code sync state 失敗: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("提交 MiniMax Code transaction 失敗: {error}"))?;
+    }
+
+    Ok(())
 }
 
 /// Unified sync function triggering sync for all supported assistants
@@ -6126,6 +5262,12 @@ pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
     let muse_dir = get_muse_dir();
     if let Err(e) = sync_muse_usage_logs(conn, &muse_dir) {
         eprintln!("❌ 同步 Muse 失敗: {}", e);
+    }
+
+    // 12. Sync MiniMax Code sessions
+    let mcode_dir = get_mcode_dir();
+    if let Err(e) = sync_mcode_usage_logs(conn, &mcode_dir) {
+        eprintln!("❌ 同步 MiniMax Code 失敗: {}", e);
     }
     Ok(())
 }
@@ -6441,19 +5583,22 @@ pub fn get_available_dates(
     Ok(dates)
 }
 
-pub fn get_usage_entries_by_date(
+fn query_usage_entries(
     conn: &rusqlite::Connection,
-    date: &str,
+    date_filter: &str,
     assistant: &str,
-) -> Result<Vec<(UsageDayExportRecord, String)>, String> {
+    exact_date: bool,
+) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
     let mut query = "SELECT
             timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
             tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
             delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
             duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort, import_source_id, source_kind, source_dir_key, reported_cost_usd
-         FROM usage_entries WHERE date = ?".to_string();
+            , usage_identity, date
+         FROM usage_entries WHERE date ".to_string();
+    query.push_str(if exact_date { "= ?" } else { "LIKE ?" });
     let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(date.to_string()));
+    params_vec.push(rusqlite::types::Value::Text(date_filter.to_string()));
 
     if assistant != "all" {
         let assistants: Vec<&str> = assistant.split(',').collect();
@@ -6628,19 +5773,43 @@ pub fn get_usage_entries_by_date(
                 reasoning_effort: row.get(31).ok(),
             },
             import_source_id,
+            usage_identity: Some(
+                row.get::<_, String>(36)
+                    .map_err(|e| e.to_string())?
+                    .trim()
+                    .to_string(),
+            ),
         };
 
+        if record.usage_identity.as_deref() == Some("") {
+            record.usage_identity = None;
+        }
+
+        let entry_date = row.get::<_, String>(37).map_err(|e| e.to_string())?;
         if record.import_source_id.is_none() {
             record.import_source_id = Some(build_usage_entry_import_source_id(
                 assistant,
-                date,
+                &entry_date,
                 &record.entry,
+                record.usage_identity.as_deref(),
             ));
         }
 
-        entries.push((record, ast_type));
+        entries.push(UsageDayRecordWithAssistant {
+            record,
+            assistant_type: ast_type,
+            date: entry_date,
+        });
     }
     Ok(entries)
+}
+
+pub fn get_usage_entries_by_date(
+    conn: &rusqlite::Connection,
+    date: &str,
+    assistant: &str,
+) -> Result<Vec<UsageDayRecordWithAssistant>, String> {
+    query_usage_entries(conn, date, assistant, true)
 }
 
 fn entry_date_from_timestamp(timestamp: &str) -> Option<&str> {
@@ -6681,12 +5850,14 @@ pub fn export_usage_day_entries(
     let rows = get_usage_entries_by_date(conn, date, assistant)?;
     let mut records = Vec::with_capacity(rows.len());
 
-    for (mut record, _assistant_type) in rows {
+    for row in rows {
+        let mut record = row.record;
         if record.import_source_id.is_none() {
             record.import_source_id = Some(build_usage_entry_import_source_id(
                 assistant,
                 date,
                 &record.entry,
+                record.usage_identity.as_deref(),
             ));
         }
         records.push(record);
@@ -6757,49 +5928,162 @@ pub fn import_usage_day_entries(
     .map_err(|e| format!("建立匯入批次失敗: {e}"))?;
 
     for record in records {
-        let mut entry = record.entry;
-        let normalized_id = normalize_import_source_id(record.import_source_id.as_deref());
+        let UsageDayExportRecord {
+            mut entry,
+            import_source_id,
+            usage_identity: exported_usage_identity,
+        } = record;
+        let normalized_id = normalize_import_source_id(import_source_id.as_deref());
         // 先用舊邏輯驗證 timestamp 格式合法（維持既有的匯入把關行為），
         // 實際寫入的日期則用本地時區轉換，避免匯入的資料重蹈 UTC 歸日 bug。
         entry_date_from_timestamp(&entry.timestamp)
             .ok_or_else(|| "無效的 timestamp 格式，無法取得日期".to_string())?;
         let record_date = local_date_from_timestamp(&entry.timestamp);
-        let generated_source_id =
-            build_usage_entry_import_source_id(assistant, &record_date, &entry);
-
-        let source_kind = entry
+        let mut source_kind = entry
             .source_kind
             .clone()
             .unwrap_or_else(|| "legacy".to_string());
-        let usage_identity = if assistant == "grok" && source_kind == crate::grok::USAGE_SOURCE_KIND
-        {
-            entry
-                .model_id
-                .as_deref()
-                .filter(|model| !model.trim().is_empty())
-                .map(|model| format!("model:{model}"))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+        let usage_identity = exported_usage_identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let model = entry
+                    .model_id
+                    .as_deref()
+                    .or(entry.model.as_deref())
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty());
+                if assistant == "copilot"
+                    && matches!(source_kind.as_str(), "copilot-app" | "copilot-cli")
+                {
+                    let agent = entry
+                        .agent_nickname
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|agent| !agent.is_empty())
+                        .unwrap_or("main");
+                    format!(
+                        "agent={};model={}",
+                        encode_hex(agent.as_bytes()),
+                        encode_hex(model.unwrap_or_default().as_bytes())
+                    )
+                } else if matches!(assistant, "grok" | "pi" | "omp") {
+                    model
+                        .map(|model| format!("model:{model}"))
+                        .unwrap_or_default()
+                } else if assistant == "codex" {
+                    // Exports written before rollout identities existed carry a
+                    // transcript path but no identity. Deriving it here keeps the
+                    // imported row on the same unique key as the locally synced
+                    // row, so the import dedupes instead of counting twice.
+                    entry
+                        .transcript_path
+                        .as_deref()
+                        .and_then(codex_rollout_identity)
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            });
+        let generated_source_id = build_usage_entry_import_source_id(
+            assistant,
+            &record_date,
+            &entry,
+            Some(&usage_identity),
+        );
+        // A codex export without a usable source kind (`legacy` is what this app
+        // writes when an import has no local counterpart, and older exports omit
+        // the field) would never match the locally parsed `codex-desktop` /
+        // `codex-cli` rows and would therefore keep its own copy of a turn the
+        // local sync already knows about. Adopting the local row's source kind
+        // puts the imported row on the same unique key so it dedupes instead of
+        // counting twice.
+        let exported_source_kind = entry
+            .source_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|kind| !kind.is_empty() && *kind != "legacy");
+        if assistant == "codex" && exported_source_kind.is_none() && !usage_identity.is_empty() {
+            let local_source_kind: Option<String> = tx
+                .query_row(
+                    "SELECT source_kind FROM usage_entries
+                     WHERE assistant_type = 'codex'
+                       AND session_id = ?
+                       AND turn_no = ?
+                       AND usage_identity <> ''
+                       AND usage_identity = ?
+                       AND import_source_id IS NULL
+                       AND import_batch_id IS NULL
+                     LIMIT 1",
+                    params![
+                        entry.session_id,
+                        entry.turn_no as i64,
+                        usage_identity.as_str()
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("查詢本機 Codex 來源類型失敗: {error}"))?;
+            if let Some(local_source_kind) = local_source_kind {
+                source_kind = local_source_kind;
+            }
+        }
         if assistant == "copilot" && matches!(source_kind.as_str(), "copilot-cli" | "legacy") {
             normalize_copilot_cli_usage_entry(&mut entry);
         } else if assistant == "claude" {
             normalize_legacy_claude_usage_entry(&mut entry);
         }
-        let source_id = normalized_id.unwrap_or(generated_source_id);
+        let source_id = match normalized_id {
+            Some(source_id) => {
+                let conflicts_with_existing_identity: i64 = tx
+                    .query_row(
+                        "SELECT EXISTS (
+                            SELECT 1
+                            FROM usage_entries
+                            WHERE assistant_type = ?1
+                              AND import_source_id = ?2
+                              AND NOT (
+                                  source_kind = ?3
+                                  AND source_dir_key IS ?4
+                                  AND session_id = ?5
+                                  AND turn_no = ?6
+                                  AND usage_identity = ?7
+                              )
+                        )",
+                        params![
+                            assistant,
+                            source_id,
+                            source_kind,
+                            entry.source_dir_key.as_deref(),
+                            entry.session_id,
+                            entry.turn_no as i64,
+                            usage_identity,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("檢查匯入資料來源識別衝突失敗: {error}"))?;
+                if conflicts_with_existing_identity != 0 {
+                    format!("{source_id}:{generated_source_id}")
+                } else {
+                    source_id
+                }
+            }
+            None => generated_source_id,
+        };
 
         let imported = tx
             .execute(
                 "INSERT OR IGNORE INTO usage_entries (
-                    assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
+                    assistant_type, source_kind, source_dir_key, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no,
                     model, model_id, tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
                     duration_ms, premium_requests, reported_cost_usd,
                     parent_session_id, agent_nickname, agent_role, reasoning_effort,
                     import_source_id, import_batch_id
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?, ?
@@ -6807,6 +6091,7 @@ pub fn import_usage_day_entries(
                 rusqlite::params![
                     assistant,
                     source_kind,
+                    entry.source_dir_key,
                     usage_identity,
                     entry.timestamp,
                     record_date,
@@ -6912,6 +6197,19 @@ pub fn list_usage_import_batches(
         .map_err(|e| format!("讀取匯入批次失敗: {e}"))
 }
 
+/// Escape `LIKE` wildcards in a literal rollout stem so a name such as
+/// `rollout-...-a_b` only matches its own sync-state key.
+fn escape_like_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 pub fn rollback_usage_import_batch(
     conn: &mut Connection,
     assistant: &str,
@@ -6935,6 +6233,42 @@ pub fn rollback_usage_import_batch(
     };
     if rolled_back_at.is_some() {
         return Err("指定的匯入批次已撤銷".to_string());
+    }
+
+    // Codex rows that were rolled back may have shadowed local transcript rows:
+    // the local sync yields to an existing row of the same rollout and turn, so
+    // clearing the sync state of exactly those rollouts makes the next sync pass
+    // rebuild the local rows instead of leaving them missing.
+    if assistant == "codex" {
+        let rolled_back_stems = {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT DISTINCT usage_identity
+                     FROM usage_entries
+                     WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                )
+                .map_err(|e| format!("準備讀取匯入的 Codex rollout 身分失敗: {e}"))?;
+            let rows = stmt
+                .query_map(params![batch_id], |row| row.get::<_, String>(0))
+                .map_err(|e| format!("讀取匯入的 Codex rollout 身分失敗: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("解析匯入的 Codex rollout 身分失敗: {e}"))?
+                .into_iter()
+                .filter_map(|identity| {
+                    identity
+                        .strip_prefix("rollout=")
+                        .map(str::to_string)
+                        .filter(|stem| !stem.is_empty())
+                })
+                .collect::<Vec<_>>()
+        };
+        for stem in rolled_back_stems {
+            tx.execute(
+                "DELETE FROM sync_state WHERE filename LIKE ? ESCAPE '\\'",
+                params![format!("codex:%{}.jsonl", escape_like_pattern(&stem))],
+            )
+            .map_err(|e| format!("清除 Codex 同步狀態失敗: {e}"))?;
+        }
     }
 
     let removed_records = tx
@@ -6964,17 +6298,60 @@ pub fn rollback_usage_import_batch(
     })
 }
 
-/// Session identity tuple returned by [`get_session_assistant_and_transcript`]:
-/// `(assistant_type, transcript_path, source_kind, source_dir_key,
-/// parent_session_id, agent_nickname)`.
-pub type SessionIdentity = (
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+/// Database fields required to locate and parse one concrete session source.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SessionLookup {
+    pub assistant_type: String,
+    pub transcript_path: Option<String>,
+    pub source_kind: String,
+    pub source_dir_key: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub agent_nickname: Option<String>,
+}
+
+/// Database-backed details scoped to the same concrete session source as a
+/// [`SessionLookup`]. Keeping the three related lookups behind one method
+/// prevents callers from accidentally mixing assistant, source, or directory
+/// identity between queries.
+pub struct SessionData {
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub turn_stats: HashMap<u32, (TokenStats, String)>,
+}
+
+impl SessionLookup {
+    pub fn load_data(
+        &self,
+        conn: &rusqlite::Connection,
+        session_id: &str,
+    ) -> Result<SessionData, String> {
+        let source_kind = Some(self.source_kind.as_str());
+        let source_dir_key = self.source_dir_key.as_deref();
+        Ok(SessionData {
+            cwd: get_session_cwd(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+            model: get_session_model(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+            turn_stats: get_session_turns_token_stats(
+                conn,
+                &self.assistant_type,
+                session_id,
+                source_kind,
+                source_dir_key,
+            )?,
+        })
+    }
+}
 
 /// Resolves the single `source_kind` used by the legacy `source_kind = None`
 /// fallback. All four session-lookup helpers
@@ -7055,8 +6432,7 @@ fn resolve_session_source_kind(
     }
 }
 
-/// Returns `(assistant_type, transcript_path, source_kind, source_dir_key,
-/// parent_session_id, agent_nickname)` for a given session id.
+/// Returns the fields required to locate and parse a given session id.
 ///
 /// `source_kind` and `source_dir_key` narrow the query so that sessions with the
 /// same `session_id` from different sources (e.g. Copilot CLI vs. Copilot App,
@@ -7089,7 +6465,7 @@ pub fn get_session_assistant_and_transcript(
     session_id: &str,
     source_kind: Option<&str>,
     source_dir_key: Option<&str>,
-) -> Result<SessionIdentity, String> {
+) -> Result<SessionLookup, String> {
     // Build a deterministic query:
     // - When source_kind is provided, filter by it exactly.
     // - When source_dir_key is Some, filter by source_dir_key = ?.
@@ -7165,14 +6541,14 @@ pub fn get_session_assistant_and_transcript(
             .ok()
             .flatten()
             .filter(|s| !s.is_empty());
-        Ok((
-            ast,
-            path,
+        Ok(SessionLookup {
+            assistant_type: ast,
+            transcript_path: path,
             source_kind,
             source_dir_key,
             parent_session_id,
             agent_nickname,
-        ))
+        })
     } else {
         Err("Session not found".to_string())
     }
@@ -7479,194 +6855,17 @@ pub fn get_usage_entries_by_month(
     conn: &rusqlite::Connection,
     year_month: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String, String)>, String> {
-    let query_month = format!("{}-%", year_month);
-    let mut query = "SELECT
-            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind, source_dir_key, reported_cost_usd
-         FROM usage_entries WHERE date LIKE ?".to_string();
-    let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(query_month));
-
-    if assistant != "all" {
-        let assistants: Vec<&str> = assistant.split(',').collect();
-        let mut placeholders = Vec::new();
-        for a in assistants {
-            placeholders.push("?");
-            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
-        }
-        query.push_str(&format!(
-            " AND assistant_type IN ({})",
-            placeholders.join(",")
-        ));
-    }
-    query.push_str(" ORDER BY timestamp ASC");
-
-    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(params_vec))
-        .map_err(|e| e.to_string())?;
-
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row
-            .get::<_, Option<i64>>(9)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_output: Option<u64> = row
-            .get::<_, Option<i64>>(10)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(11)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(12)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(13)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let tokens = if let (Some(input), Some(output), Some(total)) =
-            (tokens_input, tokens_output, tokens_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: tokens_cache_read,
-                cache_write: tokens_cache_write,
-                cache_write_5m: tokens_cache_write_5m,
-                cache_write_1h: tokens_cache_write_1h,
-                reasoning: tokens_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(17)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(18)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(19)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(20)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(21)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(22)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(23)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_total: Option<u64> = row
-            .get::<_, Option<i64>>(24)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
-            (delta_input, delta_output, delta_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: delta_cache_read,
-                cache_write: delta_cache_write,
-                cache_write_5m: delta_cache_write_5m,
-                cache_write_1h: delta_cache_write_1h,
-                reasoning: delta_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(25)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-        let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(26)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-
-        let reported_cost_usd: Option<f64> =
-            row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
-        let cost =
-            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: duration_ms,
-                    total_duration_ms: None,
-                    total_premium_requests: premium_requests,
-                    reported_cost_usd,
-                })
-            } else {
-                None
-            };
-
-        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
-
-        entries.push((
-            UsageEntry {
-                timestamp: row.get(0).map_err(|e| e.to_string())?,
-                session_id: row.get(1).map_err(|e| e.to_string())?,
-                session_name: row.get(2).ok(),
-                transcript_path: row.get(3).ok(),
-                cwd: row.get(4).ok(),
-                version: row.get(5).ok(),
-                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-                model: row.get(7).ok(),
-                model_id: row.get(8).ok(),
-                tokens,
-                delta_tokens,
-                context: None,
-                cost,
-                source_kind: row.get(33).ok(),
-                source_dir_key: row.get(34).ok(),
-                parent_session_id: row.get(27).ok(),
-                agent_nickname: row.get(28).ok(),
-                agent_role: row.get(29).ok(),
-                reasoning_effort: row.get(31).ok(),
-            },
-            ast_type,
-            entry_date,
-        ));
-    }
-    Ok(entries)
+) -> Result<Vec<DatedUsageEntry>, String> {
+    let rows = query_usage_entries(conn, &format!("{year_month}-%"), assistant, false)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DatedUsageEntry {
+            entry: row.record.entry,
+            assistant_type: row.assistant_type,
+            date: row.date,
+        })
+        .collect())
 }
-
 pub fn get_available_years(
     conn: &rusqlite::Connection,
     assistant: &str,
@@ -7711,194 +6910,17 @@ pub fn get_usage_entries_by_year(
     conn: &rusqlite::Connection,
     year: &str,
     assistant: &str,
-) -> Result<Vec<(UsageEntry, String, String)>, String> {
-    let query_year = format!("{}-%", year);
-    let mut query = "SELECT
-            timestamp, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
-            tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_cache_write_5m, tokens_cache_write_1h, tokens_reasoning, tokens_total,
-            delta_input, delta_output, delta_cache_read, delta_cache_write, delta_cache_write_5m, delta_cache_write_1h, delta_reasoning, delta_total,
-            duration_ms, premium_requests, parent_session_id, agent_nickname, agent_role, assistant_type, reasoning_effort,
-            date, source_kind, source_dir_key, reported_cost_usd
-         FROM usage_entries WHERE date LIKE ?".to_string();
-    let mut params_vec = Vec::new();
-    params_vec.push(rusqlite::types::Value::Text(query_year));
-
-    if assistant != "all" {
-        let assistants: Vec<&str> = assistant.split(',').collect();
-        let mut placeholders = Vec::new();
-        for a in assistants {
-            placeholders.push("?");
-            params_vec.push(rusqlite::types::Value::Text(a.to_string()));
-        }
-        query.push_str(&format!(
-            " AND assistant_type IN ({})",
-            placeholders.join(",")
-        ));
-    }
-    query.push_str(" ORDER BY timestamp ASC");
-
-    let mut stmt = conn.prepare(&query).map_err(|e| e.to_string())?;
-    let mut rows = stmt
-        .query(rusqlite::params_from_iter(params_vec))
-        .map_err(|e| e.to_string())?;
-
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-        let ast_type = row.get::<_, String>(30).map_err(|e| e.to_string())?;
-        let tokens_input: Option<u64> = row
-            .get::<_, Option<i64>>(9)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_output: Option<u64> = row
-            .get::<_, Option<i64>>(10)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(11)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(12)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(13)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(14)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(15)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let tokens_total: Option<u64> = row
-            .get::<_, Option<i64>>(16)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let tokens = if let (Some(input), Some(output), Some(total)) =
-            (tokens_input, tokens_output, tokens_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: tokens_cache_read,
-                cache_write: tokens_cache_write,
-                cache_write_5m: tokens_cache_write_5m,
-                cache_write_1h: tokens_cache_write_1h,
-                reasoning: tokens_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let delta_input: Option<u64> = row
-            .get::<_, Option<i64>>(17)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_output: Option<u64> = row
-            .get::<_, Option<i64>>(18)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_read: Option<u64> = row
-            .get::<_, Option<i64>>(19)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write: Option<u64> = row
-            .get::<_, Option<i64>>(20)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_5m: Option<u64> = row
-            .get::<_, Option<i64>>(21)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_cache_write_1h: Option<u64> = row
-            .get::<_, Option<i64>>(22)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_reasoning: Option<u64> = row
-            .get::<_, Option<i64>>(23)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-        let delta_total: Option<u64> = row
-            .get::<_, Option<i64>>(24)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as u64);
-
-        let delta_tokens = if let (Some(input), Some(output), Some(total)) =
-            (delta_input, delta_output, delta_total)
-        {
-            Some(TokenStats {
-                input,
-                output,
-                cache_read: delta_cache_read,
-                cache_write: delta_cache_write,
-                cache_write_5m: delta_cache_write_5m,
-                cache_write_1h: delta_cache_write_1h,
-                reasoning: delta_reasoning,
-                total,
-            })
-        } else {
-            None
-        };
-
-        let duration_ms: Option<f64> = row
-            .get::<_, Option<i64>>(25)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-        let premium_requests: Option<f64> = row
-            .get::<_, Option<i64>>(26)
-            .map_err(|e| e.to_string())?
-            .map(|v| v as f64);
-
-        let reported_cost_usd: Option<f64> =
-            row.get::<_, Option<f64>>(35).map_err(|e| e.to_string())?;
-        let cost =
-            if duration_ms.is_some() || premium_requests.is_some() || reported_cost_usd.is_some() {
-                Some(CostStats {
-                    total_api_duration_ms: duration_ms,
-                    total_duration_ms: None,
-                    total_premium_requests: premium_requests,
-                    reported_cost_usd,
-                })
-            } else {
-                None
-            };
-
-        let entry_date = row.get::<_, String>(32).map_err(|e| e.to_string())?;
-
-        entries.push((
-            UsageEntry {
-                timestamp: row.get(0).map_err(|e| e.to_string())?,
-                session_id: row.get(1).map_err(|e| e.to_string())?,
-                session_name: row.get(2).ok(),
-                transcript_path: row.get(3).ok(),
-                cwd: row.get(4).ok(),
-                version: row.get(5).ok(),
-                turn_no: row.get::<_, i64>(6).map_err(|e| e.to_string())? as u32,
-                model: row.get(7).ok(),
-                model_id: row.get(8).ok(),
-                tokens,
-                delta_tokens,
-                context: None,
-                cost,
-                source_kind: row.get(33).ok(),
-                source_dir_key: row.get(34).ok(),
-                parent_session_id: row.get(27).ok(),
-                agent_nickname: row.get(28).ok(),
-                agent_role: row.get(29).ok(),
-                reasoning_effort: row.get(31).ok(),
-            },
-            ast_type,
-            entry_date,
-        ));
-    }
-    Ok(entries)
+) -> Result<Vec<DatedUsageEntry>, String> {
+    let rows = query_usage_entries(conn, &format!("{year}-%"), assistant, false)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DatedUsageEntry {
+            entry: row.record.entry,
+            assistant_type: row.assistant_type,
+            date: row.date,
+        })
+        .collect())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8163,6 +7185,26 @@ mod tests {
         path
     }
 
+    #[test]
+    fn recursive_jsonl_finder_includes_nested_case_insensitive_extensions_only() {
+        let root = temp_jsonl_path("recursive-jsonl-finder");
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let root_jsonl = root.join("root.jsonl");
+        let nested_jsonl = nested.join("nested.JSONL");
+        fs::write(&root_jsonl, "{}\n").unwrap();
+        fs::write(&nested_jsonl, "{}\n").unwrap();
+        fs::write(nested.join("ignored.json"), "{}").unwrap();
+
+        let mut files = find_jsonl_files(&root);
+        files.sort();
+        let mut expected = vec![root_jsonl, nested_jsonl];
+        expected.sort();
+        assert_eq!(files, expected);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     fn create_copilot_app_registry_from_events(app_dir: &Path) {
         let store = Connection::open(app_dir.join("session-store.db")).unwrap();
         let session_ids: Vec<String> = store
@@ -8338,6 +7380,7 @@ mod tests {
                 reasoning_effort: Some("high".to_string()),
             },
             import_source_id: Some("import-test-record".to_string()),
+            usage_identity: None,
         }
     }
 
@@ -8571,6 +7614,66 @@ mod tests {
     }
 
     #[test]
+    fn usage_source_directory_registry_is_scoped_by_source_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let source_a = PathBuf::from("registered/copilot-a");
+        let source_b = PathBuf::from("registered/copilot-b");
+
+        register_usage_source_directory(&conn, "copilot", "copilot-app", "aa", &source_a).unwrap();
+        register_usage_source_directory(&conn, "copilot", "copilot-app", "bb", &source_b).unwrap();
+
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "aa").unwrap(),
+            Some(source_a)
+        );
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "bb").unwrap(),
+            Some(source_b)
+        );
+        assert_eq!(
+            get_usage_source_directory(&conn, "copilot", "copilot-app", "cc").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn session_lookup_returns_parent_and_agent_for_subagent_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let parent = "74b6d236-d311-4675-9855-fee91bc508e5";
+        let agent = "call_v4b32z66";
+        let synthetic = format!("{parent}__{agent}");
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, source_dir_key, timestamp, date,
+                session_id, turn_no, model,
+                tokens_input, tokens_output, tokens_total,
+                delta_input, delta_output, delta_total,
+                parent_session_id, agent_nickname
+             ) VALUES (
+                'copilot', 'copilot-app', 'abcdef00', '2026-07-20T10:00:00Z', '2026-07-20',
+                ?, 1, 'K2.7', 100, 10, 110, 100, 10, 110, ?, ?
+             )",
+            params![synthetic, parent, agent],
+        )
+        .unwrap();
+
+        let lookup = get_session_assistant_and_transcript(
+            &conn,
+            "copilot",
+            &synthetic,
+            Some("copilot-app"),
+            Some("abcdef00"),
+        )
+        .unwrap();
+        assert_eq!(lookup.source_kind, "copilot-app");
+        assert_eq!(lookup.source_dir_key.as_deref(), Some("abcdef00"));
+        assert_eq!(lookup.parent_session_id.as_deref(), Some(parent));
+        assert_eq!(lookup.agent_nickname.as_deref(), Some(agent));
+    }
+
+    #[test]
     fn import_usage_day_entries_writes_and_deduplicates_records() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -8643,6 +7746,85 @@ mod tests {
         if chrono::Local::now().offset().local_minus_utc() != 0 {
             assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
         }
+    }
+
+    #[test]
+    fn import_preserves_copilot_source_directories_and_multi_model_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut first = sample_import_record();
+        first.entry.session_id = "shared-copilot-session".to_string();
+        first.entry.source_kind = Some("copilot-app".to_string());
+        first.entry.source_dir_key = Some("aa".to_string());
+        first.entry.agent_nickname = None;
+        first.entry.model = Some("gpt-5".to_string());
+        first.entry.model_id = Some("gpt-5".to_string());
+        first.import_source_id = Some("shared-external-id".to_string());
+
+        let mut second = first.clone();
+        second.entry.model = Some("claude-sonnet-4".to_string());
+        second.entry.model_id = Some("claude-sonnet-4".to_string());
+        second.import_source_id = Some("shared-external-id".to_string());
+
+        let mut third = first.clone();
+        third.entry.source_dir_key = Some("bb".to_string());
+        third.import_source_id = Some("shared-external-id".to_string());
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "copilot",
+            "2026-07-10",
+            vec![first, second, third],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.imported, 3);
+        assert_eq!(summary.skipped_duplicates, 0);
+        let persisted: (u64, u64, u64, u64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT source_dir_key),
+                        COUNT(DISTINCT usage_identity),
+                        COUNT(DISTINCT import_source_id)
+                 FROM usage_entries
+                 WHERE assistant_type = 'copilot'
+                   AND session_id = 'shared-copilot-session'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, (3, 2, 2, 3));
+
+        let exported = export_usage_day_entries(&conn, "copilot", "2026-07-10").unwrap();
+        assert_eq!(exported.len(), 3);
+        assert!(exported.iter().all(|record| {
+            record.entry.source_dir_key.is_some() && record.usage_identity.is_some()
+        }));
+
+        let mut round_trip = Connection::open_in_memory().unwrap();
+        init_db(&round_trip).unwrap();
+        let round_trip_summary = import_usage_day_entries(
+            &mut round_trip,
+            "copilot",
+            "2026-07-10",
+            exported.clone(),
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(round_trip_summary.imported, 3);
+        assert_eq!(round_trip_summary.skipped_duplicates, 0);
+
+        let repeated_summary = import_usage_day_entries(
+            &mut round_trip,
+            "copilot",
+            "2026-07-10",
+            exported,
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(repeated_summary.imported, 0);
+        assert_eq!(repeated_summary.skipped_duplicates, 3);
     }
 
     #[test]
@@ -8797,7 +7979,7 @@ mod tests {
         );
         let legacy_source_id = format!("{:016x}", hash_fnv1a_64(&legacy_signature));
         assert_eq!(
-            build_usage_entry_import_source_id("claude", "2026-07-10", entry),
+            build_usage_entry_import_source_id("claude", "2026-07-10", entry, None),
             legacy_source_id
         );
 
@@ -8974,10 +8156,13 @@ mod tests {
             get_session_turns_token_stats(&conn, "claude", "claude-cache-write-ttl", None, None)
                 .unwrap();
         let entries = [
-            &day_entries[0].0.entry,
-            &month_entries[0].0,
-            &year_entries[0].0,
+            &day_entries[0].record.entry,
+            &month_entries[0].entry,
+            &year_entries[0].entry,
         ];
+        assert_eq!(day_entries[0].date, "2026-07-10");
+        assert_eq!(month_entries[0].date, "2026-07-10");
+        assert_eq!(year_entries[0].date, "2026-07-10");
 
         for entry in entries {
             let tokens = entry.tokens.as_ref().unwrap();
@@ -9033,7 +8218,7 @@ mod tests {
             .unwrap();
         }
 
-        let (_, transcript_path, source_kind, _, _, _) = get_session_assistant_and_transcript(
+        let lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             "shared",
@@ -9041,16 +8226,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(source_kind, "vscode-chat");
-        assert_eq!(transcript_path.as_deref(), Some("/tmp/vscode/session.json"));
+        assert_eq!(lookup.source_kind, "vscode-chat");
+        assert_eq!(
+            lookup.transcript_path.as_deref(),
+            Some("/tmp/vscode/session.json")
+        );
 
-        let cwd = get_session_cwd(&conn, "copilot", "shared", Some("vscode-chat"), None).unwrap();
-        assert_eq!(cwd.as_deref(), Some("/tmp/vscode"));
-
-        let turns =
-            get_session_turns_token_stats(&conn, "copilot", "shared", Some("vscode-chat"), None)
-                .unwrap();
-        let (tokens, model) = turns.get(&1).unwrap();
+        let session_data = lookup.load_data(&conn, "shared").unwrap();
+        assert_eq!(session_data.cwd.as_deref(), Some("/tmp/vscode"));
+        assert_eq!(session_data.model.as_deref(), Some("gpt-4.1"));
+        let (tokens, model) = session_data.turn_stats.get(&1).unwrap();
         assert_eq!(tokens.input, 20);
         assert_eq!(tokens.output, 1);
         assert_eq!(tokens.total, 21);
@@ -9427,174 +8612,1771 @@ mod tests {
         assert_eq!(inserted, ("copilot-cli".to_string(), 42_530, 42_530));
     }
 
-    #[test]
-    fn parse_codex_session_file_derives_delta_from_cumulative_usage() {
-        let path = temp_jsonl_path("codex-parser");
+    fn codex_token_count_event(timestamp: &str, input: u64, cached: u64, output: u64) -> String {
+        let total = input + output;
+        format!(
+            r#"{{"timestamp":"{timestamp}","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{input},"cached_input_tokens":{cached},"output_tokens":{output},"reasoning_output_tokens":0,"total_tokens":{total}}},"model_context_window":258400}}}}}}"#
+        )
+    }
 
-        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-1","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
-{"timestamp":"2026-07-07T10:58:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T10:59:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":19347},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T11:00:26.197Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"last_token_usage":{"input_tokens":30,"cached_input_tokens":10,"output_tokens":5,"reasoning_output_tokens":3,"total_tokens":35},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 3);
-
-        let first = entries[0].delta_tokens.as_ref().unwrap();
-        assert_eq!(first.input, 80);
-        assert_eq!(first.cache_read, Some(20));
-        assert_eq!(first.output, 10);
-        assert_eq!(first.reasoning, Some(4));
-        assert_eq!(first.total, 110);
-
-        let anomalous = entries[1].delta_tokens.as_ref().unwrap();
-        assert_eq!(anomalous.input, 0);
-        assert_eq!(anomalous.cache_read, Some(0));
-        assert_eq!(anomalous.output, 0);
-        assert_eq!(anomalous.reasoning, Some(0));
-        assert_eq!(anomalous.total, 0);
-
-        let third = entries[2].delta_tokens.as_ref().unwrap();
-        assert_eq!(third.input, 20);
-        assert_eq!(third.cache_read, Some(10));
-        assert_eq!(third.output, 5);
-        assert_eq!(third.reasoning, Some(3));
-        assert_eq!(third.total, 35);
-
-        let total = entries
-            .iter()
-            .map(|entry| entry.delta_tokens.as_ref().unwrap().total)
-            .sum::<u64>();
-        assert_eq!(total, 145);
+    fn codex_session_meta(session_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"2026-09-10T16:06:47.280Z","type":"session_meta","payload":{{"session_id":"{session_id}","id":"{session_id}","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.153.4"}}}}"#
+        )
     }
 
     #[test]
-    fn parse_codex_session_file_sums_completed_task_durations() {
-        let path = temp_jsonl_path("codex-task-duration");
-
-        let content = r#"{"timestamp":"2026-07-07T10:58:17.474Z","type":"session_meta","payload":{"session_id":"session-duration","model":"gpt-5.5"}}
-{"timestamp":"2026-07-07T10:58:18.000Z","type":"event_msg","payload":{"type":"task_started"}}
-{"timestamp":"2026-07-07T10:58:19.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":1200}}
-{"timestamp":"2026-07-07T10:58:20.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-07T10:58:21.000Z","type":"event_msg","payload":{"type":"task_started"}}
-{"timestamp":"2026-07-07T10:58:22.000Z","type":"event_msg","payload":{"type":"task_complete","duration_ms":2300}}
-{"timestamp":"2026-07-07T10:58:23.000Z","type":"event_msg","payload":{"type":"task_started","duration_ms":9000}}
-{"timestamp":"2026-07-07T10:58:24.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":130,"cached_input_tokens":30,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":145},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|entry| {
-            entry
-                .cost
-                .as_ref()
-                .and_then(|cost| cost.total_api_duration_ms)
-                == Some(3500.0)
-        }));
-    }
-
-    #[test]
-    fn parse_codex_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
-        let path = temp_jsonl_path("codex-session-name");
-        let content = r#"{"timestamp":"2026-07-16T00:00:00Z","type":"session_meta","payload":{"session_id":"session-name","model":"gpt-5.5"}}
-{"timestamp":"2026-07-16T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"第一條提示"}}
-{"timestamp":"2026-07-16T00:00:02Z","type":"event_msg","payload":{"type":"user_message","message":"第二條提示"}}
-{"timestamp":"2026-07-16T00:00:03Z","type":"event_msg","payload":{"type":"agent_message","message":"收到"}}
-{"timestamp":"2026-07-16T00:00:04Z","type":"event_msg","payload":{"type":"user_message","message":"後續提示"}}
-{"timestamp":"2026-07-16T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_name.as_deref(), Some("第二條提示"));
-    }
-
-    #[test]
-    fn parse_codex_session_file_ignores_repeats_and_handles_resets() {
-        let path = temp_jsonl_path("codex-parser");
-
-        let content = r#"{"timestamp":"2026-06-17T13:50:00.000Z","type":"session_meta","payload":{"session_id":"session-2","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5"}}
-{"timestamp":"2026-06-17T13:50:51.243Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T13:50:54.339Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"last_token_usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":40,"total_tokens":1100},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T13:53:01.169Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":121600},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0,"total_tokens":0},"model_context_window":121600}}}
-{"timestamp":"2026-06-17T14:43:08.185Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":121820},"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20,"reasoning_output_tokens":8,"total_tokens":220},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0].delta_tokens.as_ref().unwrap().total, 1100);
-        assert_eq!(entries[1].delta_tokens.as_ref().unwrap().total, 0);
-        assert_eq!(entries[2].delta_tokens.as_ref().unwrap().total, 0);
-
-        let after_reset = entries[3].delta_tokens.as_ref().unwrap();
-        assert_eq!(after_reset.input, 150);
-        assert_eq!(after_reset.cache_read, Some(50));
-        assert_eq!(after_reset.output, 20);
-        assert_eq!(after_reset.reasoning, Some(8));
-        assert_eq!(after_reset.total, 220);
-    }
-
-    #[test]
-    fn parse_codex_session_file_keeps_subagent_identity_separate_from_parent() {
-        let path = temp_jsonl_path("codex-subagent");
-        let content = r#"{"timestamp":"2026-07-10T03:45:00.000Z","type":"session_meta","payload":{"session_id":"parent-session","id":"child-session","forked_from_id":"parent-session","parent_thread_id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","agent_nickname":"reviewer","agent_role":"review","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1,"agent_nickname":"reviewer","agent_role":"review"}}}}}
-{"timestamp":"2026-07-10T03:45:00.500Z","type":"session_meta","payload":{"session_id":"parent-session","id":"parent-session","cwd":"/tmp/project","cli_version":"0.142.5","model":"gpt-5.5","source":"cli"}}
-{"timestamp":"2026-07-10T03:45:01.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].session_id, "child-session");
+    fn codex_rollout_identity_follows_the_transcript_file_name() {
         assert_eq!(
-            entries[0].parent_session_id.as_deref(),
-            Some("parent-session")
+            codex_rollout_identity(
+                "/home/u/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-abc.jsonl"
+            )
+            .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
         );
-        assert_ne!(entries[0].session_id, "parent-session");
+        assert_eq!(
+            codex_rollout_identity(
+                r"C:\Users\u\.codex\archived_sessions\rollout-2026-09-11T00-06-46-abc.jsonl"
+            )
+            .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
+        );
+        assert_eq!(
+            codex_rollout_identity("rollout-2026-09-11T00-09-32-abc_def.jsonl").as_deref(),
+            Some("rollout=rollout-2026-09-11T00-09-32-abc_def")
+        );
+        assert_eq!(codex_rollout_identity(""), None);
+        assert_eq!(codex_rollout_identity("/tmp/.jsonl"), None);
+        // Anything that is not a documented rollout file is not a rollout:
+        // adopting it would let a later local file with the same name purge
+        // rows that came from an import or from an unrelated file.
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/sessions/notes.jsonl"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity(r"C:\Users\u\.codex\archived_sessions\history.jsonl"),
+            None
+        );
+        // Only `.jsonl` rollouts exist, so an unrelated file that happens to
+        // carry the same stem must not share the identity of the real rollout.
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/uploads/rollout-2026-09-11T00-06-46-abc.txt"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/uploads/rollout-2026-09-11T00-06-46-abc"),
+            None
+        );
+        assert_eq!(
+            codex_rollout_identity("/tmp/.codex/sessions/rollout-2026-09-11T00-06-46-abc.JSONL")
+                .as_deref(),
+            Some("rollout=rollout-2026-09-11T00-06-46-abc")
+        );
     }
 
     #[test]
-    fn parse_codex_desktop_session_preserves_source_and_cache_write_tokens() {
-        let path = temp_jsonl_path("codex-desktop");
-        let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","originator":"Codex Desktop","source":"vscode","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
-{"timestamp":"2026-07-26T10:00:00.500Z","type":"session_meta","payload":{"id":"desktop-session","session_id":"desktop-session","source":"cli","cwd":"/tmp/project","cli_version":"0.145.0-alpha.30"}}
-{"timestamp":"2026-07-26T10:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"cache_write_input_tokens":5,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110},"model_context_window":258400}}}
-{"timestamp":"2026-07-26T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"cache_write_input_tokens":8,"output_tokens":15,"reasoning_output_tokens":7,"total_tokens":165},"model_context_window":258400}}}
-"#;
+    fn codex_rollout_identity_migration_marks_stored_rows_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', '/codex/sessions/2026/09/11/rollout-a.jsonl', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:09:50Z', '2026-09-10',
+                'shared-session',
+                '/codex/archived_sessions/rollout-a_1.jsonl', 3)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 4)",
+            [],
+        )
+        .unwrap();
 
-        fs::write(&path, content).unwrap();
-        let entries = parse_codex_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
 
-        assert_eq!(entries.len(), 2);
-        assert!(entries
+        let identities: Vec<String> = conn
+            .prepare(
+                "SELECT usage_identity
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path IS NOT NULL
+                 ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            identities,
+            vec![
+                "rollout=rollout-a_1".to_string(),
+                "rollout=rollout-a".to_string()
+            ]
+        );
+
+        let untracked_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untracked_rows, 0);
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'later-session', '/codex/sessions/2026/09/11/rollout-b.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+        let later_identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND transcript_path = '/codex/sessions/2026/09/11/rollout-b.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_identity, "");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_keeps_imported_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', '/codex/sessions/2026/09/11/rollout-a.jsonl', 1)",
+            [],
+        )
+        .unwrap();
+        // Rows written before transcripts were tracked have no path and no
+        // import: they duplicate the session tracked by the rollout above.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 2)",
+            [],
+        )
+        .unwrap();
+        // Imported rows belong to the import batch and must survive both the
+        // migration and the local sync.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'shared-session', 3, 'codex-import:1', 'batch-1')",
+            [],
+        )
+        .unwrap();
+        // Imported rows carry the rollout identity of the file name they came
+        // from so that a re-import of the same rollout dedupes against the
+        // locally synced rows instead of counting every turn twice. The import
+        // exclusions keep them out of every identity and path purge.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:09:50Z', '2026-09-10',
+                'other-machine-session', '/other/.codex/sessions/2026/09/11/rollout-b.jsonl', 1,
+                'codex-import:2', 'batch-1')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let imported_rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT session_id, COALESCE(transcript_path, ''), usage_identity
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_source_id IS NOT NULL
+                 ORDER BY session_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            imported_rows,
+            vec![
+                (
+                    "other-machine-session".to_string(),
+                    "/other/.codex/sessions/2026/09/11/rollout-b.jsonl".to_string(),
+                    "rollout=rollout-b".to_string()
+                ),
+                ("shared-session".to_string(), String::new(), String::new()),
+            ]
+        );
+
+        let untracked_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND transcript_path IS NULL
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(untracked_rows, 0);
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_removes_local_duplicates_of_imported_turns() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let rollout_path =
+            "/codex/archived_sessions/2026/09/11/rollout-2026-09-11T00-06-46-dupe.jsonl";
+        // An older release stored this turn locally and also imported it, but the
+        // two rows disagreed about the source kind, so they never shared the
+        // unique key and both were counted.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'dupe-session', ?1, 1, '')",
+            params![rollout_path],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'legacy', '2026-09-10T16:06:50Z', '2026-09-10',
+                'dupe-session', ?1, 1, '', 'codex-import:7', 'batch-7')",
+            params![rollout_path],
+        )
+        .unwrap();
+        // The local transcript is already marked as synced, so no later sync pass
+        // would revisit the rollout on its own.
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:archived_sessions/2026/09/11/rollout-2026-09-11T00-06-46-dupe.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'dupe-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1, "an imported turn must not be counted twice");
+        let imported_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = 'batch-7'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_rows, 1, "the import owns the turn");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_guards_use_its_temporary_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The correlated guards must not rescan every Codex row per outer row,
+        // so the migration builds non-partial indexes for its own lookups.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no,
+                transcript_path, usage_identity, import_source_id
+             )
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 400)
+             SELECT 'codex', 'codex-desktop', '2026-09-11T00:00:00Z', '2026-09-11',
+                    'session-' || (n % 40), n % 400,
+                    '/codex/sessions/2026/09/11/rollout-' || n || '.jsonl',
+                    CASE WHEN n % 2 = 0 THEN 'rollout=rollout-' || n ELSE '' END,
+                    CASE WHEN n % 4 = 0 THEN 1000000 + n ELSE NULL END
+             FROM seq",
+            [],
+        )
+        .unwrap();
+        for create_index_sql in [
+            CODEX_ROLLOUT_IDENTITY_GUARD_INDEX_SQL,
+            CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX_SQL,
+        ] {
+            conn.execute(create_index_sql, []).unwrap();
+        }
+
+        let plans = [
+            (
+                CODEX_ROLLOUT_IDENTITY_BACKFILL_SQL,
+                CODEX_ROLLOUT_IDENTITY_GUARD_INDEX,
+                3,
+            ),
+            (
+                CODEX_ROLLOUT_IDENTITY_ORPHAN_DELETE_SQL,
+                CODEX_ROLLOUT_IDENTITY_GUARD_INDEX,
+                0,
+            ),
+            (
+                CODEX_ROLLOUT_IMPORT_DEDUPE_DELETE_SQL,
+                CODEX_ROLLOUT_IMPORT_IDENTITY_INDEX,
+                0,
+            ),
+        ];
+        for (statement, expected_index, bound_params) in plans {
+            let mut query_plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {statement}"))
+                .unwrap();
+            let bound: Vec<&str> = vec!["rollout=rollout-x"; bound_params];
+            let details: Vec<String> = query_plan
+                .query_map(rusqlite::params_from_iter(bound), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                details.iter().any(|detail| detail.contains(expected_index)),
+                "查詢計畫未使用 {expected_index}：{details:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_drops_its_temporary_indexes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-11T00:00:00Z', '2026-09-11',
+                'temporary-index-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-temporary.jsonl', 1, '')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let temporary_indexes: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'tmp_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            temporary_indexes, 0,
+            "the migration must drop the indexes it created"
+        );
+        let identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'temporary-index-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            identity, "rollout=rollout-2026-09-11T00-06-46-temporary",
+            "the migration must still backfill the identity"
+        );
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_scopes_pathless_rows_by_source_kind() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A pathless row of another source kind is a different session, so a
+        // tracked rollout of this kind says nothing about it.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', 'codex-other', '2026-09-10T16:06:50Z', '2026-09-10',
+                'cross-kind-session', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'cross-kind-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-cross.jsonl', 2,
+                'rollout=rollout-2026-09-11T00-06-46-cross')",
+            [],
+        )
+        .unwrap();
+        // A pathless row of the tracked kind is superseded by the rollout.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'same-kind-session', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'same-kind-session',
+                '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-same.jsonl', 2,
+                'rollout=rollout-2026-09-11T00-06-46-same')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        let cross_kind_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'cross-kind-session'
+                   AND COALESCE(transcript_path, '') = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            cross_kind_rows, 1,
+            "a rollout of another source kind must not delete pathless rows"
+        );
+        let same_kind_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'same-kind-session'
+                   AND COALESCE(transcript_path, '') = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            same_kind_rows, 0,
+            "a tracked rollout of the same source kind still supersedes pathless rows"
+        );
+    }
+
+    #[test]
+    fn codex_import_source_kind_lookup_uses_the_rollout_identity_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The planner only prefers the partial identity index once it actually
+        // holds rows, so the table is seeded before the plan is inspected.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, session_id, turn_no, usage_identity, transcript_path,
+                timestamp, date
+             )
+             WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 200)
+             SELECT 'codex', 'codex-desktop', 'session-' || (n % 50), n % 200,
+                    'rollout=rollout-' || n, '/codex/sessions/rollout-' || n || '.jsonl',
+                    '2026-09-11T00:00:00Z', '2026-09-11'
+             FROM seq",
+            [],
+        )
+        .unwrap();
+
+        let mut query_plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT source_kind FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = ?
+                   AND turn_no = ?
+                   AND usage_identity <> ''
+                   AND usage_identity = ?
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL
+                 LIMIT 1",
+            )
+            .unwrap();
+        let details: Vec<String> = query_plan
+            .query_map(params!["session", 1, "rollout=rollout-x"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_assistant_usage_identity")),
+            "查詢計畫未使用 rollout 身分索引：{details:?}"
+        );
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_imported_rows_of_a_synced_rollout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-import-sync-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("imported-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        // A second file that is not a rollout transcript must be ignored.
+        fs::write(
+            sessions_dir.join("notes.jsonl"),
+            format!("{}\n", codex_session_meta("notes-session")),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The imported row carries the same source kind, session, turn and
+        // identity as the locally parsed row, so it occupies the same unique
+        // key: the local write for that turn must yield instead of failing.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'codex-desktop', '2026-09-10T16:06:50Z', '2026-09-10',
+                'imported-session', ?, 1, ?, 'codex-import:1', 'batch-1')",
+            params![
+                transcript_path.to_string_lossy().as_ref(),
+                "rollout=rollout-2026-09-11T00-06-46-imported"
+            ],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let imported_identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_source_id = 'codex-import:1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            imported_identity,
+            "rollout=rollout-2026-09-11T00-06-46-imported"
+        );
+
+        let local_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND transcript_path = ?
+                   AND import_source_id IS NULL",
+                params![transcript_path.to_string_lossy().as_ref()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(local_rows > 0);
+
+        // The turn the import already covers is not duplicated, while the turn
+        // only the transcript knows about is still written: the collision must
+        // not roll back the whole transaction of this rollout.
+        let shared_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'imported-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_turn_rows, 1);
+        let later_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'imported-session' AND turn_no = 2
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_turn_rows, 1);
+        let synced_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synced_state, 1, "the sync transaction must commit");
+
+        let notes_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'notes-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notes_rows, 0, "non-rollout files must not be synced");
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn import_usage_day_entries_dedupes_codex_rollouts_against_local_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-desktop', '2026-07-10T12:34:56Z', '2026-07-10',
+                'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+            [],
+        )
+        .unwrap();
+
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl".to_string());
+        record.entry.source_kind = None;
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        // The imported row adopts the local source kind so it lands on the same
+        // unique key as the local row and is reported as a duplicate instead of
+        // being stored next to it and counting the turn twice.
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+        let rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'import-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_dedupes_exports_that_carry_the_legacy_kind() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity
+             ) VALUES ('codex', 'codex-cli', '2026-07-10T12:34:56Z', '2026-07-10',
+                'import-session', '/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl',
+                1, 'rollout=rollout-2026-09-11T00-06-46-legacy')",
+            [],
+        )
+        .unwrap();
+
+        // This app exports the stored kind verbatim, so a re-export of an import
+        // that had no local counterpart carries `legacy`.
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl".to_string());
+        record.entry.source_kind = Some("legacy".to_string());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        assert_eq!(summary.imported, 0);
+        assert_eq!(summary.skipped_duplicates, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_keeps_foreign_codex_kind_without_a_local_row() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path = Some(
+            "/other/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-foreign.jsonl"
+                .to_string(),
+        );
+        record.entry.source_kind = None;
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+        let row: (String, String) = conn
+            .query_row(
+                "SELECT source_kind, usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                params![summary.batch_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, "legacy");
+        assert_eq!(row.1, "rollout=rollout-2026-09-11T00-06-46-foreign");
+    }
+
+    #[test]
+    fn codex_rollout_identity_migration_keeps_pathless_rows_next_to_imports() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // A local row written before transcripts were tracked has no path.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', 'imported-session', 1)",
+            [],
+        )
+        .unwrap();
+        // An imported row of the same session carries a rollout path.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                import_source_id, import_batch_id
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10', 'imported-session',
+                '/other/.codex/sessions/2026/09/11/rollout-c.jsonl', 2,
+                'codex-import:3', 'batch-2')",
+            [],
+        )
+        .unwrap();
+
+        run_codex_rollout_identity_migration(&mut conn).unwrap();
+
+        // A transient import must never supersede local rows: the pathless row
+        // stays until the local transcript of that session is synced.
+        let pathless_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND COALESCE(transcript_path, '') = ''
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pathless_rows, 1);
+    }
+
+    #[test]
+    fn import_usage_day_entries_derives_the_codex_rollout_identity() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path = Some(
+            "/other/.codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-legacy.jsonl"
+                .to_string(),
+        );
+        record.usage_identity = None;
+
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.imported, 1);
+
+        // An export written before rollout identities existed still lands on the
+        // same unique key as the locally synced row of that rollout, so it
+        // dedupes instead of counting the turn twice.
+        let identity: String = conn
+            .query_row(
+                "SELECT usage_identity FROM usage_entries
+                 WHERE assistant_type = 'codex' AND import_batch_id = ?",
+                params![summary.batch_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identity, "rollout=rollout-2026-09-11T00-06-46-legacy");
+    }
+
+    #[test]
+    fn rollback_usage_import_batch_clears_only_the_affected_codex_sync_state() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut record = sample_import_record();
+        record.entry.transcript_path =
+            Some("/codex/sessions/2026/09/11/rollout-2026-09-11T00-06-46-rolled.jsonl".to_string());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-07-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:sessions/2026/09/11/rollout-2026-09-11T00-06-46-rolled.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('codex:sessions/2026/09/11/rollout-2026-09-11T00-06-46-kept.jsonl', 10, 0)",
+            [],
+        )
+        .unwrap();
+
+        let rolled_back =
+            rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        assert_eq!(rolled_back.removed_records, 1);
+
+        let rolled_back_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE '%rolled.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rolled_back_state, 0,
+            "the rolled back rollout must be re-synced so its local rows come back"
+        );
+        let kept_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE '%kept.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept_state, 1);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_yields_to_an_imported_rollout_with_another_source_kind() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-legacy-kind-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-restored.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("restored-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The rollout was imported before it existed locally, so the imported row
+        // carries the `legacy` kind while the local parser writes `codex-desktop`.
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, source_kind, timestamp, date, session_id, transcript_path,
+                turn_no, usage_identity, import_source_id, import_batch_id
+             ) VALUES ('codex', 'legacy', '2026-09-10T16:06:50Z', '2026-09-10',
+                'restored-session', ?, 1, ?, 'codex-import:9', 'batch-9')",
+            params![
+                transcript_path.to_string_lossy().as_ref(),
+                "rollout=rollout-2026-09-11T00-06-46-restored"
+            ],
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let shared_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'restored-session' AND turn_no = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            shared_turn_rows, 1,
+            "an imported turn must not be duplicated under another source kind"
+        );
+        let later_turn_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'restored-session' AND turn_no = 2
+                   AND import_source_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_turn_rows, 1);
+        let synced_state: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'codex:%restored.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(synced_state, 1, "the sync transaction must commit");
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_defers_a_fully_imported_rollout_until_its_import_is_rolled_back() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-fully-imported-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let transcript_path = sessions_dir.join("rollout-2026-09-11T00-06-46-imported.jsonl");
+        fs::write(
+            &transcript_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("fully-imported-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        let transcript_size = fs::metadata(&transcript_path).unwrap().len();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut record = sample_import_record();
+        record.entry.session_id = "fully-imported-session".to_string();
+        record.entry.turn_no = 1;
+        record.entry.transcript_path = Some(transcript_path.to_string_lossy().into_owned());
+        record.usage_identity = None;
+        let summary = import_usage_day_entries(
+            &mut conn,
+            "codex",
+            "2026-09-10",
+            vec![record],
+            UsageImportMetadata::default(),
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let local_rows: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = 'fully-imported-session'
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local_rows, 0,
+            "a rollout owned by an import batch must not be written again locally"
+        );
+
+        let synced_state: (u64, i64) = conn
+            .query_row(
+                "SELECT last_synced_size, last_synced_time FROM sync_state
+                 WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(synced_state.0, transcript_size);
+        assert_eq!(
+            synced_state.1, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME,
+            "with no local rows stored yet the state must carry the empty-transcript marker"
+        );
+
+        // The marker keeps the following passes from re-parsing a rollout that is
+        // still owned by the import.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let state_after_second_pass: i64 = conn
+            .query_row(
+                "SELECT last_synced_time FROM sync_state WHERE filename LIKE 'codex:%imported.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state_after_second_pass, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME);
+
+        rollback_usage_import_batch(&mut conn, "codex", &summary.batch_id).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let local_rows_after_rollback: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                   AND session_id = 'fully-imported-session'
+                   AND import_source_id IS NULL
+                   AND import_batch_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            local_rows_after_rollback, 1,
+            "rolling the import back must let the local parse store the rollout again"
+        );
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_the_stored_turns_of_a_partially_parsed_canonical_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-partial-canonical-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let complete_copy = archived_dir.join("rollout-2026-09-11T00-06-46-torn.jsonl");
+        fs::write(
+            &complete_copy,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("torn-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Only the copy exists at first, so both turns are stored from it.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let stored_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_turns, 2);
+
+        // The copy is moved into `sessions/` while Codex keeps appending, so the
+        // read catches a torn trailing line that parses into a prefix of the
+        // usage stored from the copy.
+        let canonical = sessions_dir.join("rollout-2026-09-11T00-06-46-torn.jsonl");
+        let padding = "x".repeat(400);
+        fs::write(
+            &canonical,
+            format!(
+                "{}\n{}\n{{\"timestamp\":\"2026-09-10T16:09:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":180,{padding}",
+                codex_session_meta("torn-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&canonical).unwrap().len() > fs::metadata(&complete_copy).unwrap().len(),
+            "the larger file wins the canonical choice, so the torn one must be bigger"
+        );
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let surviving_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            surviving_turns, 2,
+            "a transcript with unreadable lines must not replace the turns already stored"
+        );
+        let surviving_turn_numbers: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'torn-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(surviving_turn_numbers, vec![1, 2]);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_falls_back_to_a_parsable_copy_of_a_damaged_transcript() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-damaged-canonical-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let complete_copy = archived_dir.join("rollout-2026-09-11T00-06-46-damaged.jsonl");
+        fs::write(
+            &complete_copy,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("damaged-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+
+        // The larger canonical file is still being written while the copy already
+        // holds the complete usage, so the copy has to provide the rows.
+        let damaged = sessions_dir.join("rollout-2026-09-11T00-06-46-damaged.jsonl");
+        let padding = "x".repeat(400);
+        fs::write(
+            &damaged,
+            format!(
+                "{}\n{}\n{{\"timestamp\":\"2026-09-10T16:09:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":180,{padding}",
+                codex_session_meta("damaged-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&damaged).unwrap().len() > fs::metadata(&complete_copy).unwrap().len(),
+            "the damaged file must win the canonical choice for the fallback to matter"
+        );
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'damaged-session'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            stored_paths.len(),
+            1,
+            "the rollout must be stored from exactly one transcript"
+        );
+        assert_eq!(
+            stored_paths[0],
+            complete_copy.to_string_lossy(),
+            "a transcript with unreadable lines must not be the source of the rows"
+        );
+
+        let turns: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'damaged-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            turns,
+            vec![1, 2],
+            "the complete copy carries the usage that the damaged file cannot provide"
+        );
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_copy_rows_of_an_incompletely_parsed_canonical() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-torn-skip-cleanup-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let archived_dir = codex_dir
+            .join("archived_sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        fs::create_dir_all(&archived_dir).unwrap();
+        fs::create_dir_all(&sessions_dir).unwrap();
+
+        let archived = archived_dir.join("rollout-2026-09-11T00-06-46-gated.jsonl");
+        fs::write(
+            &archived,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("gated-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // The first turn is stored from the archived copy.
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let stored_turns: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'gated-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_turns, 1);
+
+        // The same rollout is copied into `sessions/` where it keeps growing, so
+        // the copy is damaged, larger, and chosen as canonical while the archived
+        // file still holds the first turn.
+        let growing = sessions_dir.join("rollout-2026-09-11T00-06-46-gated.jsonl");
+        let padding = "x".repeat(600);
+        fs::write(
+            &growing,
+            format!(
+                "{}\n{}\n{}\n{{\"timestamp\":\"2026-09-10T16:10:50.000Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":220,{padding}",
+                codex_session_meta("gated-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:08:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        assert!(
+            fs::metadata(&growing).unwrap().len() > fs::metadata(&archived).unwrap().len(),
+            "the growing file must win the canonical choice"
+        );
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        // The damaged transcript is now the rollout with the most rows, so the
+        // next pass takes the branch that only cleans up copies. It must not drop
+        // the archived rows while the canonical file cannot replace them.
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let surviving_turns: Vec<i64> = conn
+            .prepare(
+                "SELECT turn_no FROM usage_entries
+                 WHERE assistant_type = 'codex' AND session_id = 'gated-session'
+                 ORDER BY turn_no",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            surviving_turns,
+            vec![1, 2],
+            "rows of a rollout that only parsed partially must not be cleaned up as copies"
+        );
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_rollout_copies_when_the_canonical_file_is_empty() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-copy-atomic-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let file_name = "rollout-2026-09-11T00-07-00-atomic-session.jsonl";
+        let active_path = sessions_dir.join(file_name);
+        let archived_path = archived_dir.join(file_name);
+
+        // The live file is the canonical copy (larger and inside `sessions`)
+        // but carries no usage, so nothing may be rewritten or dropped.
+        fs::write(&active_path, "not json\n".repeat(400)).unwrap();
+        fs::write(
+            &archived_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("atomic-session"),
+                codex_token_count_event("2026-09-10T16:07:00.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (turn_no, path) in [(1, &active_path), (2, &archived_path)] {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date, session_id, transcript_path, turn_no,
+                    usage_identity
+                 ) VALUES ('codex', '2026-09-10T16:07:00Z', '2026-09-10',
+                    'atomic-session', ?, ?, 'rollout=rollout-2026-09-11T00-07-00-atomic-session')",
+                params![path.to_string_lossy().as_ref(), turn_no],
+            )
+            .unwrap();
+        }
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let mut stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        stored_paths.sort();
+        let mut expected_paths = vec![
+            active_path.to_string_lossy().into_owned(),
+            archived_path.to_string_lossy().into_owned(),
+        ];
+        expected_paths.sort();
+        assert_eq!(
+            stored_paths, expected_paths,
+            "an empty canonical transcript must not drop the stored copies"
+        );
+
+        // Once the canonical file carries usage, the copy is dropped together
+        // with the canonical write in one transaction.
+        fs::write(
+            &active_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("atomic-session"),
+                codex_token_count_event("2026-09-10T16:07:00.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:09:00.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+
+        let stored_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path FROM usage_entries
+                 WHERE assistant_type = 'codex' ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            stored_paths,
+            vec![active_path.to_string_lossy().into_owned()]
+        );
+
+        let total: u64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(delta_total), 0) FROM usage_entries
+                 WHERE assistant_type = 'codex'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(total, 165);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_keeps_transcripts_sharing_one_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-shared-session-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let session_id = "01a08c12-5574-74a1-877d-613d596f0a05";
+        let active_path =
+            sessions_dir.join(format!("rollout-2026-09-11T00-06-46-{session_id}.jsonl"));
+        let archived_path = archived_dir.join(format!(
+            "rollout-2026-09-11T00-09-32-{session_id}_01a08c14-db4d-7e50-bbf3-d5a48cce3e1f.jsonl"
+        ));
+
+        let content = |event: String| format!("{}\n{}\n", codex_session_meta(session_id), event);
+        fs::write(
+            &active_path,
+            content(codex_token_count_event(
+                "2026-09-10T16:06:50.000Z",
+                100,
+                20,
+                10,
+            )),
+        )
+        .unwrap();
+        fs::write(
+            &archived_path,
+            content(codex_token_count_event(
+                "2026-09-10T16:09:50.000Z",
+                50,
+                10,
+                5,
+            )),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let codex_summary = |conn: &Connection| {
+            let rows: (u64, u64, u64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT transcript_path), COALESCE(SUM(delta_total), 0)
+                     FROM usage_entries WHERE assistant_type = 'codex'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let identities: Vec<String> = conn
+                .prepare(
+                    "SELECT DISTINCT usage_identity
+                     FROM usage_entries
+                     WHERE assistant_type = 'codex'
+                     ORDER BY usage_identity",
+                )
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (rows, identities)
+        };
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (first_rows, first_identities) = codex_summary(&conn);
+        assert_eq!(first_rows, (2, 2, 165));
+        assert_eq!(first_identities.len(), 2);
+        assert!(first_identities
             .iter()
-            .all(|entry| entry.source_kind.as_deref() == Some(CODEX_DESKTOP_SOURCE_KIND)));
+            .all(|identity| identity.starts_with("rollout=rollout-2026-09-11T00-")));
 
-        let first = entries[0].delta_tokens.as_ref().unwrap();
-        assert_eq!(first.cache_write, Some(5));
+        for _ in 0..3 {
+            sync_codex_usage_logs(&mut conn).unwrap();
+            let (rows, identities) = codex_summary(&conn);
+            assert_eq!(rows, first_rows);
+            assert_eq!(identities, first_identities);
+        }
 
-        let second = entries[1].delta_tokens.as_ref().unwrap();
-        assert_eq!(second.input, 40);
-        assert_eq!(second.cache_read, Some(10));
-        assert_eq!(second.cache_write, Some(3));
-        assert_eq!(second.output, 5);
-        assert_eq!(second.reasoning, Some(3));
-        assert_eq!(second.total, 55);
+        let transcript_paths: Vec<String> = conn
+            .prepare(
+                "SELECT DISTINCT transcript_path
+                 FROM usage_entries
+                 WHERE assistant_type = 'codex'
+                 ORDER BY transcript_path",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut expected_paths = vec![
+            active_path.to_string_lossy().into_owned(),
+            archived_path.to_string_lossy().into_owned(),
+        ];
+        expected_paths.sort();
+        assert_eq!(transcript_paths, expected_paths);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
+    }
+
+    #[test]
+    fn sync_codex_usage_logs_syncs_one_canonical_copy_of_a_rollout() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_codex_dir = std::env::var("CODEX_DIR").ok();
+        let mut codex_dir = std::env::temp_dir();
+        let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        codex_dir.push(format!(
+            "codex-copy-session-{}-{}",
+            std::process::id(),
+            unique
+        ));
+
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("11");
+        let archived_dir = codex_dir.join("archived_sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&archived_dir).unwrap();
+
+        let file_name = "rollout-2026-09-11T00-06-46-desktop-session.jsonl";
+        let active_path = sessions_dir.join(file_name);
+        let archived_path = archived_dir.join(file_name);
+
+        // The archived copy is more complete, so it wins over the live file.
+        fs::write(
+            &active_path,
+            format!(
+                "{}\n{}\n",
+                codex_session_meta("desktop-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &archived_path,
+            format!(
+                "{}\n{}\n{}\n",
+                codex_session_meta("desktop-session"),
+                codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10),
+                codex_token_count_event("2026-09-10T16:09:50.000Z", 150, 30, 15)
+            ),
+        )
+        .unwrap();
+        std::env::set_var("CODEX_DIR", &codex_dir);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, transcript_path, turn_no
+             ) VALUES ('codex', '2026-09-10T16:06:50Z', '2026-09-10',
+                'desktop-session', ?, 1)",
+            params![active_path.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        let codex_rows = |conn: &Connection| {
+            let rows: (u64, u64, u64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COUNT(DISTINCT transcript_path), COALESCE(SUM(delta_total), 0)
+                     FROM usage_entries WHERE assistant_type = 'codex'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let transcript_path: String = conn
+                .query_row(
+                    "SELECT transcript_path FROM usage_entries
+                     WHERE assistant_type = 'codex' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (rows, transcript_path)
+        };
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (first_rows, first_path) = codex_rows(&conn);
+        assert_eq!(first_rows, (2, 1, 165));
+        assert_eq!(PathBuf::from(&first_path), archived_path);
+
+        sync_codex_usage_logs(&mut conn).unwrap();
+        assert_eq!(codex_rows(&conn), (first_rows, first_path));
+
+        // An equally complete live copy takes over because Codex only archives
+        // a transcript after it stops writing to it.
+        let shared_content = format!(
+            "{}\n{}\n",
+            codex_session_meta("desktop-session"),
+            codex_token_count_event("2026-09-10T16:06:50.000Z", 100, 20, 10)
+        );
+        fs::write(&active_path, &shared_content).unwrap();
+        fs::write(&archived_path, &shared_content).unwrap();
+        sync_codex_usage_logs(&mut conn).unwrap();
+        let (copied_rows, copied_path) = codex_rows(&conn);
+        assert_eq!(copied_rows, (1, 1, 110));
+        assert_eq!(PathBuf::from(&copied_path), active_path);
+
+        if let Some(value) = old_codex_dir {
+            std::env::set_var("CODEX_DIR", value);
+        } else {
+            std::env::remove_var("CODEX_DIR");
+        }
+        let _ = fs::remove_dir_all(&codex_dir);
     }
 
     #[test]
@@ -9609,7 +10391,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("26");
         let archived_dir = codex_dir.join("archived_sessions");
         fs::create_dir_all(&sessions_dir).unwrap();
         fs::create_dir_all(&archived_dir).unwrap();
@@ -9679,7 +10465,11 @@ mod tests {
         let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         codex_dir.push(format!("codex-sync-{}-{}", std::process::id(), unique));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/07");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("07");
         fs::create_dir_all(&sessions_dir).unwrap();
         let session_path = sessions_dir.join("rollout-2026-07-07T10-58-17-session-sync.jsonl");
 
@@ -9824,7 +10614,11 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/10");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("10");
         fs::create_dir_all(&sessions_dir).unwrap();
         let parent_path = sessions_dir.join("rollout-2026-07-10T03-43-00-parent-session.jsonl");
         let child_path = sessions_dir.join("rollout-2026-07-10T03-45-00-child-session.jsonl");
@@ -10015,61 +10809,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_session_file_deduplicates_request_usage() {
-        let path = temp_jsonl_path("claude-parser");
-
-        let content = r#"{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:48.190Z","uuid":"u1","message":{"role":"user","content":"Build the report"}}
-{"type":"user","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:49.190Z","uuid":"u2","message":{"role":"user","content":"Use monthly grouping"}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
-{"type":"assistant","sessionId":"session-1","cwd":"/tmp/project","version":"2.1.201","timestamp":"2026-07-04T19:28:51.948Z","uuid":"a2","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_claude_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        let entry = &entries[0];
-        assert_eq!(entry.session_id, "session-1");
-        assert_eq!(entry.session_name.as_deref(), Some("Use monthly grouping"));
-        assert_eq!(entry.cwd.as_deref(), Some("/tmp/project"));
-        assert_eq!(entry.version.as_deref(), Some("2.1.201"));
-        assert_eq!(entry.model.as_deref(), Some("claude-haiku-4-5-20251001"));
-
-        let tokens = entry.tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 10);
-        assert_eq!(tokens.cache_write, Some(3));
-        assert_eq!(tokens.cache_write_5m, Some(1));
-        assert_eq!(tokens.cache_write_1h, Some(2));
-        assert_eq!(tokens.cache_read, Some(7));
-        assert_eq!(tokens.output, 5);
-        assert_eq!(tokens.total, 25);
-    }
-
-    #[test]
-    fn parse_claude_session_file_defaults_unclassified_cache_writes_to_5m() {
-        let path = temp_jsonl_path("claude-cache-default");
-        let content = r#"{"type":"assistant","sessionId":"session-cache-default","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5}}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries = parse_claude_session_file(&path).unwrap();
-        let _ = fs::remove_file(&path);
-
-        let tokens = entries[0].tokens.as_ref().unwrap();
-        assert_eq!(tokens.input, 10);
-        assert_eq!(tokens.cache_write, Some(3));
-        assert_eq!(tokens.cache_write_5m, Some(3));
-        assert_eq!(tokens.cache_write_1h, Some(0));
-        assert_eq!(tokens.total, 25);
-    }
-
-    #[test]
     fn sync_claude_usage_logs_writes_cache_write_ttls() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_claude_dir = std::env::var("CLAUDE_DIR").ok();
         let claude_dir = temp_jsonl_path("claude-cache-sync").with_extension("");
-        let projects_dir = claude_dir.join("projects/test-project");
+        let projects_dir = claude_dir.join("projects").join("test-project");
         fs::create_dir_all(&projects_dir).unwrap();
         let session_path = projects_dir.join("session-cache-sync.jsonl");
         let content = r#"{"type":"assistant","sessionId":"session-cache-sync","timestamp":"2026-07-04T19:28:51.753Z","uuid":"a1","requestId":"req_1","message":{"id":"msg_1","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Done"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":3,"cache_read_input_tokens":7,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":2}}}}
@@ -10155,363 +10899,6 @@ mod tests {
         if chrono::Local::now().offset().local_minus_utc() != 0 {
             assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
         }
-    }
-
-    #[test]
-    fn parse_cursor_session_file_uses_last_initial_consecutive_user_prompt_as_name() {
-        let path = temp_jsonl_path("cursor-session-name");
-        let content = r#"{"role":"user","message":{"content":"第一條提示"}}
-{"role":"user","message":{"content":"第二條提示"}}
-{"role":"assistant","message":{"content":"收到"}}
-{"role":"user","message":{"content":"後續提示"}}
-{"role":"assistant","message":{"content":"完成"}}
-"#;
-
-        fs::write(&path, content).unwrap();
-        let entries =
-            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
-                .unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert!(entries
-            .iter()
-            .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
-    }
-
-    #[test]
-    fn local_timestamp_string_from_system_time_uses_local_timezone_not_utc() {
-        // 用固定的 SystemTime（不依賴檔案系統 mtime 或執行測試當下的真實時鐘），
-        // 確保測試結果穩定，不會因為「剛好在本地白天執行測試」而在 UTC 環境下
-        // 巧合通過、卻在真正跨日的凌晨時段失去偵測力。
-        // UTC 2026-09-21T16:31:41Z：對 UTC+8 而言已經跨到本地隔天 00:31:41。
-        let fixed_utc = chrono::DateTime::parse_from_rfc3339("2026-09-21T16:31:41Z").unwrap();
-        let modified: std::time::SystemTime = fixed_utc.into();
-
-        let result = local_timestamp_string_from_system_time(modified);
-
-        let expected = fixed_utc
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-        assert_eq!(result, expected);
-        // 機器時區有偏移時，額外證明真的轉了本地時區，不是巧合維持 UTC 值。
-        if chrono::Local::now().offset().local_minus_utc() != 0 {
-            assert!(!result.starts_with("2026-09-21"));
-        }
-    }
-
-    #[test]
-    fn parse_cursor_session_file_falls_back_to_mtime_when_no_timestamp_tag() {
-        // 沒有 user 訊息帶 <timestamp> 標籤時，退回用檔案 mtime 當 timestamp。
-        // 時區轉換的正確性已由 local_timestamp_string_from_system_time_* 獨立
-        // 驗證，這裡只驗證 fallback 路徑真的被觸發、且格式合法可被
-        // cursor_date_from_timestamp 解析。
-        let path = temp_jsonl_path("cursor-mtime-fallback");
-        let content = r#"{"role":"user","message":{"content":"沒有 timestamp 標籤"}}
-{"role":"assistant","message":{"content":"回覆"}}
-"#;
-        fs::write(&path, content).unwrap();
-        let entries =
-            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
-                .unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 1);
-        assert!(cursor_date_from_timestamp(&entries[0].entry.timestamp).is_some());
-    }
-
-    #[test]
-    fn cursor_response_signature_matches_plain_text_agent_kv_content() {
-        let transcript_content = serde_json::json!([
-            {
-                "type": "text",
-                "text": "Plain answer"
-            }
-        ]);
-        let agent_kv_content = serde_json::json!([
-            {
-                "type": "text",
-                "data": "Plain answer",
-                "providerOptions": {
-                    "cursor": {
-                        "modelName": "composer-2.5"
-                    }
-                }
-            }
-        ]);
-
-        assert_eq!(
-            cursor_response_signature(&transcript_content),
-            cursor_response_signature(&agent_kv_content)
-        );
-    }
-
-    #[test]
-    fn cursor_response_signature_matches_agent_kv_tool_calls() {
-        let transcript_content = serde_json::json!([
-            {
-                "type": "text",
-                "text": "Running"
-            },
-            {
-                "type": "tool_use",
-                "name": "Shell",
-                "input": {
-                    "command": "echo hi",
-                    "block_until_ms": 120_000
-                }
-            }
-        ]);
-        let agent_kv_event = serde_json::json!({
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "data": "Running",
-                    "providerOptions": {
-                        "cursor": {
-                            "modelName": "composer-2.5"
-                        }
-                    }
-                },
-                {
-                    "type": "tool-call",
-                    "toolName": "Shell",
-                    "args": {
-                        "block_until_ms": 120_000,
-                        "command": "echo hi"
-                    }
-                }
-            ]
-        });
-        let raw = serde_json::to_vec(&agent_kv_event).unwrap();
-        let (signature, model) = parse_cursor_agent_kv_model_signature(&raw).unwrap();
-
-        assert_eq!(
-            Some(signature),
-            cursor_response_signature(&transcript_content)
-        );
-        assert_eq!(model, "composer-2.5");
-    }
-
-    #[test]
-    fn cursor_parser_does_not_reuse_a_previous_reply_model() {
-        let path = temp_jsonl_path("cursor-model-reset");
-        let content = r#"{"role":"user","message":{"content":"Prompt"}}
-{"role":"assistant","message":{"content":[{"type":"text","text":"Known reply"}]}}
-{"role":"assistant","message":{"content":[{"type":"image","data":"omitted"}]}}
-"#;
-        fs::write(&path, content).unwrap();
-        let signature = cursor_response_signature(
-            &serde_json::json!([{"type": "text", "text": "Known reply"}]),
-        )
-        .unwrap();
-        let model_mappings = HashMap::from([(signature, "composer-2.5".to_string())]);
-
-        let entries =
-            parse_cursor_session_file(&path, &model_mappings, &HashSet::new(), &HashMap::new())
-                .unwrap();
-        let _ = fs::remove_file(&path);
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].entry.model.as_deref(), Some("composer-2.5"));
-        assert!(entries[0].model_signature.is_some());
-        assert_eq!(entries[1].entry.model.as_deref(), Some("Unknown Model"));
-        assert!(entries[1].model_signature.is_none());
-    }
-
-    #[test]
-    fn cursor_session_metadata_treats_non_agent_modes_as_ide() {
-        let (_, false_overrides_agent_mode) = parse_cursor_session_metadata(
-            "composerData:false-overrides-agent",
-            br#"{
-                "composerId": "false-overrides-agent",
-                "unifiedMode": "agent",
-                "isAgentic": false
-            }"#,
-        )
-        .unwrap();
-        let (_, non_agent_mode_overrides_true) = parse_cursor_session_metadata(
-            "composerData:chat-overrides-true",
-            br#"{
-                "composerId": "chat-overrides-true",
-                "unifiedMode": "chat",
-                "isAgentic": true
-            }"#,
-        )
-        .unwrap();
-        let (_, agent_mode) = parse_cursor_session_metadata(
-            "composerData:agent",
-            br#"{
-                "composerId": "agent",
-                "unifiedMode": "agent",
-                "isAgentic": true
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(false_overrides_agent_mode.mode.as_deref(), Some("ide"));
-        assert_eq!(non_agent_mode_overrides_true.mode.as_deref(), Some("ide"));
-        assert_eq!(agent_mode.mode.as_deref(), Some("agent"));
-    }
-
-    #[test]
-    fn cursor_session_metadata_uses_only_concrete_model_configs() {
-        let (_, concrete_model) = parse_cursor_session_metadata(
-            "composerData:concrete-model",
-            br#"{
-                "composerId": "concrete-model",
-                "unifiedMode": "agent",
-                "modelConfig": { "modelName": "composer-2.5" }
-            }"#,
-        )
-        .unwrap();
-        let (_, default_model) = parse_cursor_session_metadata(
-            "composerData:default-model",
-            br#"{
-                "composerId": "default-model",
-                "unifiedMode": "agent",
-                "modelConfig": { "modelName": "default" }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(concrete_model.model.as_deref(), Some("composer-2.5"));
-        assert!(default_model.model.is_none());
-    }
-
-    #[test]
-    fn cursor_state_db_reader_observes_uncheckpointed_wal() {
-        let state_db_path = temp_jsonl_path("cursor-state-wal").with_extension("vscdb");
-        let writer = Connection::open(&state_db_path).unwrap();
-        let journal_mode: String = writer
-            .query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
-        writer
-            .execute_batch(
-                "PRAGMA wal_autocheckpoint = 0;
-                 CREATE TABLE cursorDiskKV (
-                    key TEXT PRIMARY KEY,
-                    value BLOB
-                 );
-                 INSERT INTO cursorDiskKV (key, value)
-                 VALUES ('agentKv:blob:test', X'7B7D');",
-            )
-            .unwrap();
-
-        let wal_path = PathBuf::from(format!("{}-wal", state_db_path.to_string_lossy()));
-        assert!(wal_path.exists(), "fixture must keep committed data in WAL");
-
-        let reader = open_cursor_state_db(&state_db_path).unwrap();
-        let row_count: i64 = reader
-            .query_row("SELECT COUNT(*) FROM cursorDiskKV", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(row_count, 1, "read-only connection must observe WAL data");
-
-        drop(reader);
-        drop(writer);
-        let _ = fs::remove_file(&state_db_path);
-        let _ = fs::remove_file(wal_path);
-        let _ = fs::remove_file(format!("{}-shm", state_db_path.to_string_lossy()));
-    }
-
-    #[test]
-    fn cursor_cache_token_migration_marks_legacy_values_unknown() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, turn_no,
-                tokens_cache_read, tokens_cache_write,
-                tokens_cache_write_5m, tokens_cache_write_1h,
-                delta_cache_read, delta_cache_write,
-                delta_cache_write_5m, delta_cache_write_1h
-             ) VALUES (
-                'cursor', '2026-07-24T00:00:00Z', '2026-07-24',
-                'cursor-cache-session', 1, 0, 0, 0, 0, 0, 0, 0, 0
-             )",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO usage_entries (
-                assistant_type, timestamp, date, session_id, turn_no,
-                tokens_cache_read, tokens_cache_write,
-                tokens_cache_write_5m, tokens_cache_write_1h,
-                delta_cache_read, delta_cache_write,
-                delta_cache_write_5m, delta_cache_write_1h
-             ) VALUES (
-                'cursor', '2026-07-24T00:01:00Z', '2026-07-24',
-                'cursor-cache-measured', 1, 10, 20, 30, 40, 1, 2, 3, 4
-             )",
-            [],
-        )
-        .unwrap();
-
-        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
-        run_cursor_cache_tokens_unknown_migration(&mut conn).unwrap();
-
-        let values: [Option<u64>; 8] = conn
-            .query_row(
-                "SELECT
-                    tokens_cache_read, tokens_cache_write,
-                    tokens_cache_write_5m, tokens_cache_write_1h,
-                    delta_cache_read, delta_cache_write,
-                    delta_cache_write_5m, delta_cache_write_1h
-                 FROM usage_entries
-                 WHERE session_id = 'cursor-cache-session'",
-                [],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ])
-                },
-            )
-            .unwrap();
-        let migration_count: u64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sync_state WHERE filename = ?",
-                params![CURSOR_CACHE_TOKENS_UNKNOWN_MIGRATION_KEY],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let measured_values: [u64; 8] = conn
-            .query_row(
-                "SELECT
-                    tokens_cache_read, tokens_cache_write,
-                    tokens_cache_write_5m, tokens_cache_write_1h,
-                    delta_cache_read, delta_cache_write,
-                    delta_cache_write_5m, delta_cache_write_1h
-                 FROM usage_entries
-                 WHERE session_id = 'cursor-cache-measured'",
-                [],
-                |row| {
-                    Ok([
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ])
-                },
-            )
-            .unwrap();
-
-        assert_eq!(values, [None; 8]);
-        assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
-        assert_eq!(migration_count, 1);
     }
 
     #[test]
@@ -10819,15 +11206,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_cursor_timestamp() {
-        let ts = "Wednesday, Jul 8, 2026, 2:24 AM (UTC+8)";
-        let parsed = parse_cursor_timestamp(ts);
-        assert_eq!(parsed, "2026-07-08T02:24:00+08:00");
-        assert_eq!(cursor_date_from_timestamp(&parsed), Some("2026-07-08"));
-        assert_eq!(cursor_date_from_timestamp("unknown"), None);
-    }
-
-    #[test]
     fn codex_parser_migration_clears_all_codex_file_state_once() {
         let mut conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -11061,9 +11439,13 @@ mod tests {
             unique
         ));
 
-        let sessions_dir = codex_dir.join("sessions/2026/07/26");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("07")
+            .join("26");
         fs::create_dir_all(&sessions_dir).unwrap();
-        let transcript_path = sessions_dir.join("empty-session.jsonl");
+        let transcript_path = sessions_dir.join("rollout-2026-07-26T10-00-00-empty-session.jsonl");
         let content = r#"{"timestamp":"2026-07-26T10:00:00Z","type":"session_meta","payload":{"id":"empty-session","session_id":"empty-session","originator":"Codex Desktop"}}"#;
         fs::write(&transcript_path, content).unwrap();
         std::env::set_var("CODEX_DIR", &codex_dir);
@@ -14026,8 +14408,8 @@ mod tests {
 
         // Group by (session_id, source_dir_key) to simulate daily summary logic.
         let mut sessions: HashMap<(String, Option<String>), Vec<i64>> = HashMap::new();
-        for (record, _ast) in &entries {
-            let e = &record.entry;
+        for row in &entries {
+            let e = &row.record.entry;
             let key = (e.session_id.clone(), e.source_dir_key.clone());
             sessions
                 .entry(key)
@@ -14053,8 +14435,8 @@ mod tests {
 
         // Verify source_kind is "copilot-app" for all entries so the frontend
         // renders the App badge, not the CLI fallback.
-        for (record, _ast) in &entries {
-            let e = &record.entry;
+        for row in &entries {
+            let e = &row.record.entry;
             assert_eq!(
                 e.source_kind.as_deref(),
                 Some("copilot-app"),
@@ -16217,7 +16599,7 @@ mod tests {
 
         // get_session_assistant_and_transcript must return the correct
         // source_dir_key when queried with explicit source_kind + source_dir_key.
-        let (_, _, sk_a, sdk_a, _, _) = get_session_assistant_and_transcript(
+        let lookup_a = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16225,10 +16607,10 @@ mod tests {
             Some(dir_a),
         )
         .unwrap();
-        assert_eq!(sk_a, "copilot-app");
-        assert_eq!(sdk_a.as_deref(), Some(dir_a));
+        assert_eq!(lookup_a.source_kind, "copilot-app");
+        assert_eq!(lookup_a.source_dir_key.as_deref(), Some(dir_a));
 
-        let (_, _, sk_b, sdk_b, _, _) = get_session_assistant_and_transcript(
+        let lookup_b = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16236,8 +16618,8 @@ mod tests {
             Some(dir_b),
         )
         .unwrap();
-        assert_eq!(sk_b, "copilot-app");
-        assert_eq!(sdk_b.as_deref(), Some(dir_b));
+        assert_eq!(lookup_b.source_kind, "copilot-app");
+        assert_eq!(lookup_b.source_dir_key.as_deref(), Some(dir_b));
 
         // get_session_cwd must return the correct CWD per source_dir_key.
         let cwd_a = get_session_cwd(
@@ -16349,7 +16731,7 @@ mod tests {
 
         // Query with source_kind=copilot-cli, source_dir_key=None must find
         // the CLI row only.
-        let (_, _, sk, _sdk, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16357,11 +16739,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk, "copilot-cli");
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
 
         // Query with source_kind=copilot-app, source_dir_key=hex must find
         // the App row only.
-        let (_, _, sk_app, sdk_app, _, _) = get_session_assistant_and_transcript(
+        let app_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16369,8 +16751,8 @@ mod tests {
             Some(dir_app),
         )
         .unwrap();
-        assert_eq!(sk_app, "copilot-app");
-        assert_eq!(sdk_app.as_deref(), Some(dir_app));
+        assert_eq!(app_lookup.source_kind, "copilot-app");
+        assert_eq!(app_lookup.source_dir_key.as_deref(), Some(dir_app));
 
         // CWD isolation: None -> CLI row; Some(dir) -> App row.
         let cwd_cli =
@@ -16473,7 +16855,7 @@ mod tests {
         )
         .unwrap();
 
-        let (_, _, cli_kind, cli_dir, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16481,8 +16863,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(cli_kind, "copilot-cli");
-        assert_eq!(cli_dir, None);
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
+        assert_eq!(cli_lookup.source_dir_key, None);
 
         let cli_cwd =
             get_session_cwd(&conn, "copilot", session_id, Some("copilot-cli"), None).unwrap();
@@ -16565,9 +16947,9 @@ mod tests {
 
         // Legacy query (both source_kind and source_dir_key are None) must
         // return the CLI row because source_dir_key IS NULL is the filter.
-        let (_, _, sk, _sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
+        assert_eq!(lookup.source_kind, "copilot-cli");
 
         // CWD with None must be the CLI CWD.
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
@@ -16638,7 +17020,7 @@ mod tests {
 
         // Identity must select the matching source_kind and report
         // source_dir_key as None for both.
-        let (_, _, sk_cli, sdk_cli, _, _) = get_session_assistant_and_transcript(
+        let cli_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16646,10 +17028,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk_cli, "copilot-cli");
-        assert_eq!(sdk_cli, None);
+        assert_eq!(cli_lookup.source_kind, "copilot-cli");
+        assert_eq!(cli_lookup.source_dir_key, None);
 
-        let (_, _, sk_vscode, sdk_vscode, _, _) = get_session_assistant_and_transcript(
+        let vscode_lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -16657,8 +17039,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(sk_vscode, "vscode-chat");
-        assert_eq!(sdk_vscode, None);
+        assert_eq!(vscode_lookup.source_kind, "vscode-chat");
+        assert_eq!(vscode_lookup.source_dir_key, None);
 
         // CWD isolation per source_kind.
         let cwd_cli =
@@ -16828,7 +17210,7 @@ mod tests {
         // they all observe the same source row.
         let pick_identity = || {
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None)
-                .map(|(_, _, sk, sdk, _, _)| (sk, sdk))
+                .map(|lookup| (lookup.source_kind, lookup.source_dir_key))
         };
         let pick_cwd = || get_session_cwd(&conn, "copilot", session_id, None, None);
         let pick_model = || get_session_model(&conn, "copilot", session_id, None, None);
@@ -16919,10 +17301,10 @@ mod tests {
         .unwrap();
 
         // Legacy `None` lookup must see only the CLI row, never the App row.
-        let (_, _, sk, sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
-        assert_eq!(sdk, None);
+        assert_eq!(lookup.source_kind, "copilot-cli");
+        assert_eq!(lookup.source_dir_key, None);
 
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/home/cli"));
@@ -17006,10 +17388,10 @@ mod tests {
         .unwrap();
 
         // Identity, CWD, model all must come from the CLI source.
-        let (_, _, sk, sdk, _, _) =
+        let lookup =
             get_session_assistant_and_transcript(&conn, "copilot", session_id, None, None).unwrap();
-        assert_eq!(sk, "copilot-cli");
-        assert_eq!(sdk, None);
+        assert_eq!(lookup.source_kind, "copilot-cli");
+        assert_eq!(lookup.source_dir_key, None);
 
         let cwd = get_session_cwd(&conn, "copilot", session_id, None, None).unwrap();
         assert_eq!(cwd.as_deref(), Some("/home/cli"));
@@ -17108,7 +17490,7 @@ mod tests {
         // Use the legacy `source_kind = None` fallback while scoping the
         // query to the App directory. The resolver must still prefer the
         // main row over the subagent row.
-        let (_, path, sk, sdk, parent, agent) = get_session_assistant_and_transcript(
+        let lookup = get_session_assistant_and_transcript(
             &conn,
             "copilot",
             session_id,
@@ -17116,19 +17498,19 @@ mod tests {
             Some("dead00"),
         )
         .unwrap();
-        assert_eq!(sk, "copilot-app");
-        assert_eq!(sdk.as_deref(), Some("dead00"));
+        assert_eq!(lookup.source_kind, "copilot-app");
+        assert_eq!(lookup.source_dir_key.as_deref(), Some("dead00"));
         assert_eq!(
-            parent, None,
+            lookup.parent_session_id, None,
             "main row must win: parent_session_id must be NULL"
         );
         assert_eq!(
-            agent, None,
+            lookup.agent_nickname, None,
             "main row must win: agent_nickname must be None"
         );
         // transcript_path can be NULL in this fixture; we only assert
         // that we got *some* row back (None is acceptable here).
-        let _ = path;
+        let _ = lookup.transcript_path;
 
         // CWD must come from the main row (`/home/main`), not the
         // subagent row (`/home/subagent`).
@@ -17380,6 +17762,152 @@ mod tests {
     }
 
     #[test]
+    fn grok_parser_v8_migration_reparses_existing_grok_47_session() {
+        let root = temp_jsonl_path("grok-v8-migration");
+        let session_dir_xhigh = root.join("sessions").join("work").join("grok-47-session");
+        fs::create_dir_all(&session_dir_xhigh).unwrap();
+        fs::write(
+            session_dir_xhigh.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.7","reasoning_effort":"xhigh","generated_title":"Grok 4.7 migration test"}"#,
+        )
+        .unwrap();
+        let updates_xhigh_path = session_dir_xhigh.join("updates.jsonl");
+        fs::write(
+            &updates_xhigh_path,
+            concat!(
+                r#"{"timestamp":1710000000,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000001,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.7"}}}}"#, "\n",
+                r#"{"timestamp":1710000002,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":100,"cache_read_input_tokens":50,"output_tokens":50,"total_tokens":200},"total_cost_usd":0.0005}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_xhigh = fs::metadata(&updates_xhigh_path).unwrap().len();
+
+        let session_dir_fast = root
+            .join("sessions")
+            .join("work")
+            .join("grok-47-fast-session");
+        fs::create_dir_all(&session_dir_fast).unwrap();
+        fs::write(
+            session_dir_fast.join("summary.json"),
+            r#"{"info":{"cwd":"/tmp/grok-project"},"current_model_id":"grok-4.7-fast","generated_title":"Grok 4.7 Fast migration test"}"#,
+        )
+        .unwrap();
+        let updates_fast_path = session_dir_fast.join("updates.jsonl");
+        fs::write(
+            &updates_fast_path,
+            concat!(
+                r#"{"timestamp":1710000010,"params":{"update":{"sessionUpdate":"turn_started","turn_number":0}}}"#, "\n",
+                r#"{"timestamp":1710000011,"params":{"update":{"sessionUpdate":"user_message_chunk","content":{"text":"hello grok 4.7 fast"}}}}"#, "\n",
+                r#"{"timestamp":1710000012,"params":{"update":{"sessionUpdate":"turn_completed","usage":{"input_tokens":200,"cache_read_input_tokens":0,"output_tokens":80,"total_tokens":280},"total_cost_usd":0.0008}}}"#, "\n"
+            ),
+        )
+        .unwrap();
+        let file_size_fast = fs::metadata(&updates_fast_path).unwrap().len();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate database state that already executed grok_parser_v7 with the
+        // files marked as synced and raw "grok-4.7" / "grok-4.7-fast" persisted.
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![GROK_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:grok_parser_v7', 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let relative_xhigh_path = portable_relative_path(&root, &updates_xhigh_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_xhigh_path}"), file_size_xhigh],
+        )
+        .unwrap();
+
+        let relative_fast_path = portable_relative_path(&root, &updates_fast_path);
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES (?, ?, 0)",
+            params![format!("grok:{relative_fast_path}"), file_size_fast],
+        )
+        .unwrap();
+
+        let transcript_xhigh = updates_xhigh_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:00Z', '2024-03-09', 'grok-47-session', 0, 'grok-4.7',
+                'grok-build', ?, 100, 50, 150)",
+            params![transcript_xhigh],
+        )
+        .unwrap();
+
+        let transcript_fast = updates_fast_path.to_string_lossy().into_owned();
+        conn.execute(
+            "INSERT INTO usage_entries (
+                assistant_type, timestamp, date, session_id, turn_no, model,
+                source_kind, transcript_path, delta_input, delta_output, delta_total
+             ) VALUES ('grok', '2024-03-09T18:40:10Z', '2024-03-09', 'grok-47-fast-session', 0, 'grok-4.7-fast',
+                'grok-build', ?, 200, 80, 280)",
+            params![transcript_fast],
+        )
+        .unwrap();
+
+        // Re-run init_db to execute the v8 migration.
+        init_db(&conn).unwrap();
+
+        let v7_marker_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:grok_parser_v7')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!v7_marker_exists);
+
+        let grok_sync_count: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'grok:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(grok_sync_count, 0);
+
+        // Running sync re-parses with the Grok 4.7 display names and Extra High effort.
+        sync_grok_usage_logs(&mut conn, &root).unwrap();
+
+        let updated_entries: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT model, reasoning_effort FROM usage_entries WHERE assistant_type = 'grok' ORDER BY session_id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        assert_eq!(
+            updated_entries,
+            vec![
+                ("Grok 4.7 Fast".to_string(), None),
+                (
+                    "Grok 4.7 (Extra High)".to_string(),
+                    Some("Extra High".to_string())
+                ),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn sync_grok_usage_logs_rebuilds_session_and_keeps_reported_cost() {
         let root = temp_jsonl_path("grok-sync");
         let session_dir = root.join("sessions").join("work").join("grok-session");
@@ -17446,7 +17974,7 @@ mod tests {
         assert_eq!(date_rows.len(), 1);
         assert_eq!(
             date_rows[0]
-                .0
+                .record
                 .entry
                 .cost
                 .as_ref()
@@ -17457,7 +17985,7 @@ mod tests {
         let month_rows = get_usage_entries_by_month(&conn, "2024-03", "grok").unwrap();
         assert_eq!(
             month_rows[0]
-                .0
+                .entry
                 .cost
                 .as_ref()
                 .and_then(|cost| cost.reported_cost_usd),
@@ -17467,7 +17995,7 @@ mod tests {
         let year_rows = get_usage_entries_by_year(&conn, "2024", "grok").unwrap();
         assert_eq!(
             year_rows[0]
-                .0
+                .entry
                 .cost
                 .as_ref()
                 .and_then(|cost| cost.reported_cost_usd),
@@ -17701,6 +18229,460 @@ mod tests {
             .unwrap();
         assert_eq!(imported.0, 2);
         assert!((imported.1 - 0.03).abs() < 1e-12);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // --- MiniMax Code (mcode) -------------------------------------------------
+
+    const MCODE_TEST_SESSION_ID: &str = "mvs_59b7ff115fc9409aa7b017aac208fb28";
+    const MCODE_TEST_SESSION_DIR_NAME: &str =
+        "15-16-05-177-session_bXZzXzU5YjdmZjExNWZjOTQwOWFhN2IwMTdhYWMyMDhmYjI4";
+
+    fn mcode_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "token-insights-mcode-{}-{}-{}",
+            label,
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&root);
+        root
+    }
+
+    /// `<root>/v2/sessions/2026/09/19/<dir>` — the layout `get_mcode_dir()`
+    /// points at when `MCODE_DIR=<root>/v2`.
+    fn mcode_test_session_dir(root: &Path) -> PathBuf {
+        let dir = root
+            .join("v2")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("19")
+            .join(MCODE_TEST_SESSION_DIR_NAME);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mcode_test_assistant_record(
+        message_id: &str,
+        timestamp: i64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+    ) -> String {
+        format!(
+            r#"{{"message_id":"{message_id}","turn_id":"turn_1","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"provider":"custom_provider:llmshare","model":"deepseek-v4.1-flash","usage":{{"input":{input},"output":{output},"cacheRead":{cache_read},"cacheWrite":0,"totalTokens":{},"cost":{{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}},"timestamp":{timestamp}}}}}"#,
+            input + output + cache_read
+        )
+    }
+
+    fn write_mcode_lines(path: &Path, lines: &[String]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    }
+
+    /// Creates MiniMax Code's runtime ledger with a single session row.
+    fn write_mcode_runtime_ledger(
+        path: &Path,
+        session_id: &str,
+        workspace_dir: Option<&str>,
+        title: Option<&str>,
+    ) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute(
+            "CREATE TABLE local_runtime_sessions (
+                session_id TEXT PRIMARY KEY,
+                record_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                workspace_dir TEXT,
+                title TEXT
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO local_runtime_sessions
+                (session_id, record_json, updated_at_ms, workspace_dir, title)
+             VALUES (?, '{}', 0, ?, ?)",
+            params![session_id, workspace_dir, title],
+        )
+        .unwrap();
+    }
+
+    /// Applies `MCODE_DIR` / `MCODE_STATE_DB` for the duration of `run` and
+    /// restores the previous values afterwards so neighbouring tests are not
+    /// affected (callers must hold `ENV_LOCK`).
+    fn with_mcode_env<T>(mcode_dir: &Path, state_db: &Path, run: impl FnOnce() -> T) -> T {
+        let previous_dir = std::env::var_os("MCODE_DIR");
+        let previous_db = std::env::var_os("MCODE_STATE_DB");
+        std::env::set_var("MCODE_DIR", mcode_dir);
+        std::env::set_var("MCODE_STATE_DB", state_db);
+        let result = run();
+        match previous_dir {
+            Some(value) => std::env::set_var("MCODE_DIR", value),
+            None => std::env::remove_var("MCODE_DIR"),
+        }
+        match previous_db {
+            Some(value) => std::env::set_var("MCODE_STATE_DB", value),
+            None => std::env::remove_var("MCODE_STATE_DB"),
+        }
+        result
+    }
+
+    fn mcode_synced_rows(conn: &Connection) -> Vec<(u64, String, String, Option<String>, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT turn_no, source_kind, session_id, cwd, model
+                 FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_persists_turns_with_runtime_workspace() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-persist");
+        let session_dir = mcode_test_session_dir(&root);
+        fs::write(
+            session_dir.join("manifest.json"),
+            format!(r#"{{"schemaVersion":1,"sessionId":"{MCODE_TEST_SESSION_ID}"}}"#),
+        )
+        .unwrap();
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[
+                mcode_test_assistant_record("msg-1", 1_789_830_965_412, 3_000, 200, 1_000),
+                mcode_test_assistant_record("msg-2", 1_789_830_975_412, 4_000, 300, 2_000),
+            ],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("/tmp/mcode-project"),
+            None,
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+            // An unchanged session must not be re-imported on the next pass.
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    1,
+                    crate::mcode::SOURCE_KIND.to_string(),
+                    MCODE_TEST_SESSION_ID.to_string(),
+                    Some("/tmp/mcode-project".to_string()),
+                    "deepseek-v4.1-flash".to_string(),
+                ),
+                (
+                    2,
+                    crate::mcode::SOURCE_KIND.to_string(),
+                    MCODE_TEST_SESSION_ID.to_string(),
+                    Some("/tmp/mcode-project".to_string()),
+                    "deepseek-v4.1-flash".to_string(),
+                ),
+            ]
+        );
+
+        let (transcript_path, session_name, cache_read, reported_cost): (
+            String,
+            Option<String>,
+            u64,
+            Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT transcript_path, session_name, tokens_cache_read, reported_cost_usd
+                 FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            transcript_path,
+            session_dir.join("messages.jsonl").to_string_lossy()
+        );
+        assert_eq!(session_name, None, "an empty runtime title stays NULL");
+        assert_eq!(cache_read, 1_000);
+        assert_eq!(
+            reported_cost, None,
+            "cost.total == 0 must fall back to pricing.csv estimation"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_rebuilds_when_a_snapshot_stream_grows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-snapshot");
+        let session_dir = mcode_test_session_dir(&root);
+        fs::write(
+            session_dir.join("manifest.json"),
+            format!(r#"{{"schemaVersion":1,"sessionId":"{MCODE_TEST_SESSION_ID}"}}"#),
+        )
+        .unwrap();
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-late",
+                1_789_830_975_412,
+                4_000,
+                300,
+                2_000,
+            )],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&conn).len(), 1);
+
+        // A new snapshot stream adds an earlier turn; the combined fingerprint
+        // must change and the session must be rebuilt rather than appended to.
+        write_mcode_lines(
+            &session_dir
+                .join("snapshots")
+                .join("g000000000000--ctx_a.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-early",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.0, row.1.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, crate::mcode::SOURCE_KIND),
+                (2, crate::mcode::SOURCE_KIND)
+            ]
+        );
+        let totals: Vec<u64> = conn
+            .prepare("SELECT tokens_input FROM usage_entries WHERE assistant_type = 'mcode' ORDER BY turn_no")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            totals,
+            vec![3_000, 4_000],
+            "earlier turn must be numbered 1"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_skips_a_session_with_an_incomplete_record() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-incomplete");
+        let session_dir = mcode_test_session_dir(&root);
+        let messages = session_dir.join("messages.jsonl");
+        fs::write(
+            &messages,
+            mcode_test_assistant_record("msg-1", 1_789_830_965_412, 3_000, 200, 1_000),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        assert!(
+            mcode_synced_rows(&conn).is_empty(),
+            "a partially written final record must not be imported"
+        );
+        let synced_states: u64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_state WHERE filename LIKE 'mcode:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            synced_states, 0,
+            "the fingerprint must not advance past a partial record"
+        );
+
+        // Completing the record makes the session importable.
+        let mut content = fs::read_to_string(&messages).unwrap();
+        content.push('\n');
+        fs::write(&messages, content).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&conn).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_keeps_importing_without_the_runtime_ledger() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-no-ledger");
+        let session_dir = mcode_test_session_dir(&root);
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &root.join("missing.sqlite"), || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, MCODE_TEST_SESSION_ID);
+        assert_eq!(
+            rows[0].3, None,
+            "a missing runtime ledger must not drop the session"
+        );
+
+        // A ledger without the expected table is equally tolerated.
+        let empty_db = root.join("empty.sqlite");
+        {
+            let conn = Connection::open(&empty_db).unwrap();
+            conn.execute("CREATE TABLE unrelated (id INTEGER)", [])
+                .unwrap();
+        }
+        let mut second_conn = Connection::open_in_memory().unwrap();
+        init_db(&second_conn).unwrap();
+        with_mcode_env(&root.join("v2"), &empty_db, || {
+            sync_mcode_usage_logs(&mut second_conn, &root.join("v2")).unwrap();
+        });
+        assert_eq!(mcode_synced_rows(&second_conn).len(), 1);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_matches_the_runtime_ledger_by_decoded_session_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-decoded-id");
+        let session_dir = mcode_test_session_dir(&root);
+        // No manifest.json, so the id comes from the base64url directory suffix.
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("/tmp/decoded-project"),
+            None,
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let rows = mcode_synced_rows(&conn);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2, MCODE_TEST_SESSION_ID);
+        assert_eq!(
+            rows[0].3.as_deref(),
+            Some("/tmp/decoded-project"),
+            "the decoded directory id must join to the runtime ledger row"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sync_mcode_usage_logs_uses_runtime_title_when_present() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = mcode_test_root("sync-title");
+        let session_dir = mcode_test_session_dir(&root);
+        write_mcode_lines(
+            &session_dir.join("messages.jsonl"),
+            &[mcode_test_assistant_record(
+                "msg-1",
+                1_789_830_965_412,
+                3_000,
+                200,
+                1_000,
+            )],
+        );
+        let state_db = root.join("runtime-state.sqlite");
+        write_mcode_runtime_ledger(
+            &state_db,
+            MCODE_TEST_SESSION_ID,
+            Some("   "),
+            Some("  MiniMax Code 標題  "),
+        );
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        with_mcode_env(&root.join("v2"), &state_db, || {
+            sync_mcode_usage_logs(&mut conn, &root.join("v2")).unwrap();
+        });
+
+        let (session_name, cwd): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT session_name, cwd FROM usage_entries WHERE assistant_type = 'mcode'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(session_name.as_deref(), Some("  MiniMax Code 標題  "));
+        assert_eq!(
+            cwd, None,
+            "a blank workspace_dir must not become an empty cwd"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

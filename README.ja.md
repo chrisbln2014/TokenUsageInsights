@@ -1,6 +1,6 @@
 # Token 戦情室
 
-**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
+**Token 戦情室は、ローカル優先の AI Coding Agent の Token 使用量とセッション復元ダッシュボードです。** Google Antigravity CLI、GitHub Copilot CLI、GitHub Copilot App、GitHub Copilot Chat（VS Code）、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code のローカル記録を読み取り、日別・月別・年別の Token 消費量、キャッシュ使用量、推論 Token、推定コスト、モデル分布、プロジェクトディレクトリ分布、完全な Session タイムラインをまとめて表示します。
 
 このプロジェクトが AI プロバイダー API を代わりに呼び出してデータを取得することはありません。主なデータソースはローカルログ、Status Line コレクターファイル、ローカル SQLite です。
 
@@ -57,8 +57,9 @@ http://localhost:3003
 | Pi Coding Agent | 不要 | `~/.pi/agent/sessions` | Pi Coding Agent が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | OMP | 不要 | `~/.omp/agent/sessions` | OMP が自動保存するローカル Session JSONL ファイルを直接スキャン |
 | Muse Code | 不要 | `~/.local/share/muse/sessions` | Muse Code が自動保存するローカル Session JSONL ファイルを直接スキャン |
+| MiniMax Code | 不要 | `~/.minimax/v2/sessions` | MiniMax Code が自動保存するローカル Session JSONL ファイルを直接スキャンし、作業ディレクトリと Session 名を読み取り専用で取得 |
 
-**Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
+**Copilot App、VS Code Copilot、Codex Desktop、Codex CLI、Claude Code、Cursor、Grok Build、Pi Coding Agent、OMP、Muse Code、MiniMax Code だけを使用する場合は、1 行のインストールコマンドを実行してダッシュボードを開くだけで利用できます。**
 
 ### Windows ネイティブでの利用
 
@@ -78,6 +79,7 @@ Windows ではデフォルトで次のネイティブパスを使用します：
 | Pi Coding Agent | `%USERPROFILE%\.pi` |
 | OMP | `%USERPROFILE%\.omp` |
 | Muse Code | `%USERPROFILE%\.local\share\muse` |
+| MiniMax Code | `%USERPROFILE%\.minimax\v2` |
 
 ダッシュボードの設定ガイドは Windows で PowerShell のコピー、設定、診断コマンドを表示します。PowerShell collector は .NET JSON とファイル API を使用し、Bash、`jq`、`sed`、`awk` に依存しません。
 
@@ -177,7 +179,7 @@ mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/she
 }
 ```
 
-`/ABSOLUTE/HOME` を `echo $HOME` で表示される実際のホームディレクトリ（例：`/Users/will` または `/home/will`）に置き換えてください。
+`/ABSOLUTE/HOME` を `echo $HOME` で表示される実際のホームディレクトリ（例：`/Users/your-name` または `/home/your-name`）に置き換えてください。
 
 ### 3. 検証
 
@@ -456,6 +458,27 @@ Muse Code のコストは、Session が報告するモデルと `pricing.csv` �
 
 * * *
 
+## MiniMax Code の設定
+
+**MiniMax Code に Hook、Status Line、追加の収集スクリプトは必要ありません。** ダッシュボードは次のディレクトリを直接スキャンします：
+
+```text
+~/.minimax/v2/sessions
+```
+
+MiniMax Code は各 Session を年、月、日の階層ディレクトリに保存し、Session ディレクトリ内に `messages.jsonl` と `snapshots/*.jsonl` を書き込みます。ダッシュボードは両方の stream を統合し、`message_id` で重複を排除したうえで、Session ごとにユーザープロンプト、ツール手順、Agent 応答を単一のタイムラインとして復元します。
+
+使用方法：
+
+1. MiniMax Code を通常どおり使い、少なくとも 1 つの Session を作成します。
+2. ダッシュボードを起動または再読み込みします。
+3. 左側で MiniMax Code を選択します。
+4. 右上の同期ボタンをクリックするか、バックグラウンド同期を待ちます。
+
+MiniMax Code のローカルログには費用欄がないため、本ダッシュボードは Session が報告する Token 数から `pricing.csv` のモデル単価で費用を推定します。作業ディレクトリと Session 名は MiniMax Code 実行期の `runtime-state.sqlite` から読み取り専用で取得し、本プロジェクトはこのデータベースへ書き込みや変更を行いません。データがデフォルトの場所にない場合は、`MCODE_DIR` に `sessions` を含む MiniMax Code データディレクトリを指定します。
+
+* * *
+
 ## ローカルデータの同期方法
 
 サービス起動時にバックエンドがローカル SQLite を初期化し、直ちに 1 回同期します。起動後は 5 秒ごとにバックグラウンド同期も行います。
@@ -548,6 +571,8 @@ cargo build --release --bin token-usage-insights
 | `PI_DIR` | `~/.pi` | Pi Coding Agent データディレクトリ |
 | `OMP_DIR` | `~/.omp` | OMP データディレクトリ |
 | `MUSE_DIR` | `~/.local/share/muse` | Muse Code データディレクトリ。`sessions` を含む必要があります |
+| `MCODE_DIR` | `~/.minimax/v2` | MiniMax Code データディレクトリ。`sessions` を含む必要があります |
+| `MCODE_STATE_DB` | `~/.minimax/v2/sqlite/runtime-state.sqlite` | MiniMax Code 実行期データベース（読み取り専用）。作業ディレクトリと Session 名を提供します |
 | `CORS_ALLOWED_ORIGINS` | `http://localhost:<PORT>,http://127.0.0.1:<PORT>` | カンマ区切りの許可 CORS オリジン |
 
 ### 設定ファイル (config.yaml)
@@ -755,14 +780,14 @@ token-usage-insights update --check
 # 最新バージョンへの自動更新（--force、--target-version にも対応）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v0.9.9
+token-usage-insights update --target-version v1.0.6
 ```
 
 環境変数でバージョンとインストール先を指定できます（すべて任意）：
 
 | 変数 | 対応プラットフォーム | 説明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v0.9.9` のようなインストール対象の Release tag。デフォルトは `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | `v1.0.6` のようなインストール対象の Release tag。デフォルトは `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh` に渡すインストールディレクトリ |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh` に渡す実行ファイルリンクディレクトリ |
 
@@ -958,6 +983,12 @@ cargo test
 cargo clippy --all-targets --all-features
 cargo build --release
 ./target/release/token-usage-insights
+```
+
+インストーラースクリプトの systemd ユニットテストに systemd は不要です。`uname` と `systemctl` をスタブに置き換え、一時ディレクトリ内で `scripts/install.sh --service` を実行してから、生成されたユニット（`WorkingDirectory` に引用符が付かないこと、規格子がエスケープされることを含む）を検査します。
+
+```bash
+bash tests/install-systemd.test.sh
 ```
 
 * * *

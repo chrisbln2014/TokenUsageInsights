@@ -6,9 +6,15 @@ import {
   calculateMovingAverageTrend,
   calculateMovingAverageViewportTrend,
   getChartDataPointX,
-  parseUsageTimestamp,
-} from './chart-utils.js?v=7';
-import { compareSessionRows } from './session-utils.js?v=1';
+} from './chart-utils.js?v=9';
+import {
+  compareSessionRows,
+  filterEntriesBySessionIdentity,
+  matchesSessionIdentity,
+  parentSessionIdentityKey,
+  sessionIdentityKey,
+} from './session-utils.js?v=4';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
 
 // Globals
 let tokenChartInstance = null;
@@ -92,6 +98,11 @@ const assistantAliasMap = {
   'musecode': 'muse',
   'code-muse': 'muse',
   'code_muse': 'muse',
+  'minimax-code': 'mcode',
+  'minimax_code': 'mcode',
+  'minimaxcode': 'mcode',
+  'mini-max-code': 'mcode',
+  'mini_max_code': 'mcode',
 };
 
 const assistantMeta = {
@@ -184,6 +195,16 @@ const assistantMeta = {
     senderName: 'MUSE AGENT',
     highlightColor: '#3b82f6',
     nameHighlights: ['Muse Code'],
+  },
+  mcode: {
+    logo: '/static/mcode-logo.svg',
+    label: 'MiniMax Code',
+    shortLabel: 'MiniMax Code',
+    alt: 'MiniMax Code',
+    badgeStyle: 'background: rgba(255, 107, 74, 0.15); color: #ff8a6b; border: 1px solid rgba(255, 107, 74, 0.3); display: inline-flex; align-items: center;',
+    senderName: 'MINIMAX CODE AGENT',
+    highlightColor: '#ff8a6b',
+    nameHighlights: ['MiniMax Code'],
   },
 };
 
@@ -593,6 +614,7 @@ const setupModalTitleKeys = {
   grok: 'grok_setup_modal_title',
   pi: 'pi_setup_modal_title',
   omp: 'omp_setup_modal_title',
+  mcode: 'mcode_setup_modal_title',
 };
 
 function getSetupModalTitleKey(assistant) {
@@ -618,6 +640,7 @@ function setSetupModalBody(assistant) {
     grok: 'setup-body-grok',
     pi: 'setup-body-pi',
     omp: 'setup-body-omp',
+    mcode: 'setup-body-mcode',
   };
   const bodyElements = Object.values(bodyIds)
     .filter((bodyId, index, ids) => ids.indexOf(bodyId) === index)
@@ -718,7 +741,30 @@ function updateLanguageUI() {
   updateCodexRateLimit();
 }
 
+async function loadAppVersion() {
+  const versionElement = document.getElementById('app-version');
+  if (!versionElement) return;
+
+  try {
+    const response = await fetch('/api/version', { cache: 'no-store' });
+    if (!response.ok) {
+      throw new Error(`版本 API 回傳 HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    const version = typeof payload.version === 'string' ? payload.version.trim() : '';
+    if (!version) {
+      throw new Error('版本 API 未提供有效版本');
+    }
+
+    versionElement.textContent = `v${version}`;
+  } catch (error) {
+    console.error('無法載入應用程式版本', error);
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+  void loadAppVersion();
   initApp();
 });
 
@@ -2553,7 +2599,13 @@ function renderDashboard(data) {
   }
   const nextSearchFingerprint = JSON.stringify(
     allSessions
-      .map(session => [session.assistant_type, session.session_id, session.max_turn_no])
+      .map(session => [
+        session.assistant_type,
+        session.source_kind,
+        session.source_dir_key,
+        session.session_id,
+        session.max_turn_no,
+      ])
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)))
   );
   const shouldRefreshSearch = currentSessionSearchQuery
@@ -3759,10 +3811,10 @@ function buildDailyViewData(data) {
   if (!currentSessionCwdFilter) return data;
 
   const sessions = getCwdFilteredSessions(Array.isArray(data.sessions) ? data.sessions : []);
-  const sessionIds = new Set(sessions.map(session => String(session.session_id || '')));
-  const rawEntries = (Array.isArray(data.raw_entries) ? data.raw_entries : []).filter(entry => (
-    sessionIds.has(String(entry.session_id || ''))
-  ));
+  const rawEntries = filterEntriesBySessionIdentity(
+    Array.isArray(data.raw_entries) ? data.raw_entries : [],
+    sessions
+  );
 
   return {
     ...data,
@@ -3857,8 +3909,8 @@ function updateSessionCwdFilterOptions(sessions) {
     : t('session_cwd_filter_aria_label');
 }
 
-function sessionSearchMatchKey(assistantType, sessionId) {
-  return JSON.stringify([assistantType || '', sessionId || '']);
+function sessionSearchMatchKey(session) {
+  return sessionIdentityKey(session);
 }
 
 function getSearchFilteredSessions() {
@@ -3873,7 +3925,7 @@ function getSearchFilteredSessions() {
   }
 
   return cwdFilteredSessions.filter(session => currentSessionSearchMatches.has(
-    sessionSearchMatchKey(session.assistant_type, session.session_id)
+    sessionSearchMatchKey(session)
   ));
 }
 
@@ -3937,10 +3989,7 @@ async function executeSessionPromptSearch(query, searchContext) {
     }
 
     currentSessionSearchMatches = new Set(
-      (result.matches || []).map(match => sessionSearchMatchKey(
-        match.assistant_type,
-        match.session_id
-      ))
+      (result.matches || []).map(match => sessionSearchMatchKey(match))
     );
     currentSessionSearchUnavailable = Number(result.unavailable_sessions) || 0;
     currentSessionSearchState = 'complete';
@@ -3970,13 +4019,14 @@ async function executeSessionPromptSearch(query, searchContext) {
 function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const map = new Map();
   sessions.forEach(s => {
-    map.set(s.session_id, { ...s, children: [] });
+    map.set(sessionIdentityKey(s), { ...s, children: [] });
   });
 
   const nodes = [...map.values()];
   const roots = [];
   nodes.forEach(item => {
-    const parent = item.parent_session_id ? map.get(item.parent_session_id) : null;
+    const parentKey = parentSessionIdentityKey(item);
+    const parent = parentKey ? map.get(parentKey) : null;
     if (parent && parent !== item) {
       parent.children.push(item);
     } else {
@@ -3994,8 +4044,9 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   const flat = [];
   const visited = new Set();
   const traverse = (node, depth, parentName) => {
-    if (visited.has(node.session_id)) return;
-    visited.add(node.session_id);
+    const nodeKey = sessionIdentityKey(node);
+    if (visited.has(nodeKey)) return;
+    visited.add(nodeKey);
     flat.push({
       ...node,
       depth,
@@ -4008,7 +4059,7 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
   };
   roots.forEach(r => traverse(r, 0, null));
   nodes.forEach(node => {
-    if (!visited.has(node.session_id)) {
+    if (!visited.has(sessionIdentityKey(node))) {
       traverse(node, 0, null);
     }
   });
@@ -4143,41 +4194,44 @@ function renderSessionTable(sessions) {
   }
 
   // 建立快速查詢 Map 以供 Hover 高亮與樹狀結構查詢
-  const sessionsMap = Object.create(null);
+  const sessionsMap = new Map();
   sessions.forEach(s => {
-    sessionsMap[s.session_id] = s;
+    sessionsMap.set(sessionIdentityKey(s), s);
   });
 
-  function getRootParentId(session) {
+  function getRootParentKey(session) {
     let curr = session;
     const path = [];
     const positions = new Map();
 
     while (curr) {
-      const id = curr.session_id;
-      if (positions.has(id)) {
+      const key = sessionIdentityKey(curr);
+      if (positions.has(key)) {
         return path
-          .slice(positions.get(id))
-          .map(node => String(node.session_id))
+          .slice(positions.get(key))
+          .map(node => sessionIdentityKey(node))
           .sort((a, b) => a.localeCompare(b))[0];
       }
 
-      positions.set(id, path.length);
+      positions.set(key, path.length);
       path.push(curr);
 
-      if (!curr.parent_session_id || !sessionsMap[curr.parent_session_id]) {
-        return id;
+      const parentKey = parentSessionIdentityKey(curr);
+      if (!parentKey || !sessionsMap.has(parentKey)) {
+        return key;
       }
-      curr = sessionsMap[curr.parent_session_id];
+      curr = sessionsMap.get(parentKey);
     }
 
-    return session.session_id;
+    return sessionIdentityKey(session);
   }
 
   sessions.forEach(s => {
     const tr = document.createElement('tr');
     tr.setAttribute('data-session-id', s.session_id);
     tr.setAttribute('data-parent-id', s.parent_session_id || '');
+    tr.setAttribute('data-session-key', sessionIdentityKey(s));
+    tr.setAttribute('data-parent-key', parentSessionIdentityKey(s) || '');
 
     if (s.isSubagent) {
       tr.classList.add('subagent-row');
@@ -4265,13 +4319,13 @@ function renderSessionTable(sessions) {
 
     // 群組 Hover 高亮
     tr.addEventListener('mouseenter', () => {
-      const rootId = getRootParentId(s);
+      const rootKey = getRootParentKey(s);
       tbody.querySelectorAll('tr').forEach(row => {
-        const sid = row.getAttribute('data-session-id');
-        const pid = row.getAttribute('data-parent-id');
-        const rowSession = sessionsMap[sid];
+        const sid = row.getAttribute('data-session-key');
+        const pid = row.getAttribute('data-parent-key');
+        const rowSession = sessionsMap.get(sid);
         
-        if (sid === rootId || pid === rootId || (rowSession && getRootParentId(rowSession) === rootId)) {
+        if (sid === rootKey || pid === rootKey || (rowSession && getRootParentKey(rowSession) === rootKey)) {
           row.classList.add('family-highlight');
         }
       });
@@ -5562,7 +5616,7 @@ function renderModelSessionDrilldown(sessions) {
                   const cwd = session.cwd || t('unknown_cwd');
                   const time = formatLocalTime(session.timestamp, true) || '—';
                   return `
-                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
+                    <button type="button" class="model-session-link" data-session-id="${escapeHtml(session.session_id)}" data-assistant-type="${escapeHtml(session.assistant_type || '')}" data-source-kind="${escapeHtml(session.source_kind || '')}" data-source-dir-key="${escapeHtml(session.source_dir_key || '')}" aria-label="${escapeHtml(`${t('open_session')}: ${name}`)}">
                       <span class="model-session-primary">
                         <span class="model-session-name-row">
                           <span class="model-session-name">${escapeHtml(name)}</span>
@@ -5691,12 +5745,12 @@ function appendModelSummaryRows(tbody, models, period) {
 
       const sessionButton = event.target.closest('.model-session-link');
       if (!sessionButton || !Array.isArray(detailsRow.modelSessions)) return;
-      const session = detailsRow.modelSessions.find(
-        item =>
-          item.session_id === sessionButton.dataset.sessionId
-          && (item.assistant_type || '') === sessionButton.dataset.assistantType
-          && (item.source_kind || '') === sessionButton.dataset.sourceKind
-      );
+      const session = detailsRow.modelSessions.find(item => matchesSessionIdentity(item, {
+        session_id: sessionButton.dataset.sessionId,
+        assistant_type: sessionButton.dataset.assistantType,
+        source_kind: sessionButton.dataset.sourceKind,
+        source_dir_key: sessionButton.dataset.sourceDirKey,
+      }));
       if (session) {
         openSessionTimeline({
           ...session,
@@ -6664,6 +6718,9 @@ async function loadSetupInfo(assistant = currentAssistant) {
     } else if (resolvedAssistant === 'omp') {
       const homeLabelOmp = document.getElementById('lbl-detected-home-omp');
       if (homeLabelOmp) homeLabelOmp.textContent = abbreviateHomePath(data.omp?.data_path || '');
+    } else if (resolvedAssistant === 'mcode') {
+      const homeLabelMcode = document.getElementById('lbl-detected-home-mcode');
+      if (homeLabelMcode) homeLabelMcode.textContent = abbreviateHomePath(data.mcode?.data_path || '');
     }
 
     // Apply updated language translations

@@ -1,3 +1,6 @@
+import { sessionIdentityKey } from './session-utils.js?v=4';
+import { parseUsageTimestamp } from './time-utils.js?v=1';
+
 export function normalizeEntryTokenParts(entry) {
   const tokens = entry?.delta_tokens || (entry?.turn_no === 1 ? entry.tokens : null);
   if (!tokens) {
@@ -15,19 +18,6 @@ export function normalizeEntryTokenParts(entry) {
   const input = Math.max(0, total - output - cache);
 
   return { input, output, cache, total };
-}
-
-export function parseUsageTimestamp(timestamp) {
-  const value = String(timestamp || '').trim();
-  if (!value) return null;
-
-  const hasExplicitTimezone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value);
-  const isSqlOrIsoTimestamp = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(value);
-  const normalized = isSqlOrIsoTimestamp && !hasExplicitTimezone
-    ? `${value.replace(' ', 'T')}Z`
-    : value;
-  const parsed = new Date(normalized);
-  return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
 export function getUsageEntryUtcMinute(timestamp) {
@@ -291,16 +281,19 @@ export function aggregateDailyTokenCandles(
   entries.forEach(entry => {
     const parts = normalizeEntryTokenParts(entry);
     if (parts.total <= 0) return;
-    const sessionId = String(entry.session_id || '');
-    sessionTokenTotals.set(sessionId, (sessionTokenTotals.get(sessionId) || 0) + parts.total);
+    const identityKey = sessionIdentityKey(entry);
+    sessionTokenTotals.set(
+      identityKey,
+      (sessionTokenTotals.get(identityKey) || 0) + parts.total
+    );
   });
 
   const sessionCostPerToken = new Map();
   (Array.isArray(sessions) ? sessions : []).forEach(session => {
-    const sessionId = String(session.session_id || '');
-    const tokenTotal = sessionTokenTotals.get(sessionId) || Number(session.total_tokens) || 0;
+    const identityKey = sessionIdentityKey(session);
+    const tokenTotal = sessionTokenTotals.get(identityKey) || Number(session.total_tokens) || 0;
     const cost = Math.max(0, Number(session.cost_usd) || 0);
-    sessionCostPerToken.set(sessionId, tokenTotal > 0 ? cost / tokenTotal : 0);
+    sessionCostPerToken.set(identityKey, tokenTotal > 0 ? cost / tokenTotal : 0);
   });
 
   entries.forEach(entry => {
@@ -314,7 +307,7 @@ export function aggregateDailyTokenCandles(
     bucket.output += parts.output;
     bucket.cache += parts.cache;
     bucket.total += parts.total;
-    bucket.cost += parts.total * (sessionCostPerToken.get(String(entry.session_id || '')) || 0);
+    bucket.cost += parts.total * (sessionCostPerToken.get(sessionIdentityKey(entry)) || 0);
   });
 
   let cumulative = 0;

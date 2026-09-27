@@ -4355,7 +4355,7 @@ fn sync_codex_transcript(
                 entry.source_kind.as_deref().unwrap_or(CODEX_OTHER_SOURCE_KIND),
                 identity,
                 entry.timestamp,
-                entry.timestamp.get(0..10).unwrap_or("unknown"),
+                local_date_from_timestamp(&entry.timestamp),
                 entry.session_id,
                 entry.session_name.as_deref(),
                 entry.transcript_path.as_deref(),

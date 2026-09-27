@@ -180,6 +180,15 @@ pub(super) fn cursor_date_from_timestamp(timestamp: &str) -> Option<&str> {
     Some(date)
 }
 
+/// 供 `parse_cursor_session_file` 在找不到 `<timestamp>` 標籤時，用檔案 mtime
+/// 當作 fallback timestamp。必須轉本地時區（而非 UTC）再格式化，因為
+/// `cursor_date_from_timestamp` 只單純截取這個字串前 10 碼當日期，不會再做任
+/// 何時區換算。
+fn local_timestamp_string_from_system_time(modified: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Local> = modified.into();
+    datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 fn run_cursor_model_attribution_migration(conn: &mut Connection) -> Result<(), String> {
     let already_applied: bool = conn
         .query_row(
@@ -877,13 +886,12 @@ pub(super) fn parse_cursor_session_file(
             if current_timestamp.is_empty() {
                 if let Ok(metadata) = filepath.metadata() {
                     if let Ok(modified) = metadata.modified() {
-                        let datetime: chrono::DateTime<chrono::Utc> = modified.into();
-                        current_timestamp = datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+                        current_timestamp = local_timestamp_string_from_system_time(modified);
                     }
                 }
             }
             if current_timestamp.is_empty() {
-                current_timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                current_timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
             }
 
             let input_tokens = (current_prompt.len() / 4).max(10) as u64;
@@ -1159,6 +1167,66 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.entry.session_name.as_deref() == Some("第二條提示")));
+    }
+
+    #[test]
+    fn parse_cursor_session_file_uses_local_timezone_mtime_when_timestamp_tag_missing() {
+        let path = temp_jsonl_path("cursor-no-timestamp");
+        let content = r#"{"role":"user","message":{"content":"第一條提示"}}
+{"role":"assistant","message":{"content":"收到"}}
+"#;
+        fs::write(&path, content).unwrap();
+        // 1_790_008_301 秒 = 2026-09-21T16:31:41Z = 本地 (UTC+8) 2026-09-22 00:31:41
+        let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_008_301);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+
+        let entries =
+            parse_cursor_session_file(&path, &HashMap::new(), &HashSet::new(), &HashMap::new())
+                .unwrap();
+        let _ = fs::remove_file(&path);
+
+        let expected: chrono::DateTime<chrono::Local> = mtime.into();
+        let timestamp = &entries[0].entry.timestamp;
+        assert_eq!(timestamp, &expected.format("%Y-%m-%d %H:%M:%S").to_string());
+        let expected_date = expected.format("%Y-%m-%d").to_string();
+        assert_eq!(
+            cursor_date_from_timestamp(timestamp),
+            Some(expected_date.as_str())
+        );
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert!(
+                timestamp.starts_with("2026-09-22"),
+                "不應是 UTC 的 2026-09-21：{timestamp}"
+            );
+            assert_eq!(expected_date, "2026-09-22", "不應是 UTC 的 2026-09-21");
+        }
+    }
+
+    #[test]
+    fn local_timestamp_string_from_system_time_uses_local_timezone_not_utc() {
+        // 用固定的 SystemTime（不依賴檔案系統 mtime 或執行測試當下的真實時鐘），
+        // 確保測試結果穩定，不會因為「剛好在本地白天執行測試」而在 UTC 環境下
+        // 巧合通過、卻在真正跨日的凌晨時段失去偵測力。
+        // UTC 2026-09-21T16:31:41Z：對 UTC+8 而言已經跨到本地隔天 00:31:41。
+        let fixed_utc = chrono::DateTime::parse_from_rfc3339("2026-09-21T16:31:41Z").unwrap();
+        let modified: std::time::SystemTime = fixed_utc.into();
+
+        let result = local_timestamp_string_from_system_time(modified);
+
+        let expected = fixed_utc
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(result, expected);
+        // 機器時區有偏移時，額外證明真的轉了本地時區，不是巧合維持 UTC 值。
+        if chrono::Local::now().offset().local_minus_utc() != 0 {
+            assert!(!result.starts_with("2026-09-21"));
+        }
     }
 
     #[test]

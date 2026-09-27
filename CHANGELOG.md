@@ -4,15 +4,15 @@
 
 ## [未發行]
 
-### 變更
-
-- 整合 upstream v1.0.6（新增 mcode／MiniMax Code 助理支援與 `/api/version` 端點等上游變更）
-  至本 fork 的合併分支。
-
 ### 新增與改善
 
 - Cloud Run 唯讀 snapshot 模式路由補齊 `/api/version`（回傳與正式模式一致的 `CARGO_PKG_VERSION`）
   與 mcode 助理，避免這次整合 upstream 後 snapshot 部署落後正式模式。
+
+### 變更
+
+- 整合 upstream v1.0.6（新增 mcode／MiniMax Code 助理支援與 `/api/version` 端點等上游變更）
+  至本 fork 的合併分支。
 
 ### 修正
 

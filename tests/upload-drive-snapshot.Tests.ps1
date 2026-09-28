@@ -306,3 +306,86 @@ Describe "upload-drive-snapshot.ps1：Get-DailyRawCache 對重複日期不重複
         }
     }
 }
+
+Describe "upload-drive-snapshot.ps1：Get-UniqueOrdered 去重後維持原始出現順序" {
+    BeforeAll {
+        $script:Ac5SnapshotPath = Join-Path $TestDrive "ac5-snapshot.json"
+        $script:Ac5FileIdPath = Join-Path $TestDrive "ac5-file-id.txt"
+        $script:Ac5IndexPath = Join-Path $TestDrive "ac5-index.json"
+
+        Mock -CommandName Invoke-RestMethod -MockWith { throw "AC5-TEST: Invoke-RestMethod 不應該被呼叫" }
+        Mock -CommandName Invoke-WebRequest -MockWith { throw "AC5-TEST: Invoke-WebRequest 不應該被呼叫" }
+        Mock -CommandName gcloud -MockWith { throw "AC5-TEST: gcloud 不應該被呼叫" }
+        Mock -CommandName pwsh -MockWith { throw "AC5-TEST: pwsh 不應該被呼叫" }
+
+        . $script:ScriptPath -SnapshotPath $script:Ac5SnapshotPath -FileIdPath $script:Ac5FileIdPath -SessionEventIndexPath $script:Ac5IndexPath
+    }
+
+    It "輸入順序非字典序時，去重後仍照原始出現順序排列（不能用 Select-Object -Unique，那會重新排序）" {
+        # 刻意用「後面的日期比前面小」的輸入：如果去重邏輯內部誤用了
+        # Select-Object -Unique（會重新排序成字典序 09-10, 09-11），
+        # 這條測試會抓到，因為預期結果是保留原始出現順序 09-11, 09-10。
+        $result = Get-UniqueOrdered -Values @("2026-09-11", "2026-09-10", "2026-09-11")
+        @($result) | Should -Be @("2026-09-11", "2026-09-10")
+    }
+}
+
+Describe "upload-drive-snapshot.ps1：Export-SnapshotFromApi 對日期清單本身的重複值做去重（codex 總審發現：只防重打 API，沒防輸出重複 key）" {
+    BeforeAll {
+        $script:Ac4SnapshotPath = Join-Path $TestDrive "ac4-snapshot.json"
+        $script:Ac4FileIdPath = Join-Path $TestDrive "ac4-file-id.txt"
+        $script:Ac4IndexPath = Join-Path $TestDrive "ac4-index.json"
+
+        Mock -CommandName Invoke-RestMethod -MockWith { throw "AC4-TEST: Invoke-RestMethod 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName Invoke-WebRequest -MockWith { throw "AC4-TEST: Invoke-WebRequest 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName gcloud -MockWith { throw "AC4-TEST: gcloud 不應該被呼叫" }
+        Mock -CommandName pwsh -MockWith { throw "AC4-TEST: pwsh 不應該被呼叫" }
+
+        . $script:ScriptPath -SnapshotPath $script:Ac4SnapshotPath -FileIdPath $script:Ac4FileIdPath -SessionEventIndexPath $script:Ac4IndexPath
+    }
+
+    Context "/api/claude/dates 回傳的日期清單本身含重複值（例如 @('2026-09-10','2026-09-11','2026-09-10')）" {
+        BeforeEach {
+            Mock -CommandName Upload-SessionEvent -MockWith {
+                param($Assistant, $SessionId, $SessionDate, $SourceKind, $SourceDirKey)
+                return $null
+            }
+
+            Mock -CommandName Invoke-TokenUsageApi -MockWith {
+                param($Path)
+                if ($Path -eq "/api/claude/dates") { return [pscustomobject]@{ dates = @("2026-09-10", "2026-09-11", "2026-09-10") } }
+                if ($Path -match "^/api/[^/]+/dates$") { return [pscustomobject]@{ dates = @() } }
+                if ($Path -match "/months$") { return [pscustomobject]@{ months = @() } }
+                if ($Path -match "/years$") { return [pscustomobject]@{ years = @() } }
+                return $null
+            }
+
+            Mock -CommandName Invoke-TokenUsageApiRaw -MockWith {
+                param($Path)
+                if ($Path -eq "/api/claude/usage/2026-09-10") { return '{"sessions":[]}' }
+                if ($Path -eq "/api/claude/usage/2026-09-11") { return '{"sessions":[]}' }
+                return $null
+            }
+        }
+
+        It "輸出的 daily JSON 裡 2026-09-10 這個 key 只出現一次，dates 陣列也已去重，且整份 JSON 能被正常解析（重現 codex 審查發現的重複 key 問題）" {
+            $outputPath = Join-Path $TestDrive "ac4-export.json"
+            Export-SnapshotFromApi -OutputPath $outputPath
+
+            $rawJson = Get-Content -Raw -LiteralPath $outputPath
+
+            # 直接數原始文字裡 daily 物件的 key 出現次數：duplicate key 一旦被
+            # ConvertFrom-Json 解析成 PSObject，不同 PowerShell 版本對重複屬性的
+            # 處理方式不保證一致，只有從原始文字比對才能可靠證明「輸出本身」
+            # 有沒有重複 key。
+            $dailyKeyMatches = [regex]::Matches($rawJson, [regex]::Escape('"2026-09-10":{'))
+            $dailyKeyMatches.Count | Should -Be 1
+
+            { $rawJson | ConvertFrom-Json } | Should -Not -Throw
+
+            $snapshot = $rawJson | ConvertFrom-Json
+            @($snapshot.assistants.claude.dates) | Should -Be @("2026-09-10", "2026-09-11")
+            @($snapshot.assistants.claude.dates).Count | Should -Be 2
+        }
+    }
+}

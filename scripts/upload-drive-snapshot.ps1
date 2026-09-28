@@ -252,6 +252,25 @@ function Get-AsArray {
     return @($Value)
 }
 
+function Get-UniqueOrdered {
+    param(
+        [object[]]$Values
+    )
+
+    # 依原始出現順序去重（不能用 Select-Object -Unique，那會重新排序）。
+    # /api/{assistant}/dates 若回傳含重複值的日期清單，呼叫端要在傳給任何下游
+    # 函式（Get-DailyRawCache、Collect-SessionEventsFromApi、寫 daily JSON）之前
+    # 先用這裡去重過的清單取代，否則輸出的 JSON 會出現重複 key（codex 總審發現）。
+    $seen = [System.Collections.Generic.HashSet[string]]::new()
+    $result = [System.Collections.Generic.List[object]]::new()
+    foreach ($value in $Values) {
+        if ($seen.Add([string]$value)) {
+            $result.Add($value)
+        }
+    }
+    return @($result.ToArray())
+}
+
 function Clear-TranscriptPath {
     param([object]$Value)
 
@@ -765,6 +784,11 @@ function Export-SnapshotFromApi {
         $firstAssistant = $true
         foreach ($assistant in $Assistants) {
             $dates = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/dates") "dates"
+            # /api/{assistant}/dates 本身可能回傳含重複值的日期清單。這裡去重一次，
+            # 讓後面 Get-DailyRawCache、Collect-SessionEventsFromApi、寫 daily JSON、
+            # 以及輸出的 "dates" 陣列全部統一用同一份去重後的清單，不再各自傳遞原始
+            # 可能重複的 $dates（codex 總審發現：上一輪只防了重打 API，沒防輸出重複 key）。
+            $dates = Get-UniqueOrdered -Values $dates
             $months = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/months") "months"
             $years = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/years") "years"
             $dailyRawCache = Get-DailyRawCache -Assistant $assistant -Dates $dates

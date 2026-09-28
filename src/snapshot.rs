@@ -1,6 +1,11 @@
-use axum::{extract::Path as AxumPath, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::Path as AxumPath,
+    http::{header::CONTENT_TYPE, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{value::RawValue, Value};
 use std::{
     collections::HashMap,
     fs,
@@ -47,9 +52,9 @@ pub struct AssistantSnapshot {
     pub months: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_string_list")]
     pub years: Vec<String>,
-    pub daily: HashMap<String, Value>,
-    pub monthly: HashMap<String, Value>,
-    pub yearly: HashMap<String, Value>,
+    pub daily: HashMap<String, Box<RawValue>>,
+    pub monthly: HashMap<String, Box<RawValue>>,
+    pub yearly: HashMap<String, Box<RawValue>>,
     #[serde(default)]
     pub session_events: HashMap<String, SessionEventRef>,
 }
@@ -67,16 +72,25 @@ impl DashboardSnapshot {
         self.assistants.get(&normalize_assistant_name(assistant))
     }
 
-    pub fn lookup_daily(&self, assistant: &str, date: &str) -> Option<&Value> {
-        self.lookup_assistant(assistant)?.daily.get(date)
+    pub fn lookup_daily(&self, assistant: &str, date: &str) -> Option<&RawValue> {
+        self.lookup_assistant(assistant)?
+            .daily
+            .get(date)
+            .map(Box::as_ref)
     }
 
-    pub fn lookup_monthly(&self, assistant: &str, year_month: &str) -> Option<&Value> {
-        self.lookup_assistant(assistant)?.monthly.get(year_month)
+    pub fn lookup_monthly(&self, assistant: &str, year_month: &str) -> Option<&RawValue> {
+        self.lookup_assistant(assistant)?
+            .monthly
+            .get(year_month)
+            .map(Box::as_ref)
     }
 
-    pub fn lookup_yearly(&self, assistant: &str, year: &str) -> Option<&Value> {
-        self.lookup_assistant(assistant)?.yearly.get(year)
+    pub fn lookup_yearly(&self, assistant: &str, year: &str) -> Option<&RawValue> {
+        self.lookup_assistant(assistant)?
+            .yearly
+            .get(year)
+            .map(Box::as_ref)
     }
 
     pub fn lookup_session_event(
@@ -105,6 +119,8 @@ where
 struct CachedSnapshot {
     loaded_at: Instant,
     snapshot: Arc<DashboardSnapshot>,
+    /// 僅 Drive 模式會填值；本機檔案模式維持每次到期就重新載入，不比對版本
+    version: Option<String>,
 }
 
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<CachedSnapshot>>> = OnceLock::new();
@@ -185,8 +201,11 @@ where
         for value in daily.values_mut() {
             strip_transcript_paths(value);
         }
-        let monthly = fetch_view_map(&fetch, &assistant, SnapshotView::Monthly, &months).await?;
-        let yearly = fetch_view_map(&fetch, &assistant, SnapshotView::Yearly, &years).await?;
+        let daily = to_raw_map(daily)?;
+        let monthly =
+            to_raw_map(fetch_view_map(&fetch, &assistant, SnapshotView::Monthly, &months).await?)?;
+        let yearly =
+            to_raw_map(fetch_view_map(&fetch, &assistant, SnapshotView::Yearly, &years).await?)?;
 
         assistant_snapshots.insert(
             assistant,
@@ -254,6 +273,17 @@ where
         }
     }
     Ok(map)
+}
+
+/// 把解析過的 Value 轉成原始 JSON（Box<RawValue>），回應時可直接送出文字，不必再解析或整份複製
+fn to_raw_map(map: HashMap<String, Value>) -> Result<HashMap<String, Box<RawValue>>, String> {
+    map.into_iter()
+        .map(|(key, value)| {
+            let raw = serde_json::value::to_raw_value(&value)
+                .map_err(|e| format!("轉換為 RawValue 失敗 ({key}): {e}"))?;
+            Ok((key, raw))
+        })
+        .collect()
 }
 
 fn strip_transcript_paths(daily: &mut Value) {
@@ -355,27 +385,110 @@ async fn get_cached_snapshot() -> Result<Arc<DashboardSnapshot>, String> {
     let cache = SNAPSHOT_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().await;
 
+    let download = || load_snapshot_from_env();
+
+    // 與 load_snapshot_from_env 相同的優先順序：本機檔案模式優先於 Drive 模式，
+    // 兩者都設定時不啟用「查版本、沒變就不下載」，避免下載走檔案、查版本卻打 Drive 導致永遠沿用舊快取
+    let use_drive_version_check = !env_var_is_set("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH")
+        && env_var_is_set("DRIVE_SNAPSHOT_FILE_ID");
+
+    if use_drive_version_check {
+        let file_id = std::env::var("DRIVE_SNAPSHOT_FILE_ID").unwrap_or_default();
+        let check_version = || async { drive_file_version(&file_id).await };
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download).await
+    } else {
+        // 本機檔案模式：維持現狀，時間到就重新載入（量測記憶體需要量到最糟情況）
+        let no_version_check = || async { Ok::<Option<String>, String>(None) };
+        refresh_cached_snapshot(&mut guard, ttl, &no_version_check, &download).await
+    }
+}
+
+/// 刷新快取的核心邏輯，抽成可注入版本查詢／下載函式的純函式以利測試（不依賴全域快取或真實網路）。
+/// `check_version` 回傳 `Ok(None)` 代表無法判斷版本（例如本機檔案模式），一律視為需要下載。
+async fn refresh_cached_snapshot<V, VFut, D, DFut>(
+    guard: &mut Option<CachedSnapshot>,
+    ttl: Duration,
+    check_version: &V,
+    download: &D,
+) -> Result<Arc<DashboardSnapshot>, String>
+where
+    V: Fn() -> VFut,
+    VFut: Future<Output = Result<Option<String>, String>>,
+    D: Fn() -> DFut,
+    DFut: Future<Output = Result<DashboardSnapshot, String>>,
+{
     if let Some(cached) = guard.as_ref() {
         if cached.loaded_at.elapsed() < ttl {
             return Ok(cached.snapshot.clone());
         }
     }
 
-    let snapshot = match load_snapshot_from_env().await {
-        Ok(snapshot) => Arc::new(snapshot),
+    let mut new_version: Option<String> = None;
+    match check_version().await {
+        Ok(version) => {
+            new_version = version;
+            let unchanged = matches!(
+                (new_version.as_deref(), guard.as_ref().and_then(|c| c.version.as_deref())),
+                (Some(new_v), Some(old_v)) if new_v == old_v
+            );
+            if unchanged {
+                if let Some(cached) = guard.as_mut() {
+                    cached.loaded_at = Instant::now();
+                    return Ok(cached.snapshot.clone());
+                }
+            }
+        }
+        Err(err) => {
+            if let Some(cached) = guard.as_ref() {
+                eprintln!("⚠️ 查詢 Drive 檔案版本失敗，沿用快取資料: {err}");
+                return Ok(cached.snapshot.clone());
+            }
+            eprintln!("⚠️ 查詢 Drive 檔案版本失敗，直接嘗試下載: {err}");
+        }
+    }
+
+    match download().await {
+        Ok(snapshot) => {
+            let snapshot = Arc::new(snapshot);
+            *guard = Some(CachedSnapshot {
+                loaded_at: Instant::now(),
+                snapshot: snapshot.clone(),
+                version: new_version,
+            });
+            Ok(snapshot)
+        }
         Err(err) => {
             if let Some(cached) = guard.as_ref() {
                 eprintln!("⚠️ 重新載入 snapshot 失敗，使用快取資料: {err}");
-                return Ok(cached.snapshot.clone());
+                Ok(cached.snapshot.clone())
+            } else {
+                Err(err)
             }
-            return Err(err);
         }
-    };
-    *guard = Some(CachedSnapshot {
-        loaded_at: Instant::now(),
-        snapshot: snapshot.clone(),
-    });
-    Ok(snapshot)
+    }
+}
+
+/// 輕量查詢 Drive 檔案版本，不下載整份內容；用於刷新前判斷是否值得重新下載
+async fn drive_file_version(file_id: &str) -> Result<Option<String>, String> {
+    let token = google_access_token()?;
+    let url =
+        format!("https://www.googleapis.com/drive/v3/files/{file_id}?fields=version,modifiedTime");
+    let body = run_curl(&[
+        "-fsS",
+        "--max-time",
+        "20",
+        "-H",
+        &format!("Authorization: Bearer {token}"),
+        &url,
+    ])
+    .map_err(|e| format!("查詢 Drive 檔案版本失敗 ({file_id}): {e}"))?;
+    let payload: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+    let version = payload
+        .get("version")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("modifiedTime").and_then(Value::as_str))
+        .map(ToOwned::to_owned);
+    Ok(version)
 }
 
 async fn fetch_drive_file(file_id: &str) -> Result<String, String> {
@@ -557,6 +670,16 @@ fn not_found_response(message: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// 直接送出 snapshot 內保存的原始 JSON 文字，不解析、不複製整份 snapshot
+fn raw_json_response(value: &RawValue) -> axum::response::Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "application/json")],
+        value.get().to_owned(),
+    )
+        .into_response()
+}
+
 pub async fn get_available_dates(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
     if !ASSISTANTS.contains(&assistant.as_str()) {
@@ -618,7 +741,7 @@ pub async fn get_usage_details(
     match get_cached_snapshot().await {
         Ok(snapshot) => {
             if let Some(value) = snapshot.lookup_daily(&assistant, &date) {
-                Json(value.clone()).into_response()
+                raw_json_response(value)
             } else {
                 not_found_response("找不到該日期的使用量資料。")
             }
@@ -637,7 +760,7 @@ pub async fn get_monthly_details(
     match get_cached_snapshot().await {
         Ok(snapshot) => {
             if let Some(value) = snapshot.lookup_monthly(&assistant, &year_month) {
-                Json(value.clone()).into_response()
+                raw_json_response(value)
             } else {
                 not_found_response("找不到該月份的使用量資料。")
             }
@@ -656,7 +779,7 @@ pub async fn get_yearly_details(
     match get_cached_snapshot().await {
         Ok(snapshot) => {
             if let Some(value) = snapshot.lookup_yearly(&assistant, &year) {
-                Json(value.clone()).into_response()
+                raw_json_response(value)
             } else {
                 not_found_response("找不到該年份的使用量資料。")
             }
@@ -726,7 +849,7 @@ pub async fn get_session_details(
         Ok(snapshot) => {
             let Some(event_ref) = snapshot.lookup_session_event(&assistant, &session_id) else {
                 return not_found_response(
-                    "Snapshot 中沒有此 Session 的事件檔，請重新上傳 Google Drive snapshot。",
+                    "此 Session 的事件檔尚未同步到 Google Drive，下次排程（約 30 分鐘內）會補上；若本機紀錄已刪除則無法補回。",
                 );
             };
 
@@ -808,21 +931,227 @@ mod tests {
         assert_eq!(antigravity.dates, vec!["2026-07-09"]);
         assert_eq!(antigravity.months, vec!["2026-07"]);
 
-        let daily = snapshot.lookup_daily("antigravity", "2026-07-09").unwrap();
+        let daily_raw = snapshot.lookup_daily("antigravity", "2026-07-09").unwrap();
+        let daily: Value = serde_json::from_str(daily_raw.get()).unwrap();
         assert_eq!(daily["summary"]["total_tokens"], 110);
         assert_eq!(daily["raw_entries"][0]["session_id"], "session-1");
         assert!(daily["raw_entries"][0]["transcript_path"].is_null());
 
         assert!(snapshot.lookup_monthly("antigravity", "2026-07").is_none());
-        assert_eq!(
-            snapshot.lookup_yearly("antigravity", "2026").unwrap()["year"],
-            "2026"
-        );
+        let yearly_raw = snapshot.lookup_yearly("antigravity", "2026").unwrap();
+        let yearly: Value = serde_json::from_str(yearly_raw.get()).unwrap();
+        assert_eq!(yearly["year"], "2026");
         assert!(snapshot
             .lookup_assistant("claude")
             .unwrap()
             .dates
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_daily_monthly_yearly_round_trip_export_import_keeps_structure() {
+        let snapshot = build_snapshot_with(&["claude"], |_, view, key| async move {
+            Ok(match (view, key.as_str()) {
+                (SnapshotView::Dates, _) => Some(serde_json::json!({ "dates": ["2026-07-09"] })),
+                (SnapshotView::Months, _) => Some(serde_json::json!({ "months": ["2026-07"] })),
+                (SnapshotView::Years, _) => Some(serde_json::json!({ "years": ["2026"] })),
+                (SnapshotView::Daily, "2026-07-09") => Some(serde_json::json!({
+                    "date": "2026-07-09",
+                    "summary": { "total_tokens": 42 },
+                    "raw_entries": [
+                        { "session_id": "s1", "transcript_path": "C:\\Users\\me\\.codex\\s.jsonl" }
+                    ]
+                })),
+                (SnapshotView::Monthly, "2026-07") => {
+                    Some(serde_json::json!({ "month": "2026-07", "total_tokens": 42 }))
+                }
+                (SnapshotView::Yearly, "2026") => {
+                    Some(serde_json::json!({ "year": "2026", "total_tokens": 42 }))
+                }
+                _ => None,
+            })
+        })
+        .await
+        .unwrap();
+
+        // 匯出（序列化）再讀回（反序列化），結構必須不變
+        let exported = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: DashboardSnapshot = serde_json::from_str(&exported).unwrap();
+
+        let original_daily: Value =
+            serde_json::from_str(snapshot.lookup_daily("claude", "2026-07-09").unwrap().get())
+                .unwrap();
+        let reloaded_daily: Value =
+            serde_json::from_str(reloaded.lookup_daily("claude", "2026-07-09").unwrap().get())
+                .unwrap();
+        assert_eq!(original_daily, reloaded_daily);
+        // transcript_path 清除的效果要在匯出再讀回之後仍然保留
+        assert!(reloaded_daily["raw_entries"][0]["transcript_path"].is_null());
+
+        let original_monthly: Value =
+            serde_json::from_str(snapshot.lookup_monthly("claude", "2026-07").unwrap().get())
+                .unwrap();
+        let reloaded_monthly: Value =
+            serde_json::from_str(reloaded.lookup_monthly("claude", "2026-07").unwrap().get())
+                .unwrap();
+        assert_eq!(original_monthly, reloaded_monthly);
+
+        let original_yearly: Value =
+            serde_json::from_str(snapshot.lookup_yearly("claude", "2026").unwrap().get()).unwrap();
+        let reloaded_yearly: Value =
+            serde_json::from_str(reloaded.lookup_yearly("claude", "2026").unwrap().get()).unwrap();
+        assert_eq!(original_yearly, reloaded_yearly);
+    }
+
+    #[tokio::test]
+    async fn raw_json_response_sends_original_json_unparsed_and_uncloned() {
+        for original in [
+            serde_json::json!({ "date": "2026-07-09", "summary": { "total_tokens": 110 } }),
+            serde_json::json!({ "month": "2026-07", "total_tokens": 42 }),
+            serde_json::json!({ "year": "2026", "total_tokens": 42 }),
+        ] {
+            let raw = serde_json::value::to_raw_value(&original).unwrap();
+            let response = raw_json_response(&raw);
+            assert_eq!(response.status(), StatusCode::OK);
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap();
+            assert!(
+                content_type.starts_with("application/json"),
+                "{content_type}"
+            );
+
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body = String::from_utf8(bytes.to_vec()).unwrap();
+            let parsed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed, original);
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_refresh_reuses_cache_when_version_unchanged_across_two_expiries() {
+        let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = download_count.clone();
+        let download = move || {
+            let dc = dc.clone();
+            async move {
+                dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_snapshot("v1"))
+            }
+        };
+        let check_version = || async { Ok::<Option<String>, String>(Some("v1".to_string())) };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO; // 每次呼叫都視為已到期，用來模擬「兩次到期」
+
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "版本沒變，兩次到期都不應該重新下載"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_refresh_redownloads_when_version_changes() {
+        let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = download_count.clone();
+        let download = move || {
+            let dc = dc.clone();
+            async move {
+                dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_snapshot("content"))
+            }
+        };
+        let version = Arc::new(std::sync::Mutex::new("v1".to_string()));
+        let version_for_check = version.clone();
+        let check_version = move || {
+            let version_for_check = version_for_check.clone();
+            async move { Ok::<Option<String>, String>(Some(version_for_check.lock().unwrap().clone())) }
+        };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO;
+
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        *version.lock().unwrap() = "v2".to_string();
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "版本變了應該重新下載"
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_refresh_falls_back_to_cache_when_version_check_fails() {
+        let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = download_count.clone();
+        let download = move || {
+            let dc = dc.clone();
+            async move {
+                dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_snapshot("content"))
+            }
+        };
+        let should_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let should_fail_for_check = should_fail.clone();
+        let check_version = move || {
+            let should_fail = should_fail_for_check.clone();
+            async move {
+                if should_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("模擬查詢版本失敗".to_string())
+                } else {
+                    Ok(Some("v1".to_string()))
+                }
+            }
+        };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO;
+
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download).await;
+        assert!(result.is_ok(), "查版本失敗時應沿用舊快取並回傳成功");
+        assert_eq!(
+            download_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "查版本失敗不應觸發下載"
+        );
+    }
+
+    fn test_snapshot(source: &str) -> DashboardSnapshot {
+        DashboardSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            generated_at: "2026-09-28T00:00:00Z".to_string(),
+            source: source.to_string(),
+            assistants: HashMap::new(),
+        }
     }
 
     #[tokio::test]

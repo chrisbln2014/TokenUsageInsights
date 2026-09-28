@@ -470,7 +470,9 @@ function Upload-SessionEvent {
     param(
         [string]$Assistant,
         [string]$SessionId,
-        [string]$SessionDate
+        [string]$SessionDate,
+        [string]$SourceKind = "",
+        [string]$SourceDirKey = ""
     )
 
     if ($SkipSessionEvents -or [string]::IsNullOrWhiteSpace($SessionId)) {
@@ -485,7 +487,23 @@ function Upload-SessionEvent {
         return Convert-SessionEventRefFromIndex -Existing $existing -FallbackFileName $fileName
     }
 
-    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId"
+    # 前端在查 session 明細時也會帶這兩個查詢參數（static/app.js:4431-4436），
+    # 理由相同：後端需要 source_kind／source_dir_key 才能在多個來源共用同一個
+    # session_id 時找到正確的那一筆（例如 Copilot App）。缺這兩個參數時後端把
+    # source_dir_key 當成 IS NULL 查，Copilot App session 因此永遠回 404。
+    $queryParams = @()
+    if (-not [string]::IsNullOrWhiteSpace($SourceKind)) {
+        $queryParams += "source_kind=$([uri]::EscapeDataString($SourceKind))"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($SourceDirKey)) {
+        $queryParams += "source_dir_key=$([uri]::EscapeDataString($SourceDirKey))"
+    }
+    $queryString = ""
+    if ($queryParams.Count -gt 0) {
+        $queryString = "?" + ($queryParams -join "&")
+    }
+
+    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId$queryString"
     if ([string]::IsNullOrWhiteSpace($raw)) {
         return Convert-SessionEventRefFromIndex -Existing $existing -FallbackFileName $fileName
     }
@@ -550,7 +568,8 @@ function Upload-SessionEvent {
 function Collect-SessionEventsFromApi {
     param(
         [string]$Assistant,
-        [object[]]$Dates
+        [object[]]$Dates,
+        [System.Collections.IDictionary]$DailyRawCache
     )
 
     $sessionEvents = [ordered]@{}
@@ -561,7 +580,18 @@ function Collect-SessionEventsFromApi {
         return $sessionEvents
     }
     foreach ($date in $Dates) {
-        $day = Invoke-TokenUsageApi "/api/$Assistant/usage/$date"
+        # 同一天的 usage 只查一次：這裡直接讀 $DailyRawCache（由呼叫端事先用
+        # Get-DailyRawCache 查好），不再自己另外呼叫 API。原因見計畫書斷言 7：
+        # 這裡（收集事件檔）跟 daily 的寫入如果各自查一次，中間隔了整輪匯出的
+        # 時間（約 30 分鐘），中途新開的 session 只會進 daily、不會有事件檔。
+        $raw = $null
+        if ($null -ne $DailyRawCache) {
+            $raw = $DailyRawCache[[string]$date]
+        }
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            continue
+        }
+        $day = $raw | ConvertFrom-Json
         if ($null -eq $day) {
             continue
         }
@@ -576,8 +606,18 @@ function Collect-SessionEventsFromApi {
                 continue
             }
 
+            $sourceKind = ""
+            if ($session.PSObject.Properties["source_kind"]) {
+                $sourceKind = [string]$session.source_kind
+            }
+            $sourceDirKey = ""
+            if ($session.PSObject.Properties["source_dir_key"]) {
+                $sourceDirKey = [string]$session.source_dir_key
+            }
+
             try {
-                $eventRef = Upload-SessionEvent -Assistant $Assistant -SessionId $sessionId -SessionDate ([string]$date)
+                $eventRef = Upload-SessionEvent -Assistant $Assistant -SessionId $sessionId -SessionDate ([string]$date) `
+                    -SourceKind $sourceKind -SourceDirKey $sourceDirKey
             } catch {
                 # 單筆 session event 上傳失敗（例如 Drive 短暫錯誤）不應中斷整個 run，
                 # 否則核心 snapshot 永遠上傳不到 Drive。略過此筆、繼續。
@@ -644,6 +684,49 @@ function Write-JsonMapFromApi {
     $Writer.Write("}")
 }
 
+function Get-DailyRawCache {
+    param(
+        [string]$Assistant,
+        [object[]]$Dates
+    )
+
+    # 每個日期只打一次 /api/{assistant}/usage/{date}，原始文字快取起來給
+    # Collect-SessionEventsFromApi（收集事件檔）跟 Write-JsonMapFromRawMap
+    # （寫 daily）共用同一份內容，避免同一天查兩次造成的時間差（計畫書斷言 7）。
+    $cache = @{}
+    foreach ($date in $Dates) {
+        $cache[[string]$date] = Invoke-TokenUsageApiRaw "/api/$Assistant/usage/$date"
+    }
+    return $cache
+}
+
+function Write-JsonMapFromRawMap {
+    param(
+        [System.IO.StreamWriter]$Writer,
+        [object[]]$Keys,
+        [System.Collections.IDictionary]$RawCache
+    )
+
+    $Writer.Write("{")
+    $first = $true
+    foreach ($key in $Keys) {
+        $raw = $RawCache[[string]$key]
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            continue
+        }
+
+        if (-not $first) {
+            $Writer.Write(",")
+        }
+        $first = $false
+
+        $Writer.Write((Convert-JsonString $key))
+        $Writer.Write(":")
+        $Writer.Write((Clear-TranscriptPathJson $raw))
+    }
+    $Writer.Write("}")
+}
+
 function Export-SnapshotFromApi {
     param([string]$OutputPath)
 
@@ -674,7 +757,8 @@ function Export-SnapshotFromApi {
             $dates = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/dates") "dates"
             $months = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/months") "months"
             $years = Get-AsArray (Invoke-TokenUsageApi "/api/$assistant/years") "years"
-            $sessionEvents = Collect-SessionEventsFromApi -Assistant $assistant -Dates $dates
+            $dailyRawCache = Get-DailyRawCache -Assistant $assistant -Dates $dates
+            $sessionEvents = Collect-SessionEventsFromApi -Assistant $assistant -Dates $dates -DailyRawCache $dailyRawCache
 
             if (-not $firstAssistant) {
                 $writer.Write(",")
@@ -686,7 +770,7 @@ function Export-SnapshotFromApi {
             $writer.Write('"dates":')
             $writer.Write((Convert-JsonArray $dates))
             $writer.Write(',"daily":')
-            Write-JsonMapFromApi -Writer $writer -Assistant $assistant -Keys $dates -PathTemplate "/api/{0}/usage/{1}"
+            Write-JsonMapFromRawMap -Writer $writer -Keys $dates -RawCache $dailyRawCache
             $writer.Write(',"months":')
             $writer.Write((Convert-JsonArray $months))
             $writer.Write(',"monthly":')
@@ -706,6 +790,13 @@ function Export-SnapshotFromApi {
     }
 
     Write-Host "Snapshot exported from $ApiUrl to $OutputPath"
+}
+
+# 被 dot-source（. .\upload-drive-snapshot.ps1）時只載入上面的函式，不執行下面的主流程。
+# 這道防護存在的理由：Pester 測試需要 dot-source 這支腳本才能單獨呼叫函式來測，
+# 若沒有這道防護，dot-source 會直接觸發真實的 Drive 上傳（見計畫書斷言 13）。
+if ($MyInvocation.InvocationName -eq '.') {
+    return
 }
 
 if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {

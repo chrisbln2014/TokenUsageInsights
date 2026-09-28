@@ -127,7 +127,13 @@ fn snapshot_mode_serves_without_creating_local_database_or_update_log() {
     );
 }
 
-fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
+struct HttpResponse {
+    status: u16,
+    content_type: Option<String>,
+    body: String,
+}
+
+fn http_get(port: u16, path: &str) -> Result<HttpResponse, String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -143,13 +149,66 @@ fn http_get(port: u16, path: &str) -> Result<(u16, String), String> {
     let mut parts = raw.splitn(2, "\r\n\r\n");
     let head = parts.next().unwrap_or_default();
     let body = parts.next().unwrap_or_default().to_string();
-    let status_line = head.lines().next().unwrap_or_default();
+    let mut head_lines = head.lines();
+    let status_line = head_lines.next().unwrap_or_default();
     let status = status_line
         .split_whitespace()
         .nth(1)
         .and_then(|s| s.parse::<u16>().ok())
         .ok_or_else(|| format!("無法解析狀態列: {status_line}"))?;
-    Ok((status, body))
+    let content_type = head_lines.find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-type")
+            .then(|| value.trim().to_string())
+    });
+    Ok(HttpResponse {
+        status,
+        content_type,
+        body,
+    })
+}
+
+/// 啟動 snapshot 模式子行程並等待就緒；回傳 (Child, 是否就緒, 已收到的 stdout 行)
+fn spawn_snapshot_server(
+    root: &Path,
+    insights_dir: &Path,
+    snapshot_path: &Path,
+    port: u16,
+) -> (std::process::Child, bool, Vec<String>) {
+    let mut child = isolated_command(root, insights_dir)
+        .env("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH", snapshot_path)
+        .env("HOST", "127.0.0.1")
+        .env("PORT", port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut lines = Vec::new();
+    let started = loop {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(line) => {
+                let ready = line.contains("is running on");
+                lines.push(line);
+                if ready {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    (child, started, lines)
 }
 
 #[test]
@@ -184,38 +243,8 @@ fn session_details_404_uses_pending_sync_message_not_reupload_instruction() {
         listener.local_addr().unwrap().port()
     };
 
-    let mut child = isolated_command(&root, &insights_dir)
-        .env("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH", &snapshot_path)
-        .env("HOST", "127.0.0.1")
-        .env("PORT", port.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let stdout = child.stdout.take().unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut lines = Vec::new();
-    let started = loop {
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(line) => {
-                let ready = line.contains("is running on");
-                lines.push(line);
-                if ready {
-                    break true;
-                }
-            }
-            Err(_) => break false,
-        }
-    };
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
 
     let response = if started {
         http_get(port, "/api/claude/session/missing-session")
@@ -228,13 +257,92 @@ fn session_details_404_uses_pending_sync_message_not_reupload_instruction() {
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(started, "snapshot 模式未啟動: {lines:?}");
-    let (status, body) = response.expect("HTTP 請求失敗");
-    assert_eq!(status, 404, "body={body}");
-    let payload: serde_json::Value = serde_json::from_str(&body).expect(&body);
+    let response = response.expect("HTTP 請求失敗");
+    assert_eq!(response.status, 404, "body={}", response.body);
+    let payload: serde_json::Value = serde_json::from_str(&response.body).expect(&response.body);
     assert_eq!(
         payload["error"],
         "此 Session 的事件檔尚未同步到 Google Drive，下次排程（約 30 分鐘內）會補上；若本機紀錄已刪除則無法補回。"
     );
+}
+
+#[test]
+fn usage_monthly_yearly_endpoints_return_snapshot_fixture_json_unchanged() {
+    let root = unique_temp_dir("raw-json-passthrough");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+
+    let daily_fixture = serde_json::json!({
+        "date": "2026-07-09",
+        "summary": { "total_tokens": 110 }
+    });
+    let monthly_fixture = serde_json::json!({ "month": "2026-07", "total_tokens": 220 });
+    let yearly_fixture = serde_json::json!({ "year": "2026", "total_tokens": 330 });
+
+    let snapshot = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-09-28T00:00:00Z",
+        "source": "test",
+        "assistants": {
+            "claude": {
+                "dates": ["2026-07-09"],
+                "months": ["2026-07"],
+                "years": ["2026"],
+                "daily": { "2026-07-09": daily_fixture },
+                "monthly": { "2026-07": monthly_fixture },
+                "yearly": { "2026": yearly_fixture }
+            }
+        }
+    });
+    std::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let responses = if started {
+        Ok((
+            http_get(port, "/api/claude/usage/2026-07-09"),
+            http_get(port, "/api/claude/monthly/2026-07"),
+            http_get(port, "/api/claude/yearly/2026"),
+        ))
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let (daily_response, monthly_response, yearly_response) = responses.unwrap();
+
+    for (label, response, fixture) in [
+        ("daily", daily_response, &daily_fixture),
+        ("monthly", monthly_response, &monthly_fixture),
+        ("yearly", yearly_response, &yearly_fixture),
+    ] {
+        let response = response.unwrap_or_else(|e| panic!("{label} 請求失敗: {e}"));
+        assert_eq!(response.status, 200, "{label} body={}", response.body);
+        let content_type = response
+            .content_type
+            .unwrap_or_else(|| panic!("{label} 缺少 Content-Type"));
+        assert!(
+            content_type.starts_with("application/json"),
+            "{label} content-type={content_type}"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&response.body)
+            .unwrap_or_else(|e| panic!("{label} 解析失敗: {e}"));
+        assert_eq!(
+            &parsed, fixture,
+            "{label} 回應內容應與 snapshot fixture 原始 JSON 相等"
+        );
+    }
 }
 
 #[test]

@@ -390,4 +390,60 @@ Describe "upload-drive-snapshot.ps1：Export-SnapshotFromApi 對日期清單本�
             @($snapshot.assistants.claude.dates).Count | Should -Be 2
         }
     }
+
+    Context "重複日期底下真的有 session，鎖住事件收集既不重複也不漏收（codex 總審第三輪發現：上面那條測試兩個重複日期都回傳空 session 陣列，完全測不出事件收集這段有沒有真的去重）" {
+        BeforeEach {
+            $script:Ac4bCapturedCalls = [System.Collections.Generic.List[object]]::new()
+            # 刻意讓 mock 回傳 $null（呼應同一 Describe 底下 AC4 那個 mock 的既有寫法，
+            # 也對應正式程式碼 Upload-SessionEvent 在真實情況下會回傳 $null 的路徑，
+            # 例如上傳過程丟出例外、被 Collect-SessionEventsFromApi 捕捉時）。
+            # Collect-SessionEventsFromApi 只有在 Upload-SessionEvent 回傳非 $null 時
+            # 才會把 sessionId 記進內部的去重字典，所以回傳 $null 會讓函式內部按
+            # sessionId 去重的機制形同沒有作用——這樣測試才能不靠內部去重、單純鎖住
+            # 「事件收集拿到的日期清單本身是否已去重」這一件事，對應任務描述的迴歸情境
+            # （事件收集改用未去重的原始 $dates）。
+            Mock -CommandName Upload-SessionEvent -MockWith {
+                param($Assistant, $SessionId, $SessionDate, $SourceKind, $SourceDirKey)
+                $script:Ac4bCapturedCalls.Add([pscustomobject]@{
+                    SessionDate = $SessionDate
+                    SessionId   = $SessionId
+                })
+                return $null
+            }
+
+            Mock -CommandName Invoke-TokenUsageApi -MockWith {
+                param($Path)
+                if ($Path -eq "/api/claude/dates") { return [pscustomobject]@{ dates = @("2026-09-10", "2026-09-11", "2026-09-10") } }
+                if ($Path -match "^/api/[^/]+/dates$") { return [pscustomobject]@{ dates = @() } }
+                if ($Path -match "/months$") { return [pscustomobject]@{ months = @() } }
+                if ($Path -match "/years$") { return [pscustomobject]@{ years = @() } }
+                return $null
+            }
+
+            Mock -CommandName Invoke-TokenUsageApiRaw -MockWith {
+                param($Path)
+                # 重複出現兩次的 2026-09-10 底下放一筆「真實」session，這樣事件收集
+                # 才有東西可以重複處理；2026-09-11 也放一筆不同的 session，用來鎖住
+                # 「事件收集不能漏收非重複日期」這件事（reviewer Finding 1：只斷言
+                # 2026-09-10 不重複，測不出事件收集只處理了第一天就漏收其他日期）。
+                if ($Path -eq "/api/claude/usage/2026-09-10") { return '{"sessions":[{"session_id":"sess-dup-check","source_kind":"claude-code"}]}' }
+                if ($Path -eq "/api/claude/usage/2026-09-11") { return '{"sessions":[{"session_id":"sess-other","source_kind":"claude-code"}]}' }
+                return $null
+            }
+        }
+
+        It "sess-dup-check 只被呼叫一次，且事件收集有處理到全部日期（總呼叫次數是 2，不是 3 也不是 1）" {
+            $outputPath = Join-Path $TestDrive "ac4b-export.json"
+            Export-SnapshotFromApi -OutputPath $outputPath
+
+            $dupCalls = @($script:Ac4bCapturedCalls | Where-Object { $_.SessionDate -eq "2026-09-10" -and $_.SessionId -eq "sess-dup-check" })
+            $dupCalls.Count | Should -Be 1
+
+            # 只斷言上面那條重複日期不重複，測不出事件收集漏收了 2026-09-11
+            # （例如以後有人不小心把 Collect-SessionEventsFromApi 改成只處理去重後
+            # 清單的第一筆）。這裡額外鎖住「總共應該有 2 筆事件呼叫（sess-dup-check
+            # 一次、sess-other 一次）」，兩個方向的迴歸都能抓到。
+            $script:Ac4bCapturedCalls.Count | Should -Be 2
+        }
+    }
 }

@@ -149,6 +149,20 @@ Describe "upload-drive-snapshot.ps1：驗收條件 1（session 事件檔帶 sour
             # 沒編碼過的原始反斜線／空白不應該直接出現在查詢字串裡。
             $script:CapturedPaths[0] | Should -Not -Match ([regex]::Escape('a b\.copilot'))
         }
+
+        It "SessionId 本身帶特殊字元時，URL 路徑段落也要做 URL 編碼（不只是查詢參數）" {
+            # 目前實際資料裡的 session id 只含英數字/底線/連字號不會出事，但這裡刻意用
+            # 含 / # 空白 & 的字串，模擬路徑被誤解析的防禦性缺口（審查員發現 1）。
+            $specialSessionId = 'sess/with #chars &weird id'
+            Upload-SessionEvent -Assistant "claude" -SessionId $specialSessionId -SessionDate "2026-09-10" | Out-Null
+
+            $expectedSessionId = [uri]::EscapeDataString($specialSessionId)
+
+            $script:CapturedPaths.Count | Should -Be 1
+            $script:CapturedPaths[0] | Should -Match ([regex]::Escape("/api/claude/session/$expectedSessionId"))
+            # 未編碼的原始特殊字元不應該直接出現在路徑裡，否則路徑會被切壞。
+            $script:CapturedPaths[0] | Should -Not -Match ([regex]::Escape($specialSessionId))
+        }
     }
 }
 
@@ -250,6 +264,45 @@ Describe "upload-drive-snapshot.ps1：驗收條件 2（同一天的 usage 只查
             $dailySessionIds.Count | Should -Be $script:CopilotFixtureObj.sessions.Count
             $dailySessionIds | Should -Be $eventSessionIds
             $dailySessionIds | Should -Not -Contain "midrun-new-session-0001"
+        }
+    }
+}
+
+Describe "upload-drive-snapshot.ps1：Get-DailyRawCache 對重複日期不重複查詢" {
+    BeforeAll {
+        $script:Ac3SnapshotPath = Join-Path $TestDrive "ac3-snapshot.json"
+        $script:Ac3FileIdPath = Join-Path $TestDrive "ac3-file-id.txt"
+        $script:Ac3IndexPath = Join-Path $TestDrive "ac3-index.json"
+
+        Mock -CommandName Invoke-RestMethod -MockWith { throw "AC3-TEST: Invoke-RestMethod 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName Invoke-WebRequest -MockWith { throw "AC3-TEST: Invoke-WebRequest 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName gcloud -MockWith { throw "AC3-TEST: gcloud 不應該被呼叫" }
+        Mock -CommandName pwsh -MockWith { throw "AC3-TEST: pwsh 不應該被呼叫" }
+
+        . $script:ScriptPath -SnapshotPath $script:Ac3SnapshotPath -FileIdPath $script:Ac3FileIdPath -SessionEventIndexPath $script:Ac3IndexPath
+    }
+
+    Context "傳入的日期清單本身含重複值（例如 /api/{assistant}/dates 回傳裡混進重複日期）" {
+        BeforeEach {
+            $script:CapturedDateCalls = [System.Collections.Generic.List[string]]::new()
+            Mock -CommandName Invoke-TokenUsageApiRaw -MockWith {
+                param($Path)
+                $script:CapturedDateCalls.Add($Path)
+                return '{"sessions":[]}'
+            }
+        }
+
+        It "同一個日期只被實際查詢一次，輸出快取裡每個日期也只有一筆（審查員發現 2）" {
+            $dates = @("2026-09-10", "2026-09-11", "2026-09-10")
+            $cache = Get-DailyRawCache -Assistant "claude" -Dates $dates
+
+            $hitsFor0910 = @($script:CapturedDateCalls | Where-Object { $_ -eq "/api/claude/usage/2026-09-10" })
+            $hitsFor0910.Count | Should -Be 1
+            $script:CapturedDateCalls.Count | Should -Be 2
+
+            $cache.Keys.Count | Should -Be 2
+            $cache["2026-09-10"] | Should -Not -BeNullOrEmpty
+            $cache["2026-09-11"] | Should -Not -BeNullOrEmpty
         }
     }
 }

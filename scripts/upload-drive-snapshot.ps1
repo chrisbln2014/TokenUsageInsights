@@ -503,7 +503,11 @@ function Upload-SessionEvent {
         $queryString = "?" + ($queryParams -join "&")
     }
 
-    $raw = Invoke-TokenUsageApiRaw "/api/$Assistant/session/$SessionId$queryString"
+    # $Assistant 來自固定白名單、$SessionId 目前實際資料只含英數字/底線/連字號，兩者都
+    # 恰巧不會出事，但這裡仍做防禦性 URL 編碼，避免未來出現 / ? # 空白等字元把路徑切壞。
+    $escapedAssistant = [uri]::EscapeDataString($Assistant)
+    $escapedSessionId = [uri]::EscapeDataString($SessionId)
+    $raw = Invoke-TokenUsageApiRaw "/api/$escapedAssistant/session/$escapedSessionId$queryString"
     if ([string]::IsNullOrWhiteSpace($raw)) {
         return Convert-SessionEventRefFromIndex -Existing $existing -FallbackFileName $fileName
     }
@@ -695,7 +699,13 @@ function Get-DailyRawCache {
     # （寫 daily）共用同一份內容，避免同一天查兩次造成的時間差（計畫書斷言 7）。
     $cache = @{}
     foreach ($date in $Dates) {
-        $cache[[string]$date] = Invoke-TokenUsageApiRaw "/api/$Assistant/usage/$date"
+        $dateKey = [string]$date
+        if ($cache.ContainsKey($dateKey)) {
+            # 傳入的日期清單本身有重複值時（例如 /api/{assistant}/dates 回傳裡混進重複
+            # 日期），跳過已經查過的日期，避免重複打 API、也避免輸出快取出現重複 key。
+            continue
+        }
+        $cache[$dateKey] = Invoke-TokenUsageApiRaw "/api/$Assistant/usage/$dateKey"
     }
     return $cache
 }

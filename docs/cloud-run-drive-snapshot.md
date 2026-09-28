@@ -24,7 +24,7 @@ Snapshot 預先產生前端看板需要的每日、每月、每年 API response�
 
 Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.transcript_path` 也會被清空，避免把本機日誌路徑放到雲端。
 
-涵蓋的助理：antigravity、copilot、codex、claude、cursor、grok、pi、omp、muse（`src/snapshot.rs` 的 `ASSISTANTS`，由測試釘住必須與 `handlers::is_supported_assistant` 一致）。`--export-snapshot` 直接呼叫本機看板的 handler 產生 response，內容與本機 API 完全一致。
+涵蓋的助理：antigravity、copilot、codex、claude、cursor、grok、pi、omp、muse、mcode（`src/snapshot.rs` 的 `ASSISTANTS`，由測試釘住必須與 `handlers::is_supported_assistant`、`scripts/upload-drive-snapshot.ps1` 的 `$Assistants` 一致）。`--export-snapshot` 直接呼叫本機看板的 handler 產生 response，內容與本機 API 完全一致。
 
 `--export-snapshot <path>` 必須是第一個參數（不可與 `export`／`import`／`update` 等子命令混用）；`TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT` 環境變數只在不帶任何參數執行時生效。匯出會先增量同步本機日誌，但不做舊版資料庫遷移（由看板啟動時處理）。每日回應包含 `home_dir` 與各 session 的 `cwd`、`session_name`（前端用來分組與縮寫路徑），只有 `transcript_path` 會被清空。
 
@@ -53,6 +53,15 @@ pwsh -ExecutionPolicy Bypass -File .\scripts\export-snapshot.ps1 `
 ```
 
 建議用 Windows Task Scheduler 每 15 到 60 分鐘跑一次。頻率越高，Drive API 與 Cloud Run 讀取壓力越高；個人看板通常 30 分鐘已足夠。
+
+## 實際部署位置（本機這套環境）
+
+| 用途 | GCP project | 說明 |
+|---|---|---|
+| **Cloud Run 服務** | `demoproject-dotnet`（asia-east1，服務名 `token-usage-insights`） | 有綁帳單帳戶，用量超出免費額度會直接計費 |
+| Drive API 配額（本機上傳腳本的 ADC） | `tokenusage-chris-20260709` | 只當 `X-Goog-User-Project` 配額 project 使用；**沒有綁帳單，不能拿來跑 Cloud Run** |
+
+兩者用途不同，不要混淆：本機上傳腳本的 `-ProjectId` 是 Drive API 配額 project，不是 Cloud Run 所在的 project。
 
 ## 自動上傳到 Google Drive
 
@@ -124,37 +133,36 @@ TokenUsageInsights-NightlyRestart（每天 01:00，Highest 權限）
 
 ## Google Drive 權限
 
-1. 建立或選用 Cloud Run service account，例如：
+Cloud Run 讀 Drive 時用兩個 service account（`src/snapshot.rs` 的 `google_access_token`）：
 
-```bash
-gcloud iam service-accounts create token-insights-run \
-  --display-name="Token Usage Insights Cloud Run"
-```
+| Service account | 角色 |
+|---|---|
+| `token-insights-run@demoproject-dotnet.iam.gserviceaccount.com` | Cloud Run 的執行身分（`--service-account`） |
+| `token-insights-drive@demoproject-dotnet.iam.gserviceaccount.com` | 讀 Drive 用的身分（環境變數 `DRIVE_SERVICE_ACCOUNT_EMAIL`）；執行身分透過 IAM Credentials `generateAccessToken` 取得它的 `drive.readonly` token，因此執行身分必須有權替它產生 token |
 
-2. 把 `snapshot.json` 或所在 Drive 資料夾分享給 service account email，權限給 Viewer。
-3. 在 GCP project 啟用 Google Drive API。
-
-Service account email 會像：
-
-```text
-token-insights-run@PROJECT_ID.iam.gserviceaccount.com
-```
+1. 把 `snapshot.json` 與 session 事件檔分享給 `token-insights-drive@…`，權限給 Viewer（上傳腳本的 `-ShareWithServiceAccount` 預設就是這個帳號，會自動分享）。
+2. 在 Cloud Run 所在的 project 啟用 Google Drive API 與 IAM Service Account Credentials API。
 
 ## 部署到 Cloud Run
 
-以下以 `asia-east1` 為例，請依你的 GCP project 調整。
+### 首次部署
 
 ```bash
-gcloud services enable run.googleapis.com artifactregistry.googleapis.com drive.googleapis.com iap.googleapis.com
+gcloud services enable run.googleapis.com artifactregistry.googleapis.com drive.googleapis.com iap.googleapis.com \
+  --project demoproject-dotnet
 
 gcloud run deploy token-usage-insights \
-  --source . \
+  --source <乾淨原始碼資料夾，見下方「重新部署」> \
+  --project demoproject-dotnet \
   --region asia-east1 \
-  --service-account token-insights-run@PROJECT_ID.iam.gserviceaccount.com \
+  --service-account token-insights-run@demoproject-dotnet.iam.gserviceaccount.com \
   --no-allow-unauthenticated \
   --iap \
-  --set-env-vars TOKEN_USAGE_INSIGHTS_DATA_SOURCE=snapshot,DRIVE_SNAPSHOT_FILE_ID=DRIVE_FILE_ID,DRIVE_TOKEN_SCOPE=https://www.googleapis.com/auth/drive.readonly,TOKEN_USAGE_INSIGHTS_SNAPSHOT_REFRESH_SECONDS=300
+  --max-instances 1 \
+  --set-env-vars TOKEN_USAGE_INSIGHTS_DATA_SOURCE=snapshot,DRIVE_SNAPSHOT_FILE_ID=<Drive 檔案 ID>,DRIVE_TOKEN_SCOPE=https://www.googleapis.com/auth/drive.readonly,DRIVE_SERVICE_ACCOUNT_EMAIL=token-insights-drive@demoproject-dotnet.iam.gserviceaccount.com,TOKEN_USAGE_INSIGHTS_SNAPSHOT_REFRESH_SECONDS=300
 ```
+
+`<Drive 檔案 ID>` 是本機 `%LOCALAPPDATA%\TokenUsageInsights\drive-snapshot-file-id.txt` 的內容。
 
 部署完成後，只授權指定使用者讀取：
 
@@ -162,15 +170,43 @@ gcloud run deploy token-usage-insights \
 gcloud iap web add-iam-policy-binding \
   --member=user:chris@berlin.com.tw \
   --role=roles/iap.httpsResourceAccessor \
+  --project demoproject-dotnet \
   --region=asia-east1 \
   --resource-type=cloud-run \
   --service=token-usage-insights
 ```
 
+注意：`roles/iap.httpsResourceAccessor` 只給「透過 IAP 開網頁」的權限，不含 project 管理權限；有這個角色的帳號打得開看板，但不一定查得到 project 本身。
+
+### 重新部署（換版）
+
+repo 沒有 `.gcloudignore`，直接 `--source .` 會把工作區裡未追蹤的檔案一起上傳到 Cloud Build 的原始碼 bucket。改從指定 commit 匯出乾淨資料夾再部署：
+
+```bash
+git archive <commit> | tar -x -C <乾淨資料夾>
+
+gcloud run deploy token-usage-insights \
+  --source <乾淨資料夾> \
+  --project demoproject-dotnet \
+  --region asia-east1
+```
+
+對既有服務重新部署時只會換 image；環境變數、service account、`--max-instances`、IAP 設定都沿用上一個 revision。部署完用 `gcloud run services describe token-usage-insights --project demoproject-dotnet --region asia-east1` 確認新 revision 已承接 100% 流量。
+
+### 回滾
+
+```bash
+gcloud run revisions list --service token-usage-insights --project demoproject-dotnet --region asia-east1
+gcloud run services update-traffic token-usage-insights --to-revisions=<舊 revision>=100 \
+  --project demoproject-dotnet --region asia-east1
+```
+
+回滾需要該 revision 的 image 還在 Artifact Registry，清理舊 image 時至少保留上一版。
+
 ## 成本控制
 
-- Cloud Run 設定 `min-instances=0`，閒置時縮到 0。
-- Artifact Registry 只保留最近 1 到 2 個 image。
+- Cloud Run 設定 `min-instances=0`，閒置時縮到 0；`max-instances=1`。
+- Artifact Registry 只保留最近 1 到 2 個 image（線上版加上一版供回滾）。每次 `--source` 部署都會新增一份（約 37 MB），用 `gcloud artifacts docker images list asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights --include-tags` 對照 `gcloud run revisions list` 的 image digest，再以 digest 逐一刪除沒有流量的舊 image。
 - 不開 Artifact Registry vulnerability scanning，避免掃描費。
 - 設 Billing budget alert，例如 1 USD 與 5 USD。
 - 若只給自己看，`TOKEN_USAGE_INSIGHTS_SNAPSHOT_REFRESH_SECONDS=300` 或更高即可。

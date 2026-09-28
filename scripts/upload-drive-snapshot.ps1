@@ -257,7 +257,8 @@ function Get-UniqueOrdered {
         [object[]]$Values
     )
 
-    # 依原始出現順序去重（不能用 Select-Object -Unique，那會重新排序）。
+    # 依原始出現順序去重（不能用 Sort-Object -Unique 或任何會排序的寫法，
+    # 那會把結果改成字典序，不是原始出現順序）。
     # /api/{assistant}/dates 若回傳含重複值的日期清單，呼叫端要在傳給任何下游
     # 函式（Get-DailyRawCache、Collect-SessionEventsFromApi、寫 daily JSON）之前
     # 先用這裡去重過的清單取代，否則輸出的 JSON 會出現重複 key（codex 總審發現）。

@@ -321,10 +321,12 @@ Describe "upload-drive-snapshot.ps1：Get-UniqueOrdered 去重後維持原始出
         . $script:ScriptPath -SnapshotPath $script:Ac5SnapshotPath -FileIdPath $script:Ac5FileIdPath -SessionEventIndexPath $script:Ac5IndexPath
     }
 
-    It "輸入順序非字典序時，去重後仍照原始出現順序排列（不能用 Select-Object -Unique，那會重新排序）" {
+    It "輸入順序非字典序時，去重後仍照原始出現順序排列（不能用 Sort-Object -Unique，那會重新排序）" {
         # 刻意用「後面的日期比前面小」的輸入：如果去重邏輯內部誤用了
-        # Select-Object -Unique（會重新排序成字典序 09-10, 09-11），
+        # Sort-Object -Unique（會重新排序成字典序 09-10, 09-11），
         # 這條測試會抓到，因為預期結果是保留原始出現順序 09-11, 09-10。
+        # 注意：Select-Object -Unique 實測本來就保序（等價於這裡的實作），
+        # 不是這條測試要防的回歸對象；審查員（fable reviewer）實測驗證過。
         $result = Get-UniqueOrdered -Values @("2026-09-11", "2026-09-10", "2026-09-11")
         @($result) | Should -Be @("2026-09-11", "2026-09-10")
     }

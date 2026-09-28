@@ -1266,6 +1266,15 @@ mod tests {
 
     // R4：本機檔案模式（TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH）完全不查 Drive 版本，
     // 到期就直接重新載入檔案；即使同時設定 DRIVE_SNAPSHOT_FILE_ID 也一樣。
+    //
+    // 這裡只驗證純函式 should_use_drive_version_check 本身的真值表。它「是否真的被
+    // get_cached_snapshot() 用來分派 if/else」由 tests/snapshot_mode.rs 的子行程整合測試
+    // （drive_only_mode_queries_drive_version_and_logs_failure_on_unreachable_proxy /
+    // snapshot_path_mode_skips_drive_version_check_even_with_drive_id_set）負責：那兩條測試
+    // 真的啟動伺服器打 HTTP 請求、觀察 get_cached_snapshot() 內部的 stderr 輸出，因此才對
+    // 「get_cached_snapshot 裡的 if 被改成恆真/恆假」或「呼叫時把兩個參數對調」有偵測力；
+    // 這裡若自己重寫一次 if/else 去呼叫這個純函式，驗的只是測試自己的程式碼，對正式程式碼
+    // 的分派邏輯沒有偵測力（審查員 R4 意見）。
     #[tokio::test]
     async fn file_path_mode_never_queries_drive_version_even_when_drive_id_also_set() {
         // 與 get_cached_snapshot() 相同的路由邏輯：檔案路徑有設定時，優先走本機檔案模式
@@ -1276,40 +1285,6 @@ mod tests {
         assert!(should_use_drive_version_check(false, true));
         assert!(!should_use_drive_version_check(true, false));
         assert!(!should_use_drive_version_check(false, false));
-
-        let check_version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let cc = check_version_calls.clone();
-        let check_version = move || {
-            let cc = cc.clone();
-            async move {
-                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok::<Option<String>, String>(Some("v1".to_string()))
-            }
-        };
-        let no_version_check = || async { Ok::<Option<String>, String>(None) };
-        let download = || async { Ok(test_snapshot("file-content")) };
-
-        let use_drive_version_check = should_use_drive_version_check(true, true);
-        let mut guard: Option<CachedSnapshot> = None;
-        let ttl = Duration::ZERO;
-
-        for _ in 0..2 {
-            if use_drive_version_check {
-                refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
-                    .await
-                    .unwrap();
-            } else {
-                refresh_cached_snapshot(&mut guard, ttl, &no_version_check, &download)
-                    .await
-                    .unwrap();
-            }
-        }
-
-        assert_eq!(
-            check_version_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "檔案模式完全不應呼叫查版本函式"
-        );
     }
 
     // R7：Drive 回應沒有 version 也沒有 modifiedTime（查詢函式回傳 None）時，

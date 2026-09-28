@@ -410,6 +410,208 @@ fn usage_monthly_yearly_endpoints_return_404_for_missing_period() {
     }
 }
 
+/// 啟動 snapshot 模式子行程，可自訂額外環境變數（用於模擬「只設 Drive file id」與
+/// 「本機檔案路徑＋Drive file id 同時設定」兩種模式），並回傳一個持續接收 stderr 行的
+/// channel，供之後判斷 get_cached_snapshot() 是否真的查詢過 Drive 版本。
+fn spawn_snapshot_server_with_env(
+    root: &Path,
+    insights_dir: &Path,
+    port: u16,
+    extra_env: &[(&str, &str)],
+) -> (
+    std::process::Child,
+    bool,
+    Vec<String>,
+    mpsc::Receiver<String>,
+) {
+    let mut command = isolated_command(root, insights_dir);
+    command
+        .env("HOST", "127.0.0.1")
+        .env("PORT", port.to_string())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    let mut child = command.spawn().unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let stderr = child.stderr.take().unwrap();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if stderr_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut lines = Vec::new();
+    let started = loop {
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(line) => {
+                let ready = line.contains("is running on");
+                lines.push(line);
+                if ready {
+                    break true;
+                }
+            }
+            Err(_) => break false,
+        }
+    };
+    (child, started, lines, stderr_rx)
+}
+
+/// 在 `total` 時間預算內盡量收集已送達的 stderr 行；一旦等不到新的一行就提早結束，
+/// 不然沒有更多輸出時仍會把時間預算等到底。
+fn drain_stderr_for(rx: &mpsc::Receiver<String>, total: Duration) -> Vec<String> {
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+// R4（審查員回歸）：should_use_drive_version_check 的真值表測試本身沒有執行到
+// get_cached_snapshot() 裡真正的 if/else 分派邏輯——審查員實測過，把那段 if 改成恆真/恆假、
+// 或呼叫時把兩個環境變數判斷參數對調，純函式測試依然全綠。這裡改成真的啟動子行程、真的走
+// HTTP 請求，讓 get_cached_snapshot() 的分派邏輯被執行到，靠 stderr 有沒有出現「查詢 Drive
+// 版本失敗」的警告字串來判斷是否真的呼叫了 drive_file_version()。
+//
+// 情境 (a)：只設定 DRIVE_SNAPSHOT_FILE_ID（模擬 Cloud Run 的 Drive 模式），並用一個連不到
+// 的 HTTPS_PROXY 保證查版本一定失敗——只要 stderr 出現查詢失敗的警告，就證明真的有嘗試查
+// 版本，能抓到「if 被改成恆假」或「呼叫參數對調」。
+#[test]
+fn drive_only_mode_queries_drive_version_and_logs_failure_on_unreachable_proxy() {
+    let root = unique_temp_dir("drive-only-mode");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let (mut child, started, lines, stderr_rx) = spawn_snapshot_server_with_env(
+        &root,
+        &insights_dir,
+        port,
+        &[
+            ("DRIVE_SNAPSHOT_FILE_ID", "fake-file-id"),
+            ("GOOGLE_ACCESS_TOKEN", "fake-token"),
+            // 保證連不到，curl 大約 2 秒內就會因連線失敗而回錯（已在本機驗證過耗時）
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+        ],
+    );
+
+    let response = if started {
+        http_get(port, "/api/claude/yearly/2026")
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+    // 查版本失敗後程式碼會繼續嘗試完整下載（同樣連不到），這裡不斷言 HTTP 狀態碼——
+    // 重點只在於「是否真的嘗試查過版本」，等 curl 逾時/失敗後這個請求本身失敗與否都可接受。
+    let _ = response;
+
+    let stderr_lines = drain_stderr_for(&stderr_rx, Duration::from_secs(6));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    assert!(
+        stderr_lines
+            .iter()
+            .any(|line| line.contains("查詢 Drive 檔案版本失敗，直接嘗試下載")),
+        "只設定 DRIVE_SNAPSHOT_FILE_ID 時應嘗試查詢 Drive 版本，但 stderr 沒有出現查詢失敗的警告: {stderr_lines:?}"
+    );
+}
+
+// 情境 (b)：同時設定 TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH 與 DRIVE_SNAPSHOT_FILE_ID（模擬本機
+// 檔案模式、但環境裡殘留了 Drive 設定）。不設定 GOOGLE_ACCESS_TOKEN，因為根本不該去查 Drive。
+// 斷言請求正常 200，且 stderr 完全沒有查詢 Drive 版本的警告——能抓到「if 被改成恆真」。
+#[test]
+fn snapshot_path_mode_skips_drive_version_check_even_with_drive_id_set() {
+    let root = unique_temp_dir("path-plus-drive-mode");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+    let snapshot = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-09-28T00:00:00Z",
+        "source": "test",
+        "assistants": {
+            "claude": {
+                "dates": [],
+                "months": [],
+                "years": ["2026"],
+                "daily": {},
+                "monthly": {},
+                "yearly": { "2026": { "year": "2026", "total_tokens": 1 } }
+            }
+        }
+    });
+    std::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let (mut child, started, lines, stderr_rx) = spawn_snapshot_server_with_env(
+        &root,
+        &insights_dir,
+        port,
+        &[
+            (
+                "TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH",
+                snapshot_path.to_str().unwrap(),
+            ),
+            ("DRIVE_SNAPSHOT_FILE_ID", "fake-file-id"),
+        ],
+    );
+
+    let response = if started {
+        http_get(port, "/api/claude/yearly/2026")
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let stderr_lines = drain_stderr_for(&stderr_rx, Duration::from_secs(3));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let response = response.expect("HTTP 請求失敗");
+    assert_eq!(response.status, 200, "body={}", response.body);
+    assert!(
+        !stderr_lines
+            .iter()
+            .any(|line| line.contains("查詢 Drive 檔案版本失敗")),
+        "同時設定本機檔案路徑與 Drive file id 時不應查詢 Drive 版本，但 stderr 出現了: {stderr_lines:?}"
+    );
+}
+
 #[test]
 fn export_snapshot_flag_writes_snapshot_for_every_assistant() {
     let root = unique_temp_dir("export-snapshot");

@@ -387,10 +387,10 @@ async fn get_cached_snapshot() -> Result<Arc<DashboardSnapshot>, String> {
 
     let download = || load_snapshot_from_env();
 
-    // 與 load_snapshot_from_env 相同的優先順序：本機檔案模式優先於 Drive 模式，
-    // 兩者都設定時不啟用「查版本、沒變就不下載」，避免下載走檔案、查版本卻打 Drive 導致永遠沿用舊快取
-    let use_drive_version_check = !env_var_is_set("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH")
-        && env_var_is_set("DRIVE_SNAPSHOT_FILE_ID");
+    let use_drive_version_check = should_use_drive_version_check(
+        env_var_is_set("TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH"),
+        env_var_is_set("DRIVE_SNAPSHOT_FILE_ID"),
+    );
 
     if use_drive_version_check {
         let file_id = std::env::var("DRIVE_SNAPSHOT_FILE_ID").unwrap_or_default();
@@ -401,6 +401,16 @@ async fn get_cached_snapshot() -> Result<Arc<DashboardSnapshot>, String> {
         let no_version_check = || async { Ok::<Option<String>, String>(None) };
         refresh_cached_snapshot(&mut guard, ttl, &no_version_check, &download).await
     }
+}
+
+/// 是否該對 Drive 檔案做版本查詢：與 `load_snapshot_from_env` 相同的優先順序，本機檔案模式
+/// 優先於 Drive 模式，兩者都設定時不啟用「查版本、沒變就不下載」，避免下載走檔案、查版本卻打
+/// Drive 導致永遠沿用舊快取。抽成接受布林值的純函式（R4）以利測試，不直接讀真實環境變數。
+fn should_use_drive_version_check(
+    snapshot_path_env_is_set: bool,
+    drive_file_id_env_is_set: bool,
+) -> bool {
+    !snapshot_path_env_is_set && drive_file_id_env_is_set
 }
 
 /// 刷新快取的核心邏輯，抽成可注入版本查詢／下載函式的純函式以利測試（不依賴全域快取或真實網路）。
@@ -439,10 +449,9 @@ where
             }
         }
         Err(err) => {
-            if let Some(cached) = guard.as_ref() {
-                eprintln!("⚠️ 查詢 Drive 檔案版本失敗，沿用快取資料: {err}");
-                return Ok(cached.snapshot.clone());
-            }
+            // F1 修正：查版本失敗不能直接沿用快取——如果這個新請求在正式環境長期失敗
+            // （但下載本身正常），會讓 Cloud Run 永遠停在第一次載入的舊資料。改成繼續往下
+            // 嘗試完整下載；下載也失敗時，下面的 download() 失敗分支仍會沿用舊快取。
             eprintln!("⚠️ 查詢 Drive 檔案版本失敗，直接嘗試下載: {err}");
         }
     }
@@ -1103,15 +1112,17 @@ mod tests {
         );
     }
 
+    // F1：查版本失敗時不能直接沿用快取，要繼續嘗試下載；下載成功就要用新內容更新快取
+    // （否則查版本這個新請求若在正式環境長期失敗，Cloud Run 會永遠停在第一次載入的舊資料）。
     #[tokio::test]
-    async fn drive_refresh_falls_back_to_cache_when_version_check_fails() {
+    async fn drive_refresh_downloads_when_version_check_fails_instead_of_reusing_cache() {
         let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let dc = download_count.clone();
         let download = move || {
             let dc = dc.clone();
             async move {
-                dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(test_snapshot("content"))
+                let n = dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(test_snapshot(&format!("content-v{n}")))
             }
         };
         let should_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1130,19 +1141,211 @@ mod tests {
         let mut guard: Option<CachedSnapshot> = None;
         let ttl = Duration::ZERO;
 
+        let first = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first.source, "content-v1");
+
+        should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let second = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "查版本失敗時應該繼續嘗試下載，不能直接沿用快取"
+        );
+        assert_eq!(
+            second.source, "content-v2",
+            "下載成功時快取內容應該更新成新版本，不是繼續沿用舊快取"
+        );
+    }
+
+    // 既有、修改前就有的容錯行為：查版本失敗「且」下載也失敗時，才沿用舊快取。
+    #[tokio::test]
+    async fn drive_refresh_falls_back_to_cache_only_when_download_also_fails() {
+        let download_should_fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let download_should_fail_for_download = download_should_fail.clone();
+        let download = move || {
+            let should_fail = download_should_fail_for_download.clone();
+            async move {
+                if should_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    Err("模擬下載失敗".to_string())
+                } else {
+                    Ok(test_snapshot("content-v1"))
+                }
+            }
+        };
+        let check_version =
+            || async { Err::<Option<String>, String>("模擬查詢版本失敗".to_string()) };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO;
+
+        // 第一次載入時 guard 是空的，下載成功建立快取
+        let first = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(first.source, "content-v1");
+
+        // 第二次：查版本失敗、下載也失敗 → 沿用舊快取
+        download_should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let second = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            second.source, "content-v1",
+            "查版本與下載都失敗時，應沿用舊快取"
+        );
+    }
+
+    // R2：Drive 模式下版本比對「相同」而沿用快取時，要重設 loaded_at 讓 TTL 重新倒數，
+    // 否則下一次還在 TTL 內的請求也會誤判成到期而再去查一次版本。
+    #[tokio::test]
+    async fn drive_refresh_resets_loaded_at_when_version_unchanged() {
+        let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = download_count.clone();
+        let download = move || {
+            let dc = dc.clone();
+            async move {
+                dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(test_snapshot("v1"))
+            }
+        };
+        let check_version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = check_version_calls.clone();
+        let check_version = move || {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Option<String>, String>(Some("v1".to_string()))
+            }
+        };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::from_millis(80);
+
+        // 第一次載入（guard 是空的，一定會查版本＋下載）
         refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
             .await
             .unwrap();
         assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            check_version_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
 
-        should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
-        let result = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download).await;
-        assert!(result.is_ok(), "查版本失敗時應沿用舊快取並回傳成功");
+        // 等到 TTL 到期，版本查詢回「相同」，沿用快取——若 loaded_at 沒有被重設，
+        // 下一步驟就會立刻視為又到期。
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
         assert_eq!(
             download_count.load(std::sync::atomic::Ordering::SeqCst),
             1,
-            "查版本失敗不應觸發下載"
+            "版本沒變不應該重新下載"
         );
+        assert_eq!(
+            check_version_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        // 緊接著在 TTL 還沒到期的情況下再打一次：不應該再去查版本，
+        // 因為上一步驟應該已經把 loaded_at 重設過。
+        refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            check_version_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "loaded_at 沒有被重設的話，這裡就會誤判成到期又去查一次版本"
+        );
+    }
+
+    // R4：本機檔案模式（TOKEN_USAGE_INSIGHTS_SNAPSHOT_PATH）完全不查 Drive 版本，
+    // 到期就直接重新載入檔案；即使同時設定 DRIVE_SNAPSHOT_FILE_ID 也一樣。
+    #[tokio::test]
+    async fn file_path_mode_never_queries_drive_version_even_when_drive_id_also_set() {
+        // 與 get_cached_snapshot() 相同的路由邏輯：檔案路徑有設定時，優先走本機檔案模式
+        assert!(
+            !should_use_drive_version_check(true, true),
+            "同時設定檔案路徑與 Drive file id 時，應優先走本機檔案模式、不查版本"
+        );
+        assert!(should_use_drive_version_check(false, true));
+        assert!(!should_use_drive_version_check(true, false));
+        assert!(!should_use_drive_version_check(false, false));
+
+        let check_version_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = check_version_calls.clone();
+        let check_version = move || {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Option<String>, String>(Some("v1".to_string()))
+            }
+        };
+        let no_version_check = || async { Ok::<Option<String>, String>(None) };
+        let download = || async { Ok(test_snapshot("file-content")) };
+
+        let use_drive_version_check = should_use_drive_version_check(true, true);
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO;
+
+        for _ in 0..2 {
+            if use_drive_version_check {
+                refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+                    .await
+                    .unwrap();
+            } else {
+                refresh_cached_snapshot(&mut guard, ttl, &no_version_check, &download)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(
+            check_version_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "檔案模式完全不應呼叫查版本函式"
+        );
+    }
+
+    // R7：Drive 回應沒有 version 也沒有 modifiedTime（查詢函式回傳 None）時，
+    // 不能跟「快取也沒記過版本」湊成一對就當成「沒變」，要當成不同、重新下載。
+    #[tokio::test]
+    async fn drive_refresh_redownloads_when_both_versions_are_none() {
+        let download_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dc = download_count.clone();
+        let download = move || {
+            let dc = dc.clone();
+            async move {
+                let n = dc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                Ok(test_snapshot(&format!("content-v{n}")))
+            }
+        };
+        // 模擬 Drive 回應缺 version 與 modifiedTime 欄位：查詢函式回 Ok(None)
+        let check_version = || async { Ok::<Option<String>, String>(None) };
+
+        let mut guard: Option<CachedSnapshot> = None;
+        let ttl = Duration::ZERO;
+
+        let first = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(download_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(first.source, "content-v1");
+
+        let second = refresh_cached_snapshot(&mut guard, ttl, &check_version, &download)
+            .await
+            .unwrap();
+        assert_eq!(
+            download_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "兩邊版本都是 None 時不能當成沒變，必須重新下載"
+        );
+        assert_eq!(second.source, "content-v2");
     }
 
     fn test_snapshot(source: &str) -> DashboardSnapshot {

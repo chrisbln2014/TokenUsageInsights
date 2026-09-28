@@ -345,6 +345,71 @@ fn usage_monthly_yearly_endpoints_return_snapshot_fixture_json_unchanged() {
     }
 }
 
+// R8：查詢一個 snapshot 裡不存在的日期／月份／年份，必須回 404，不能變成 200
+// （static/app.js 依賴 404 判斷「當日無資料」）。
+#[test]
+fn usage_monthly_yearly_endpoints_return_404_for_missing_period() {
+    let root = unique_temp_dir("raw-json-missing-period");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+
+    let snapshot = serde_json::json!({
+        "schema_version": 1,
+        "generated_at": "2026-09-28T00:00:00Z",
+        "source": "test",
+        "assistants": {
+            "claude": {
+                "dates": ["2026-07-09"],
+                "months": ["2026-07"],
+                "years": ["2026"],
+                "daily": { "2026-07-09": { "date": "2026-07-09" } },
+                "monthly": { "2026-07": { "month": "2026-07" } },
+                "yearly": { "2026": { "year": "2026" } }
+            }
+        }
+    });
+    std::fs::write(&snapshot_path, serde_json::to_string(&snapshot).unwrap()).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let responses = if started {
+        Ok((
+            http_get(port, "/api/claude/usage/2099-01-01"),
+            http_get(port, "/api/claude/monthly/2099-01"),
+            http_get(port, "/api/claude/yearly/2099"),
+        ))
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let (daily_response, monthly_response, yearly_response) = responses.unwrap();
+
+    for (label, response) in [
+        ("daily", daily_response),
+        ("monthly", monthly_response),
+        ("yearly", yearly_response),
+    ] {
+        let response = response.unwrap_or_else(|e| panic!("{label} 請求失敗: {e}"));
+        assert_eq!(
+            response.status, 404,
+            "{label} 找不到資料時應回 404，body={}",
+            response.body
+        );
+    }
+}
+
 #[test]
 fn export_snapshot_flag_writes_snapshot_for_every_assistant() {
     let root = unique_temp_dir("export-snapshot");

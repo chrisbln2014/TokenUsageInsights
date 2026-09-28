@@ -447,3 +447,68 @@ Describe "upload-drive-snapshot.ps1：Export-SnapshotFromApi 對日期清單本�
         }
     }
 }
+
+Describe "upload-drive-snapshot.ps1：Collect-SessionEventsFromApi 對橫跨兩個不同日期、真正相同的 session_id 只上傳一次（node reviewer 建議補的測試：之前判斷這段去重邏輯正確但沒有直接測試覆蓋，把去重邏輯拿掉或改成用日期+session_id 當鍵，既有測試全綠也測不出來）" {
+    BeforeAll {
+        $script:Ac6SnapshotPath = Join-Path $TestDrive "ac6-snapshot.json"
+        $script:Ac6FileIdPath = Join-Path $TestDrive "ac6-file-id.txt"
+        $script:Ac6IndexPath = Join-Path $TestDrive "ac6-index.json"
+
+        Mock -CommandName Invoke-RestMethod -MockWith { throw "AC6-TEST: Invoke-RestMethod 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName Invoke-WebRequest -MockWith { throw "AC6-TEST: Invoke-WebRequest 不應該被呼叫（沒被個別測試接管）" }
+        Mock -CommandName gcloud -MockWith { throw "AC6-TEST: gcloud 不應該被呼叫" }
+        Mock -CommandName pwsh -MockWith { throw "AC6-TEST: pwsh 不應該被呼叫" }
+
+        . $script:ScriptPath -SnapshotPath $script:Ac6SnapshotPath -FileIdPath $script:Ac6FileIdPath -SessionEventIndexPath $script:Ac6IndexPath
+    }
+
+    Context "同一個 session_id（sess-spans-midnight）真的出現在兩筆不同日期各自的 usage 回應裡（模擬一個對話橫跨本地午夜、被系統歸到兩天資料的情境，兩筆資料用不同 turn_no 區分但 session_id 完全相同）" {
+        BeforeEach {
+            $script:Ac6CapturedCalls = [System.Collections.Generic.List[object]]::new()
+            Mock -CommandName Upload-SessionEvent -MockWith {
+                param($Assistant, $SessionId, $SessionDate, $SourceKind, $SourceDirKey)
+                $script:Ac6CapturedCalls.Add([pscustomobject]@{
+                    SessionId   = $SessionId
+                    SessionDate = $SessionDate
+                })
+                return [ordered]@{
+                    drive_file_id = "fake-$SessionId"
+                    file_name     = "fake-$SessionId.json"
+                    content_type  = "application/json"
+                    uploaded_at   = "2026-09-10T00:00:00Z"
+                }
+            }
+
+            # 直接組 DailyRawCache 餵給 Collect-SessionEventsFromApi，不透過
+            # Export-SnapshotFromApi／Invoke-TokenUsageApiRaw，讓測試更聚焦、更快，
+            # 也更直接對應這個函式本身的去重邏輯（$sessionEvents.Contains($sessionId)）。
+            $script:Ac6DailyRawCache = @{
+                "2026-09-10" = '{"sessions":[{"session_id":"sess-spans-midnight","source_kind":"claude-code","turn_no":1}]}'
+                "2026-09-11" = '{"sessions":[{"session_id":"sess-spans-midnight","source_kind":"claude-code","turn_no":2}]}'
+            }
+        }
+
+        It "sess-spans-midnight 只被 Upload-SessionEvent 呼叫一次，不會因為出現在兩個日期底下就被呼叫兩次" {
+            Collect-SessionEventsFromApi -Assistant "claude" -Dates @("2026-09-10", "2026-09-11") -DailyRawCache $script:Ac6DailyRawCache | Out-Null
+
+            $calls = @($script:Ac6CapturedCalls | Where-Object { $_.SessionId -eq "sess-spans-midnight" })
+            $calls.Count | Should -Be 1
+        }
+
+        It "回傳的 sessionEvents 結果裡 sess-spans-midnight 這個 key 只有一筆，且內容來自實際被呼叫到的那一次（不是空字典恰好只有一個 key 的假綠）" {
+            $result = Collect-SessionEventsFromApi -Assistant "claude" -Dates @("2026-09-10", "2026-09-11") -DailyRawCache $script:Ac6DailyRawCache
+
+            $matchingKeys = @($result.Keys | Where-Object { $_ -eq "sess-spans-midnight" })
+            $matchingKeys.Count | Should -Be 1
+
+            # [ordered]@{} 本身就不可能有重複 key，所以上面那條斷言在「完全沒去重、
+            # 兩次都被記進同一個 key」跟「有去重、只記一次」兩種情況下都會是 1，
+            # 偵測力很弱。這裡額外核對：(a) 實際只被呼叫了哪一個日期（用來對照
+            # Upload-SessionEvent 真的只被呼叫一次時，是哪一次的呼叫被記錄下來），
+            # (b) 回傳字典裡這筆的內容確實是 mock 回傳的那個 fake 物件，不是空殼。
+            $script:Ac6CapturedCalls.Count | Should -Be 1
+            $script:Ac6CapturedCalls[0].SessionDate | Should -Be "2026-09-10"
+            $result["sess-spans-midnight"].drive_file_id | Should -Be "fake-sess-spans-midnight"
+        }
+    }
+}

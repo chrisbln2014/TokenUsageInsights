@@ -22,9 +22,7 @@ use crate::handlers::{
     MonthListResponse, MonthlyDailyBreakdown, MonthlyDetailsResponse, UsageDetailsResponse,
     YearListResponse, YearlyDetailsResponse, YearlyMonthlyBreakdown, ALL_ASSISTANTS_SCOPE,
 };
-use crate::reporting::{
-    AgentBreakdown, AgentPeriodUsage, DaySummary, MonthlyModelSummary, MonthlyProjectSummary,
-};
+use crate::reporting::{AgentBreakdown, DaySummary, MonthlyModelSummary, MonthlyProjectSummary};
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const DEFAULT_REFRESH_SECONDS: u64 = 300;
@@ -885,14 +883,14 @@ fn merge_monthly_details(
             entry.total_reasoning_tokens += day.total_reasoning_tokens;
             entry.sessions_count += day.sessions_count;
             entry.cost_usd += day.cost_usd;
-            entry.agents.insert(
-                assistant.clone(),
-                AgentPeriodUsage {
-                    total_tokens: day.total_tokens,
-                    cost_usd: day.cost_usd,
-                    sessions_count: day.sessions_count,
-                },
-            );
+            // 用累加而非覆寫：同一 assistant 若對同一天貢獻多筆（理論上不會發生，
+            // 因為來源的 daily_breakdown 是以日期為鍵的 map 收斂而來，但這裡不假設
+            // 呼叫端一定維持這個不變量），避免總量已經累加、但 agents 分佈卻只留
+            // 下最後一筆而跟總量對不上。
+            let agent_usage = entry.agents.entry(assistant.clone()).or_default();
+            agent_usage.total_tokens += day.total_tokens;
+            agent_usage.cost_usd += day.cost_usd;
+            agent_usage.sessions_count += day.sessions_count;
         }
 
         merge_projects(&mut projects, item.projects);
@@ -950,14 +948,11 @@ fn merge_yearly_details(
             entry.total_reasoning_tokens += month.total_reasoning_tokens;
             entry.sessions_count += month.sessions_count;
             entry.cost_usd += month.cost_usd;
-            entry.agents.insert(
-                assistant.clone(),
-                AgentPeriodUsage {
-                    total_tokens: month.total_tokens,
-                    cost_usd: month.cost_usd,
-                    sessions_count: month.sessions_count,
-                },
-            );
+            // 理由同 merge_monthly_details：累加而非覆寫，見上方註解。
+            let agent_usage = entry.agents.entry(assistant.clone()).or_default();
+            agent_usage.total_tokens += month.total_tokens;
+            agent_usage.cost_usd += month.cost_usd;
+            agent_usage.sessions_count += month.sessions_count;
         }
 
         merge_projects(&mut projects, item.projects);

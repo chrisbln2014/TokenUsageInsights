@@ -70,6 +70,7 @@ Windows 預設使用下列原生路徑：
 ### 資料分析
 
 - 每日、月度、年度 Token 統計
+- 「全部 Agent」合併檢視：彙總整台電腦所有 Coding Agent 的 Token 用量與估算費用，並列出各 Agent 佔比與依 Agent 堆疊的每日／每月趨勢
 - 輸入、輸出、快取讀取、快取寫入、推理 Token 分拆
 - 依 `pricing.csv` 進行本地估算費用
 - Session 數、請求次數與 API 耗時統計
@@ -468,7 +469,7 @@ token-usage-insights
 
 | 變數 | 適用平台 | 說明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v1.0.6`。預設 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安裝的 Release tag，例如 `v1.1.1`。預設 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安裝目錄，會轉交給 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 執行檔連結目錄，會轉交給 `install.sh` |
 

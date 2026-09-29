@@ -92,6 +92,7 @@ Windows 默认使用以下原生路径：
 ### 数据分析
 
 - 每日、月度、年度 Token 统计
+- “全部 Agent”合并视图：汇总整台电脑所有 Coding Agent 的 Token 用量与估算费用，并列出各 Agent 占比与按 Agent 堆叠的每日／每月趋势
 - 输入、输出、缓存读取、缓存写入、推理 Token 拆分
 - 根据 `pricing.csv` 进行本地费用估算
 - Session 数量、请求次数与 API 耗时统计
@@ -128,7 +129,7 @@ Windows 默认使用以下原生路径：
 
 | 参数 | 适用视图 | 可用值 | 说明 |
 | --- | --- | --- | --- |
-| `agent` | 全部 | `antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 指定要显示的 Coding Agent。另支持 `claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` 等别名写法 |
+| `agent` | 全部 | `all`、`antigravity`、`copilot`、`codex`、`claude`、`cursor`、`grok`、`pi`、`omp`、`muse` | 指定要显示的 Coding Agent；`all` 会合并本机所有 Agent 的数据（不提供导入／导出）。另支持 `claude-code`、`grok-build`、`pi-coding-agent`、`oh-my-pi`、`muse-code` 等别名写法 |
 | `tab` | 全部 | `daily`、`monthly`、`yearly` | 指定以日（每日）、月（月度）或年（年度）视图显示 |
 | `date` | 全部 | `daily`：`YYYY-MM-DD`；`monthly`：`YYYY-MM`；`yearly`：`YYYY` | 指定要显示的日期、月份或年份，格式会依 `tab` 自动对应 |
 | `dir` | `daily` | 完整路径、`~` 开头的家目录路径，或唯一的路径后缀（如 `TokenUsageInsights`） | 指定每日视图的工作目录筛选。Windows 路径不区分大小写；找不到匹配目录时会显示全部 |
@@ -139,6 +140,7 @@ Windows 默认使用以下原生路径：
 ```text
 http://localhost:3003/?agent=copilot&tab=monthly&date=2026-08
 http://localhost:3003/?agent=codex&tab=yearly&date=2026
+http://localhost:3003/?agent=all&tab=monthly&date=2026-09
 http://localhost:3003/?agent=claude&tab=daily&date=2026-08-09&chart=trend
 http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/TokenUsageInsights
 ```
@@ -780,14 +782,14 @@ token-usage-insights update --check
 # 原地自我更新至最新版本（亦支持 --force 强制覆盖、--target-version 指定版本）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.0.6
+token-usage-insights update --target-version v1.1.1
 ```
 
 环境变量可控制版本与安装路径（均为可选）：
 
 | 变量 | 适用平台 | 说明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.0.6`。默认 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.1.1`。默认 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安装目录，会传递给 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 可执行文件链接目录，会传递给 `install.sh` |
 

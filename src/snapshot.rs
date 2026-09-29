@@ -1372,7 +1372,9 @@ mod tests {
     fn snapshot_assistants_match_handlers_supported_assistants() {
         let source = include_str!("handlers/mod.rs");
         let fn_body = source
-            .split("pub fn is_supported_assistant")
+            // 用 "(" 界定函式名稱邊界，避免比對到同檔案中先定義的
+            // is_supported_assistant_scope（其名稱以 is_supported_assistant 為前綴）。
+            .split("pub fn is_supported_assistant(")
             .nth(1)
             .and_then(|rest| rest.split("\n}").next())
             .expect("handlers/mod.rs 應定義 is_supported_assistant");

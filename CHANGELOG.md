@@ -13,6 +13,8 @@
 
 - 整合 upstream v1.0.6（新增 mcode／MiniMax Code 助理支援與 `/api/version` 端點等上游變更）
   至本 fork 的合併分支。
+- 整合 upstream v1.1.1（新增「全部 Agent」合併檢視，並修正 `copilot-search-b` 缺少價格規則時的
+  錯誤提示）至本 fork 的合併分支；細節詳見下方新併入的 `[1.1.1]`／`[1.1.0]` 版本區塊。
 
 ### 修正
 
@@ -35,6 +37,34 @@
 
 - 前端（`static/app.js`、`static/chart-utils.js`）目前仍以 UTC 切分「日」的邊界，與本次後端寫入
   點改為本地時區的修復不完全一致；此問題刻意排除在本次範圍外，留待後續任務處理。
+
+## [1.1.1] - 2026-09-28
+
+### 修正
+
+- 自動忽略 `copilot-search-b` 缺少模型價格規則的錯誤提示，保留 Token 用量統計與既有成本計算；其他缺少價格規則的模型仍會提示。
+
+### 相容性
+
+- 既有資料、API、CLI 參數與安裝流程均可沿用；未變更資料庫結構或環境變數。
+
+## [1.1.0] - 2026-09-28
+
+### 新增與改善
+
+- 新增「全部 Agent」合併檢視：側欄 Agent 選擇器最上方的「全部 Agent」按鈕（或網址參數 `agent=all`）會合併本機所有 Coding Agent 的資料，每日、月度、年度視圖的指標卡片、趨勢圖、Session 清單、專案與模型排行都改以整台電腦的合計呈現，合併後的 Token 與估算費用等於各 Agent 分別統計的加總。
+- 合併檢視新增「Agent 用量分佈」區塊：以費用佔比條與表格列出各 Agent 的 Session 數、輸入、輸出、快取讀取、總 Token、Token 佔比、估算費用與費用佔比，並附合計列；點選任一 Agent 會切換到該 Agent 的同一期間報表。
+- 月度與年度的合併檢視新增依 Agent 堆疊的每日／每月長條圖，可在「費用」與「Token」指標間切換（選擇會記住），點選長條可下鑽到該日或該月。
+- 合併檢視的「前置作業啟用教學」改為「本機 Agent 資料來源」清單，顯示每個 Agent 的偵測路徑與狀態，並可進入個別 Agent 的設定教學後返回清單；模型 Session 明細會標示每個 Session 的來源 Agent。
+
+### 修正
+
+- 修正月度「單月每日 Token 消耗與會話數趨勢」圖的「每日會話數」曲線永遠空白的問題：前端讀取不存在的 `total_sessions` 欄位，現改為 API 實際提供的 `sessions_count`，與年度趨勢圖一致。
+
+### 相容性
+
+- 報表 API 的 `:assistant` 路徑參數新增接受 `all`（每日、月度、年度、可用日期／月份／年份、模型 Session、Session 提示詞搜尋、費用標準、手動同步與 setup-info）；匯出、匯入、匯入紀錄與撤銷、Session 詳情與 Codex rate limit 仍只接受單一 Agent，傳入 `all` 會回傳 400。
+- 月度 `daily_breakdown` 與年度 `monthly_breakdown` 的每個項目新增 `agents` 欄位，依 Agent 提供該區段的 `total_tokens`、`cost_usd` 與 `sessions_count`；既有欄位不變。未變更資料庫結構、環境變數或安裝流程。
 
 ## [1.0.6] - 2026-09-23
 
@@ -807,7 +837,10 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.6...v1.1.0
+[1.0.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.4...v1.0.5
 [1.0.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.3...v1.0.4
 [1.0.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.1...v1.0.3

@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -18,7 +18,12 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::handlers::{
-    self, normalize_assistant_name, DateListResponse, MonthListResponse, YearListResponse,
+    self, is_supported_assistant_scope, normalize_assistant_name, DateListResponse,
+    MonthListResponse, MonthlyDailyBreakdown, MonthlyDetailsResponse, UsageDetailsResponse,
+    YearListResponse, YearlyDetailsResponse, YearlyMonthlyBreakdown, ALL_ASSISTANTS_SCOPE,
+};
+use crate::reporting::{
+    AgentBreakdown, AgentPeriodUsage, DaySummary, MonthlyModelSummary, MonthlyProjectSummary,
 };
 
 const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
@@ -689,17 +694,306 @@ fn raw_json_response(value: &RawValue) -> axum::response::Response {
         .into_response()
 }
 
+/// 把多個 assistant 各自的字串清單取聯集、去重，並依既有慣例排序成遞減（新到舊）。
+/// 日期／月份／年份字串本身可字典序比較出時間順序，用 `BTreeSet` 去重＋反轉即為遞減。
+fn union_desc(lists: impl IntoIterator<Item = Vec<String>>) -> Vec<String> {
+    let set: BTreeSet<String> = lists.into_iter().flatten().collect();
+    set.into_iter().rev().collect()
+}
+
+/// 依「全部 Agent」合併範圍抓取所有存在快取的 assistant 原始 JSON，逐一解析成強型別
+/// `T`；任何一個解析失敗就整體回錯（不要吞掉單一 assistant 的壞資料）。
+fn collect_all_scope<T, F>(
+    snapshot: &DashboardSnapshot,
+    key: &str,
+    lookup: F,
+) -> Result<Vec<(String, T)>, String>
+where
+    T: serde::de::DeserializeOwned,
+    F: for<'a> Fn(&'a DashboardSnapshot, &'a str, &'a str) -> Option<&'a RawValue>,
+{
+    let mut items = Vec::new();
+    for candidate in ASSISTANTS {
+        if let Some(raw) = lookup(snapshot, candidate, key) {
+            let parsed = serde_json::from_str::<T>(raw.get())
+                .map_err(|e| format!("解析 {candidate}/{key} 的快取資料失敗: {e}"))?;
+            items.push((candidate.to_string(), parsed));
+        }
+    }
+    Ok(items)
+}
+
+/// 合併 `DaySummary` 的所有數值欄位（逐 assistant 累加）。
+fn merge_day_summary(summary: &mut DaySummary, part: &DaySummary) {
+    summary.total_sessions += part.total_sessions;
+    summary.total_tokens += part.total_tokens;
+    summary.total_input_tokens += part.total_input_tokens;
+    summary.total_output_tokens += part.total_output_tokens;
+    summary.total_cache_read_tokens += part.total_cache_read_tokens;
+    summary.total_cache_write_tokens += part.total_cache_write_tokens;
+    summary.total_reasoning_tokens += part.total_reasoning_tokens;
+    summary.total_duration_ms += part.total_duration_ms;
+    summary.total_requests += part.total_requests;
+    summary.total_cost_usd += part.total_cost_usd;
+}
+
+/// 用某個 assistant 自己回應的頂層 `DaySummary` 重新建構一筆 `AgentBreakdown`——刻意不沿用
+/// 來源回應裡巢狀的 `agent_breakdown`，理由見 PLAN.md 驗收條件 #6 的設計說明。
+fn agent_breakdown_from_summary(summary: &DaySummary) -> AgentBreakdown {
+    AgentBreakdown {
+        total_tokens: summary.total_tokens,
+        total_input_tokens: summary.total_input_tokens,
+        total_output_tokens: summary.total_output_tokens,
+        total_cache_read_tokens: summary.total_cache_read_tokens,
+        total_reasoning_tokens: summary.total_reasoning_tokens,
+        total_cost_usd: summary.total_cost_usd,
+        total_sessions: summary.total_sessions,
+    }
+}
+
+fn merge_projects(
+    projects: &mut HashMap<String, MonthlyProjectSummary>,
+    items: Vec<MonthlyProjectSummary>,
+) {
+    for item in items {
+        let entry = projects
+            .entry(item.cwd.clone())
+            .or_insert_with(|| MonthlyProjectSummary {
+                cwd: item.cwd.clone(),
+                sessions_count: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+            });
+        entry.sessions_count += item.sessions_count;
+        entry.total_tokens += item.total_tokens;
+        entry.cost_usd += item.cost_usd;
+    }
+}
+
+fn sorted_projects_by_tokens_desc(
+    projects: HashMap<String, MonthlyProjectSummary>,
+) -> Vec<MonthlyProjectSummary> {
+    let mut projects: Vec<MonthlyProjectSummary> = projects.into_values().collect();
+    projects.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
+    projects
+}
+
+fn merge_models(
+    models: &mut HashMap<(String, Option<String>), MonthlyModelSummary>,
+    items: Vec<MonthlyModelSummary>,
+) {
+    for item in items {
+        let key = (item.model.clone(), item.mode.clone());
+        let entry = models.entry(key).or_insert_with(|| MonthlyModelSummary {
+            model: item.model.clone(),
+            mode: item.mode.clone(),
+            sessions_count: 0,
+            total_tokens: 0,
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_cache_read_tokens: 0,
+            cost_usd: 0.0,
+        });
+        entry.sessions_count += item.sessions_count;
+        entry.total_tokens += item.total_tokens;
+        entry.total_input_tokens += item.total_input_tokens;
+        entry.total_output_tokens += item.total_output_tokens;
+        entry.total_cache_read_tokens += item.total_cache_read_tokens;
+        entry.cost_usd += item.cost_usd;
+    }
+}
+
+fn sorted_models_by_tokens_desc(
+    models: HashMap<(String, Option<String>), MonthlyModelSummary>,
+) -> Vec<MonthlyModelSummary> {
+    let mut models: Vec<MonthlyModelSummary> = models.into_values().collect();
+    models.sort_by_key(|item| std::cmp::Reverse(item.total_tokens));
+    models
+}
+
+/// 合併多個 assistant 的 daily usage 回應成「全部 Agent」的合計結果。
+fn merge_usage_details(
+    date: String,
+    items: Vec<(String, UsageDetailsResponse)>,
+) -> UsageDetailsResponse {
+    let mut summary = DaySummary::default();
+    let mut sessions = Vec::new();
+    let mut raw_entries = Vec::new();
+    // 沿用被合併的來源清單裡第一筆的真實 home_dir，而不是編一個佔位字串——
+    // static/app.js 的 abbreviateHomePath／resolveSessionCwdMatchKeyFromUrl 依賴這個欄位
+    // 把路徑縮寫成 `~/...`；同一台機器匯出的各 assistant home_dir 理應相同，任一筆皆可。
+    let mut home_dir: Option<String> = None;
+
+    for (_assistant, item) in items {
+        if home_dir.is_none() {
+            home_dir = Some(item.home_dir.clone());
+        }
+        merge_day_summary(&mut summary, &item.summary);
+        sessions.extend(item.sessions);
+        raw_entries.extend(item.raw_entries);
+    }
+
+    sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    UsageDetailsResponse {
+        date,
+        home_dir: home_dir.unwrap_or_default(),
+        summary,
+        sessions,
+        raw_entries,
+    }
+}
+
+/// 合併多個 assistant 的月度回應成「全部 Agent」的合計結果，`daily_breakdown`／
+/// `projects`／`models`／`agent_breakdown` 都逐 assistant 累加並依既有排序慣例排序。
+fn merge_monthly_details(
+    year_month: String,
+    items: Vec<(String, MonthlyDetailsResponse)>,
+) -> MonthlyDetailsResponse {
+    let mut summary = DaySummary::default();
+    let mut agent_breakdown: HashMap<String, AgentBreakdown> = HashMap::new();
+    let mut daily_map: BTreeMap<String, MonthlyDailyBreakdown> = BTreeMap::new();
+    let mut projects: HashMap<String, MonthlyProjectSummary> = HashMap::new();
+    let mut models: HashMap<(String, Option<String>), MonthlyModelSummary> = HashMap::new();
+
+    for (assistant, item) in items {
+        merge_day_summary(&mut summary, &item.summary);
+        agent_breakdown.insert(
+            assistant.clone(),
+            agent_breakdown_from_summary(&item.summary),
+        );
+
+        for day in item.daily_breakdown {
+            let entry =
+                daily_map
+                    .entry(day.date.clone())
+                    .or_insert_with(|| MonthlyDailyBreakdown {
+                        date: day.date.clone(),
+                        total_tokens: 0,
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_reasoning_tokens: 0,
+                        sessions_count: 0,
+                        cost_usd: 0.0,
+                        agents: BTreeMap::new(),
+                    });
+            entry.total_tokens += day.total_tokens;
+            entry.total_input_tokens += day.total_input_tokens;
+            entry.total_output_tokens += day.total_output_tokens;
+            entry.total_cache_read_tokens += day.total_cache_read_tokens;
+            entry.total_reasoning_tokens += day.total_reasoning_tokens;
+            entry.sessions_count += day.sessions_count;
+            entry.cost_usd += day.cost_usd;
+            entry.agents.insert(
+                assistant.clone(),
+                AgentPeriodUsage {
+                    total_tokens: day.total_tokens,
+                    cost_usd: day.cost_usd,
+                    sessions_count: day.sessions_count,
+                },
+            );
+        }
+
+        merge_projects(&mut projects, item.projects);
+        merge_models(&mut models, item.models);
+    }
+
+    MonthlyDetailsResponse {
+        year_month,
+        summary,
+        daily_breakdown: daily_map.into_values().collect(),
+        projects: sorted_projects_by_tokens_desc(projects),
+        models: sorted_models_by_tokens_desc(models),
+        agent_breakdown,
+    }
+}
+
+/// 合併多個 assistant 的年度回應成「全部 Agent」的合計結果，邏輯與
+/// `merge_monthly_details` 對應，只是時間顆粒度換成月份。
+fn merge_yearly_details(
+    year: String,
+    items: Vec<(String, YearlyDetailsResponse)>,
+) -> YearlyDetailsResponse {
+    let mut summary = DaySummary::default();
+    let mut agent_breakdown: HashMap<String, AgentBreakdown> = HashMap::new();
+    let mut monthly_map: BTreeMap<String, YearlyMonthlyBreakdown> = BTreeMap::new();
+    let mut projects: HashMap<String, MonthlyProjectSummary> = HashMap::new();
+    let mut models: HashMap<(String, Option<String>), MonthlyModelSummary> = HashMap::new();
+
+    for (assistant, item) in items {
+        merge_day_summary(&mut summary, &item.summary);
+        agent_breakdown.insert(
+            assistant.clone(),
+            agent_breakdown_from_summary(&item.summary),
+        );
+
+        for month in item.monthly_breakdown {
+            let entry =
+                monthly_map
+                    .entry(month.month.clone())
+                    .or_insert_with(|| YearlyMonthlyBreakdown {
+                        month: month.month.clone(),
+                        total_tokens: 0,
+                        total_input_tokens: 0,
+                        total_output_tokens: 0,
+                        total_cache_read_tokens: 0,
+                        total_reasoning_tokens: 0,
+                        sessions_count: 0,
+                        cost_usd: 0.0,
+                        agents: BTreeMap::new(),
+                    });
+            entry.total_tokens += month.total_tokens;
+            entry.total_input_tokens += month.total_input_tokens;
+            entry.total_output_tokens += month.total_output_tokens;
+            entry.total_cache_read_tokens += month.total_cache_read_tokens;
+            entry.total_reasoning_tokens += month.total_reasoning_tokens;
+            entry.sessions_count += month.sessions_count;
+            entry.cost_usd += month.cost_usd;
+            entry.agents.insert(
+                assistant.clone(),
+                AgentPeriodUsage {
+                    total_tokens: month.total_tokens,
+                    cost_usd: month.cost_usd,
+                    sessions_count: month.sessions_count,
+                },
+            );
+        }
+
+        merge_projects(&mut projects, item.projects);
+        merge_models(&mut models, item.models);
+    }
+
+    YearlyDetailsResponse {
+        year,
+        summary,
+        monthly_breakdown: monthly_map.into_values().collect(),
+        projects: sorted_projects_by_tokens_desc(projects),
+        models: sorted_models_by_tokens_desc(models),
+        agent_breakdown,
+    }
+}
+
 pub async fn get_available_dates(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
-            let dates = snapshot
-                .lookup_assistant(&assistant)
-                .map(|item| item.dates.clone())
-                .unwrap_or_default();
+            let dates = if assistant == ALL_ASSISTANTS_SCOPE {
+                union_desc(
+                    ASSISTANTS
+                        .iter()
+                        .filter_map(|a| snapshot.lookup_assistant(a))
+                        .map(|a| a.dates.clone()),
+                )
+            } else {
+                snapshot
+                    .lookup_assistant(&assistant)
+                    .map(|item| item.dates.clone())
+                    .unwrap_or_default()
+            };
             Json(DateListResponse { dates }).into_response()
         }
         Err(err) => snapshot_error_response(err),
@@ -708,15 +1002,24 @@ pub async fn get_available_dates(AxumPath(assistant): AxumPath<String>) -> impl 
 
 pub async fn get_available_months(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
-            let months = snapshot
-                .lookup_assistant(&assistant)
-                .map(|item| item.months.clone())
-                .unwrap_or_default();
+            let months = if assistant == ALL_ASSISTANTS_SCOPE {
+                union_desc(
+                    ASSISTANTS
+                        .iter()
+                        .filter_map(|a| snapshot.lookup_assistant(a))
+                        .map(|a| a.months.clone()),
+                )
+            } else {
+                snapshot
+                    .lookup_assistant(&assistant)
+                    .map(|item| item.months.clone())
+                    .unwrap_or_default()
+            };
             Json(MonthListResponse { months }).into_response()
         }
         Err(err) => snapshot_error_response(err),
@@ -725,15 +1028,24 @@ pub async fn get_available_months(AxumPath(assistant): AxumPath<String>) -> impl
 
 pub async fn get_available_years(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
-            let years = snapshot
-                .lookup_assistant(&assistant)
-                .map(|item| item.years.clone())
-                .unwrap_or_default();
+            let years = if assistant == ALL_ASSISTANTS_SCOPE {
+                union_desc(
+                    ASSISTANTS
+                        .iter()
+                        .filter_map(|a| snapshot.lookup_assistant(a))
+                        .map(|a| a.years.clone()),
+                )
+            } else {
+                snapshot
+                    .lookup_assistant(&assistant)
+                    .map(|item| item.years.clone())
+                    .unwrap_or_default()
+            };
             Json(YearListResponse { years }).into_response()
         }
         Err(err) => snapshot_error_response(err),
@@ -744,11 +1056,25 @@ pub async fn get_usage_details(
     AxumPath((assistant, date)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
+            if assistant == ALL_ASSISTANTS_SCOPE {
+                let items = match collect_all_scope::<UsageDetailsResponse, _>(
+                    &snapshot,
+                    &date,
+                    DashboardSnapshot::lookup_daily,
+                ) {
+                    Ok(items) => items,
+                    Err(err) => return snapshot_error_response(err),
+                };
+                if items.is_empty() {
+                    return not_found_response("找不到該日期的使用量資料。");
+                }
+                return Json(merge_usage_details(date, items)).into_response();
+            }
             if let Some(value) = snapshot.lookup_daily(&assistant, &date) {
                 raw_json_response(value)
             } else {
@@ -763,11 +1089,25 @@ pub async fn get_monthly_details(
     AxumPath((assistant, year_month)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
+            if assistant == ALL_ASSISTANTS_SCOPE {
+                let items = match collect_all_scope::<MonthlyDetailsResponse, _>(
+                    &snapshot,
+                    &year_month,
+                    DashboardSnapshot::lookup_monthly,
+                ) {
+                    Ok(items) => items,
+                    Err(err) => return snapshot_error_response(err),
+                };
+                if items.is_empty() {
+                    return not_found_response("找不到該月份的使用量資料。");
+                }
+                return Json(merge_monthly_details(year_month, items)).into_response();
+            }
             if let Some(value) = snapshot.lookup_monthly(&assistant, &year_month) {
                 raw_json_response(value)
             } else {
@@ -782,11 +1122,25 @@ pub async fn get_yearly_details(
     AxumPath((assistant, year)): AxumPath<(String, String)>,
 ) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
     match get_cached_snapshot().await {
         Ok(snapshot) => {
+            if assistant == ALL_ASSISTANTS_SCOPE {
+                let items = match collect_all_scope::<YearlyDetailsResponse, _>(
+                    &snapshot,
+                    &year,
+                    DashboardSnapshot::lookup_yearly,
+                ) {
+                    Ok(items) => items,
+                    Err(err) => return snapshot_error_response(err),
+                };
+                if items.is_empty() {
+                    return not_found_response("找不到該年份的使用量資料。");
+                }
+                return Json(merge_yearly_details(year, items)).into_response();
+            }
             if let Some(value) = snapshot.lookup_yearly(&assistant, &year) {
                 raw_json_response(value)
             } else {
@@ -799,7 +1153,7 @@ pub async fn get_yearly_details(
 
 pub async fn get_setup_info(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
 
@@ -824,7 +1178,7 @@ fn snapshot_setup_info() -> Value {
 
 pub async fn trigger_manual_sync(AxumPath(assistant): AxumPath<String>) -> impl IntoResponse {
     let assistant = normalize_assistant_name(&assistant);
-    if !ASSISTANTS.contains(&assistant.as_str()) {
+    if !is_supported_assistant_scope(&assistant) {
         return unsupported_assistant_response();
     }
 
@@ -1643,5 +1997,517 @@ mod tests {
         std::env::set_var("TOKEN_USAGE_INSIGHTS_EMPTY_TEST", "snapshot.json");
         assert!(env_var_is_set("TOKEN_USAGE_INSIGHTS_EMPTY_TEST"));
         std::env::remove_var("TOKEN_USAGE_INSIGHTS_EMPTY_TEST");
+    }
+
+    // ---- 「全部 Agent」合併邏輯（AC5/AC6）純函式單元測試 ----
+
+    use crate::db::UsageEntry;
+
+    fn sample_session(
+        assistant: &str,
+        timestamp: &str,
+        total_tokens: u64,
+    ) -> handlers::SessionSummary {
+        handlers::SessionSummary {
+            session_id: format!("{assistant}-session"),
+            session_name: "Session".to_string(),
+            assistant_type: assistant.to_string(),
+            source_kind: "legacy".to_string(),
+            source_dir_key: None,
+            cwd: "/repo".to_string(),
+            model: "test-model".to_string(),
+            total_tokens,
+            total_input_tokens: total_tokens / 2,
+            total_output_tokens: total_tokens / 2,
+            total_cache_read_tokens: 0,
+            total_cache_write_tokens: 0,
+            total_reasoning_tokens: 0,
+            max_turn_no: 1,
+            timestamp: timestamp.to_string(),
+            duration_ms: 0,
+            total_requests: 1,
+            cost_usd: total_tokens as f64 * 0.001,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn sample_usage_entry(session_id: &str, timestamp: &str) -> UsageEntry {
+        UsageEntry {
+            timestamp: timestamp.to_string(),
+            session_id: session_id.to_string(),
+            session_name: None,
+            transcript_path: None,
+            cwd: Some("/repo".to_string()),
+            version: None,
+            turn_no: 1,
+            model: Some("test-model".to_string()),
+            model_id: Some("test-model".to_string()),
+            tokens: None,
+            delta_tokens: None,
+            context: None,
+            cost: None,
+            source_kind: None,
+            source_dir_key: None,
+            parent_session_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn sample_day_summary(total_tokens: u64, total_sessions: usize, cost_usd: f64) -> DaySummary {
+        DaySummary {
+            total_sessions,
+            total_tokens,
+            total_input_tokens: total_tokens / 2,
+            total_output_tokens: total_tokens / 2,
+            total_cache_read_tokens: total_tokens / 10,
+            total_cache_write_tokens: total_tokens / 20,
+            total_reasoning_tokens: total_tokens / 100,
+            total_duration_ms: total_tokens * 10,
+            total_requests: total_sessions as u64,
+            total_cost_usd: cost_usd,
+        }
+    }
+
+    #[test]
+    fn union_desc_dedupes_and_sorts_descending() {
+        let merged = union_desc(vec![
+            vec!["2026-07-01".to_string(), "2026-07-03".to_string()],
+            vec!["2026-07-02".to_string(), "2026-07-03".to_string()],
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                "2026-07-03".to_string(),
+                "2026-07-02".to_string(),
+                "2026-07-01".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn union_desc_returns_empty_for_no_lists() {
+        assert!(union_desc(Vec::<Vec<String>>::new()).is_empty());
+    }
+
+    #[test]
+    fn merge_usage_details_sums_summary_and_sorts_sessions_by_timestamp_desc() {
+        let claude_summary = sample_day_summary(100, 1, 0.5);
+        let codex_summary = sample_day_summary(200, 1, 1.5);
+
+        let claude_item = UsageDetailsResponse {
+            date: "2026-07-01".to_string(),
+            // 兩個來源刻意給不同的 home_dir，用來斷言合併結果採用「第一筆」的真實值，
+            // 而不是自己編一個佔位字串（如果兩邊都用同一個字串，這個斷言就測不出差異）。
+            home_dir: "C:\\Users\\claude-home".to_string(),
+            summary: claude_summary,
+            sessions: vec![sample_session("claude", "2026-07-01T09:00:00Z", 100)],
+            raw_entries: vec![handlers::RawUsageEntry {
+                assistant_type: "claude".to_string(),
+                entry: sample_usage_entry("claude-1", "2026-07-01T09:00:00Z"),
+            }],
+        };
+        let codex_item = UsageDetailsResponse {
+            date: "2026-07-01".to_string(),
+            home_dir: "C:\\Users\\codex-home".to_string(),
+            summary: codex_summary,
+            sessions: vec![sample_session("codex", "2026-07-01T10:00:00Z", 200)],
+            raw_entries: vec![handlers::RawUsageEntry {
+                assistant_type: "codex".to_string(),
+                entry: sample_usage_entry("codex-1", "2026-07-01T10:00:00Z"),
+            }],
+        };
+
+        let merged = merge_usage_details(
+            "2026-07-01".to_string(),
+            vec![
+                ("claude".to_string(), claude_item),
+                ("codex".to_string(), codex_item),
+            ],
+        );
+
+        assert_eq!(merged.date, "2026-07-01");
+        // 用被合併清單裡第一筆（claude）的真實 home_dir，不是自己編的佔位字串——
+        // 前端 abbreviateHomePath／resolveSessionCwdMatchKeyFromUrl 依賴這個欄位運作。
+        assert_eq!(merged.home_dir, "C:\\Users\\claude-home");
+        assert_eq!(merged.summary.total_sessions, 2);
+        assert_eq!(merged.summary.total_tokens, 300);
+        assert_eq!(merged.summary.total_input_tokens, 150);
+        assert_eq!(merged.summary.total_output_tokens, 150);
+        assert_eq!(merged.summary.total_cache_read_tokens, 30);
+        assert_eq!(merged.summary.total_cache_write_tokens, 15);
+        assert_eq!(merged.summary.total_reasoning_tokens, 3);
+        assert_eq!(merged.summary.total_duration_ms, 3000);
+        assert_eq!(merged.summary.total_requests, 2);
+        assert!((merged.summary.total_cost_usd - 2.0).abs() < 1e-9);
+
+        assert_eq!(merged.sessions.len(), 2);
+        assert_eq!(merged.sessions[0].assistant_type, "codex"); // 10:00 晚於 09:00，DESC 排在前
+        assert_eq!(merged.sessions[1].assistant_type, "claude");
+
+        // raw_entries 必須保留各自真實的來源 assistant_type，不能被合併邏輯覆寫成同一個值
+        // （例如覆寫成 "all"）；先前只斷言 len() 抓不到這種錯誤。
+        assert_eq!(merged.raw_entries.len(), 2);
+        let mut raw_entry_assistant_types: Vec<&str> = merged
+            .raw_entries
+            .iter()
+            .map(|entry| entry.assistant_type.as_str())
+            .collect();
+        raw_entry_assistant_types.sort_unstable();
+        assert_eq!(raw_entry_assistant_types, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn merge_monthly_details_combines_daily_breakdown_projects_models_and_rebuilds_agent_breakdown()
+    {
+        let claude = MonthlyDetailsResponse {
+            year_month: "2026-07".to_string(),
+            summary: sample_day_summary(300, 2, 1.0),
+            daily_breakdown: vec![
+                MonthlyDailyBreakdown {
+                    date: "2026-07-01".to_string(),
+                    total_tokens: 100,
+                    total_input_tokens: 60,
+                    total_output_tokens: 40,
+                    total_cache_read_tokens: 5,
+                    total_reasoning_tokens: 1,
+                    sessions_count: 1,
+                    cost_usd: 0.4,
+                    agents: BTreeMap::new(),
+                },
+                MonthlyDailyBreakdown {
+                    date: "2026-07-02".to_string(),
+                    total_tokens: 200,
+                    total_input_tokens: 120,
+                    total_output_tokens: 80,
+                    total_cache_read_tokens: 5,
+                    total_reasoning_tokens: 1,
+                    sessions_count: 1,
+                    cost_usd: 0.6,
+                    agents: BTreeMap::new(),
+                },
+            ],
+            projects: vec![MonthlyProjectSummary {
+                cwd: "/repo".to_string(),
+                sessions_count: 2,
+                total_tokens: 300,
+                cost_usd: 1.0,
+            }],
+            models: vec![MonthlyModelSummary {
+                model: "gpt-5".to_string(),
+                mode: None,
+                sessions_count: 2,
+                total_tokens: 300,
+                total_input_tokens: 180,
+                total_output_tokens: 120,
+                total_cache_read_tokens: 10,
+                cost_usd: 1.0,
+            }],
+            // 刻意留空／不真實，用來證明合併邏輯不信任來源回應裡巢狀的 agent_breakdown
+            agent_breakdown: HashMap::new(),
+        };
+        let codex = MonthlyDetailsResponse {
+            year_month: "2026-07".to_string(),
+            summary: sample_day_summary(50, 1, 0.2),
+            daily_breakdown: vec![MonthlyDailyBreakdown {
+                date: "2026-07-01".to_string(),
+                total_tokens: 50,
+                total_input_tokens: 30,
+                total_output_tokens: 20,
+                total_cache_read_tokens: 2,
+                total_reasoning_tokens: 0,
+                sessions_count: 1,
+                cost_usd: 0.2,
+                agents: BTreeMap::new(),
+            }],
+            projects: vec![MonthlyProjectSummary {
+                cwd: "/repo".to_string(),
+                sessions_count: 1,
+                total_tokens: 50,
+                cost_usd: 0.2,
+            }],
+            models: vec![MonthlyModelSummary {
+                model: "gpt-5".to_string(),
+                mode: None,
+                sessions_count: 1,
+                total_tokens: 50,
+                total_input_tokens: 30,
+                total_output_tokens: 20,
+                total_cache_read_tokens: 2,
+                cost_usd: 0.2,
+            }],
+            agent_breakdown: HashMap::new(),
+        };
+
+        let merged = merge_monthly_details(
+            "2026-07".to_string(),
+            vec![("claude".to_string(), claude), ("codex".to_string(), codex)],
+        );
+
+        assert_eq!(merged.summary.total_tokens, 350);
+        assert_eq!(merged.summary.total_sessions, 3);
+
+        assert_eq!(merged.agent_breakdown.len(), 2);
+        assert_eq!(merged.agent_breakdown["claude"].total_tokens, 300);
+        assert_eq!(merged.agent_breakdown["claude"].total_sessions, 2);
+        assert_eq!(merged.agent_breakdown["codex"].total_tokens, 50);
+
+        assert_eq!(merged.daily_breakdown.len(), 2);
+        assert_eq!(merged.daily_breakdown[0].date, "2026-07-01");
+        assert_eq!(merged.daily_breakdown[0].total_tokens, 150);
+        assert_eq!(merged.daily_breakdown[0].agents.len(), 2);
+        assert_eq!(merged.daily_breakdown[0].agents["claude"].total_tokens, 100);
+        assert_eq!(merged.daily_breakdown[0].agents["codex"].total_tokens, 50);
+        assert_eq!(merged.daily_breakdown[1].date, "2026-07-02");
+        assert_eq!(merged.daily_breakdown[1].agents.len(), 1);
+
+        assert_eq!(merged.projects.len(), 1);
+        assert_eq!(merged.projects[0].cwd, "/repo");
+        assert_eq!(merged.projects[0].total_tokens, 350);
+
+        assert_eq!(merged.models.len(), 1);
+        assert_eq!(merged.models[0].model, "gpt-5");
+        assert_eq!(merged.models[0].total_tokens, 350);
+    }
+
+    #[test]
+    fn merge_monthly_details_sorts_projects_and_models_by_total_tokens_desc() {
+        let make = |cwd: &str, model: &str, tokens: u64| MonthlyDetailsResponse {
+            year_month: "2026-07".to_string(),
+            summary: sample_day_summary(tokens, 1, 0.0),
+            daily_breakdown: vec![],
+            projects: vec![MonthlyProjectSummary {
+                cwd: cwd.to_string(),
+                sessions_count: 1,
+                total_tokens: tokens,
+                cost_usd: 0.0,
+            }],
+            models: vec![MonthlyModelSummary {
+                model: model.to_string(),
+                mode: None,
+                sessions_count: 1,
+                total_tokens: tokens,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                total_cache_read_tokens: 0,
+                cost_usd: 0.0,
+            }],
+            agent_breakdown: HashMap::new(),
+        };
+
+        let merged = merge_monthly_details(
+            "2026-07".to_string(),
+            vec![
+                ("small".to_string(), make("/small", "small-model", 10)),
+                ("big".to_string(), make("/big", "big-model", 1000)),
+                ("medium".to_string(), make("/medium", "medium-model", 100)),
+            ],
+        );
+
+        assert_eq!(
+            merged
+                .projects
+                .iter()
+                .map(|p| p.cwd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/big", "/medium", "/small"]
+        );
+        assert_eq!(
+            merged
+                .models
+                .iter()
+                .map(|m| m.model.as_str())
+                .collect::<Vec<_>>(),
+            vec!["big-model", "medium-model", "small-model"]
+        );
+    }
+
+    #[test]
+    fn merge_yearly_details_combines_monthly_breakdown_and_rebuilds_agent_breakdown() {
+        let claude = YearlyDetailsResponse {
+            year: "2026".to_string(),
+            summary: sample_day_summary(300, 2, 1.0),
+            monthly_breakdown: vec![
+                YearlyMonthlyBreakdown {
+                    month: "2026-07".to_string(),
+                    total_tokens: 100,
+                    total_input_tokens: 60,
+                    total_output_tokens: 40,
+                    total_cache_read_tokens: 5,
+                    total_reasoning_tokens: 1,
+                    sessions_count: 1,
+                    cost_usd: 0.4,
+                    agents: BTreeMap::new(),
+                },
+                YearlyMonthlyBreakdown {
+                    month: "2026-08".to_string(),
+                    total_tokens: 200,
+                    total_input_tokens: 120,
+                    total_output_tokens: 80,
+                    total_cache_read_tokens: 5,
+                    total_reasoning_tokens: 1,
+                    sessions_count: 1,
+                    cost_usd: 0.6,
+                    agents: BTreeMap::new(),
+                },
+            ],
+            projects: vec![MonthlyProjectSummary {
+                cwd: "/repo".to_string(),
+                sessions_count: 2,
+                total_tokens: 300,
+                cost_usd: 1.0,
+            }],
+            models: vec![MonthlyModelSummary {
+                model: "gpt-5".to_string(),
+                mode: None,
+                sessions_count: 2,
+                total_tokens: 300,
+                total_input_tokens: 180,
+                total_output_tokens: 120,
+                total_cache_read_tokens: 10,
+                cost_usd: 1.0,
+            }],
+            agent_breakdown: HashMap::new(),
+        };
+        let codex = YearlyDetailsResponse {
+            year: "2026".to_string(),
+            summary: sample_day_summary(50, 1, 0.2),
+            monthly_breakdown: vec![YearlyMonthlyBreakdown {
+                month: "2026-07".to_string(),
+                total_tokens: 50,
+                total_input_tokens: 30,
+                total_output_tokens: 20,
+                total_cache_read_tokens: 2,
+                total_reasoning_tokens: 0,
+                sessions_count: 1,
+                cost_usd: 0.2,
+                agents: BTreeMap::new(),
+            }],
+            projects: vec![MonthlyProjectSummary {
+                cwd: "/repo".to_string(),
+                sessions_count: 1,
+                total_tokens: 50,
+                cost_usd: 0.2,
+            }],
+            models: vec![MonthlyModelSummary {
+                model: "gpt-5".to_string(),
+                mode: None,
+                sessions_count: 1,
+                total_tokens: 50,
+                total_input_tokens: 30,
+                total_output_tokens: 20,
+                total_cache_read_tokens: 2,
+                cost_usd: 0.2,
+            }],
+            agent_breakdown: HashMap::new(),
+        };
+
+        let merged = merge_yearly_details(
+            "2026".to_string(),
+            vec![("claude".to_string(), claude), ("codex".to_string(), codex)],
+        );
+
+        assert_eq!(merged.summary.total_tokens, 350);
+        assert_eq!(merged.agent_breakdown.len(), 2);
+        assert_eq!(merged.agent_breakdown["claude"].total_tokens, 300);
+        assert_eq!(merged.agent_breakdown["codex"].total_tokens, 50);
+
+        assert_eq!(merged.monthly_breakdown.len(), 2);
+        assert_eq!(merged.monthly_breakdown[0].month, "2026-07");
+        assert_eq!(merged.monthly_breakdown[0].total_tokens, 150);
+        assert_eq!(merged.monthly_breakdown[0].agents.len(), 2);
+        assert_eq!(merged.monthly_breakdown[1].month, "2026-08");
+        assert_eq!(merged.monthly_breakdown[1].agents.len(), 1);
+
+        assert_eq!(merged.projects.len(), 1);
+        assert_eq!(merged.projects[0].total_tokens, 350);
+        assert_eq!(merged.models.len(), 1);
+        assert_eq!(merged.models[0].total_tokens, 350);
+    }
+
+    #[tokio::test]
+    async fn collect_all_scope_skips_missing_assistants_but_errors_on_bad_json() {
+        let mut assistants = HashMap::new();
+        assistants.insert(
+            "claude".to_string(),
+            AssistantSnapshot {
+                dates: vec!["2026-07-01".to_string()],
+                months: vec![],
+                years: vec![],
+                daily: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        "2026-07-01".to_string(),
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "date": "2026-07-01",
+                            "home_dir": "x",
+                            "summary": sample_day_summary(10, 1, 0.1),
+                            "sessions": [],
+                            "raw_entries": []
+                        }))
+                        .unwrap(),
+                    );
+                    map
+                },
+                monthly: HashMap::new(),
+                yearly: HashMap::new(),
+                session_events: HashMap::new(),
+            },
+        );
+        assistants.insert(
+            "codex".to_string(),
+            AssistantSnapshot {
+                dates: vec!["2026-07-01".to_string()],
+                months: vec![],
+                years: vec![],
+                daily: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        "2026-07-01".to_string(),
+                        serde_json::value::to_raw_value(
+                            &serde_json::json!({ "not": "a UsageDetailsResponse" }),
+                        )
+                        .unwrap(),
+                    );
+                    map
+                },
+                monthly: HashMap::new(),
+                yearly: HashMap::new(),
+                session_events: HashMap::new(),
+            },
+        );
+        let snapshot = DashboardSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            generated_at: "2026-09-28T00:00:00Z".to_string(),
+            source: "test".to_string(),
+            assistants,
+        };
+
+        // 只有 claude/codex 有資料；其餘 assistant 都缺 daily 快取，應直接跳過而非報錯。
+        let error = match collect_all_scope::<UsageDetailsResponse, _>(
+            &snapshot,
+            "2026-07-01",
+            DashboardSnapshot::lookup_daily,
+        ) {
+            Ok(_) => panic!("codex 的壞資料應該讓 collect_all_scope 回錯，而不是靜默忽略"),
+            Err(err) => err,
+        };
+        assert!(error.contains("codex/2026-07-01"), "{error}");
+
+        // 移除壞資料後，缺資料的 assistant 應被跳過，只回傳有效的那筆。
+        let mut snapshot_ok = snapshot;
+        snapshot_ok.assistants.remove("codex");
+        let items = collect_all_scope::<UsageDetailsResponse, _>(
+            &snapshot_ok,
+            "2026-07-01",
+            DashboardSnapshot::lookup_daily,
+        )
+        .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "claude");
     }
 }

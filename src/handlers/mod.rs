@@ -5,7 +5,7 @@ use crate::{
         MonthlyProjectSummary,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 pub mod daily;
@@ -98,7 +98,7 @@ pub struct AssistantSetupStatus {
     pub settings_path: String,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
     pub session_name: String,
@@ -124,14 +124,14 @@ pub struct SessionSummary {
     pub reasoning_effort: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct RawUsageEntry {
     pub assistant_type: String,
     #[serde(flatten)]
     pub entry: UsageEntry,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UsageDetailsResponse {
     pub date: String,
     pub home_dir: String,
@@ -140,7 +140,7 @@ pub struct UsageDetailsResponse {
     pub raw_entries: Vec<RawUsageEntry>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MonthlyDailyBreakdown {
     pub date: String,
     pub total_tokens: u64,
@@ -150,6 +150,7 @@ pub struct MonthlyDailyBreakdown {
     pub total_reasoning_tokens: u64,
     pub sessions_count: usize,
     pub cost_usd: f64,
+    #[serde(default)]
     pub agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
@@ -196,17 +197,18 @@ pub struct ModelSessionsResponse {
     pub sessions: Vec<ModelSessionDetail>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MonthlyDetailsResponse {
     pub year_month: String,
     pub summary: DaySummary,
     pub daily_breakdown: Vec<MonthlyDailyBreakdown>,
     pub projects: Vec<MonthlyProjectSummary>,
     pub models: Vec<MonthlyModelSummary>,
+    #[serde(default)]
     pub agent_breakdown: HashMap<String, AgentBreakdown>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct YearlyMonthlyBreakdown {
     pub month: String,
     pub total_tokens: u64,
@@ -216,16 +218,18 @@ pub struct YearlyMonthlyBreakdown {
     pub total_reasoning_tokens: u64,
     pub sessions_count: usize,
     pub cost_usd: f64,
+    #[serde(default)]
     pub agents: BTreeMap<String, AgentPeriodUsage>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct YearlyDetailsResponse {
     pub year: String,
     pub summary: DaySummary,
     pub monthly_breakdown: Vec<YearlyMonthlyBreakdown>,
     pub projects: Vec<MonthlyProjectSummary>,
     pub models: Vec<MonthlyModelSummary>,
+    #[serde(default)]
     pub agent_breakdown: HashMap<String, AgentBreakdown>,
 }
 

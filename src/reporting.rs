@@ -3,7 +3,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     db::{DatedUsageEntry, TokenStats, UsageEntry},
@@ -75,7 +75,7 @@ pub(crate) struct SessionUsageAggregation {
     pub display_model: String,
 }
 
-#[derive(Serialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct DaySummary {
     pub total_sessions: usize,
     pub total_tokens: u64,
@@ -101,7 +101,7 @@ impl DaySummary {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MonthlyProjectSummary {
     pub cwd: String,
     pub sessions_count: usize,
@@ -109,7 +109,7 @@ pub struct MonthlyProjectSummary {
     pub cost_usd: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct MonthlyModelSummary {
     pub model: String,
     pub mode: Option<String>,
@@ -121,7 +121,7 @@ pub struct MonthlyModelSummary {
     pub cost_usd: f64,
 }
 
-#[derive(Serialize, Default, Clone)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct AgentBreakdown {
     pub total_tokens: u64,
     pub total_input_tokens: u64,
@@ -133,7 +133,7 @@ pub struct AgentBreakdown {
 }
 
 /// 單一時間區段（日或月）內某個 Agent 的用量，供合併全部 Agent 的堆疊趨勢圖使用。
-#[derive(Serialize, Debug, Default, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq)]
 pub struct AgentPeriodUsage {
     pub total_tokens: u64,
     pub cost_usd: f64,

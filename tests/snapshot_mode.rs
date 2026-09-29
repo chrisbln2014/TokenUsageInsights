@@ -669,3 +669,516 @@ fn export_snapshot_env_does_not_hijack_subcommands() {
     assert!(!hijacked, "環境變數不可把 --help 劫持成 snapshot 匯出");
     assert!(!insights_dir_created);
 }
+
+// ---- 「全部 Agent」合併範圍（assistant=all）整合測試（PLAN.md 驗收條件 #5/#6/#7） ----
+//
+// fixture 說明見 tests/fixtures/README.md 的
+// `all-scope-claude-codex-snapshot-slice.json` 段落：這是從本機正式 Cloud Run
+// snapshot 匯出檔切下來的一段真實資料（claude／codex 兩個 assistant，
+// 2026-08-06／2026-08／2026 三個期間），匯出時的版本早於這次合併改動，
+// daily_breakdown／monthly_breakdown 天生就沒有巢狀的 agents 欄位——用真實產物
+// 而非手刻 JSON，符合 machine-gate 政策對契約測試輸入的要求，同時天然涵蓋
+// 「缺 agents 欄位的舊格式」這個相容性情境，不用另外偽造。
+
+const FIXTURE_DATE: &str = "2026-08-06";
+const FIXTURE_MONTH: &str = "2026-08";
+const FIXTURE_YEAR: &str = "2026";
+// 三份都確認過兩個 assistant 皆不存在，用來驗證 404 行為。
+const MISSING_DATE: &str = "2099-01-01";
+const MISSING_MONTH: &str = "2099-01";
+const MISSING_YEAR: &str = "2099";
+
+fn two_assistant_snapshot_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("all-scope-claude-codex-snapshot-slice.json")
+}
+
+fn get_json(port: u16, path: &str) -> (u16, serde_json::Value) {
+    let response = http_get(port, path).unwrap_or_else(|e| panic!("{path} 請求失敗: {e}"));
+    let value: serde_json::Value = serde_json::from_str(&response.body)
+        .unwrap_or_else(|e| panic!("{path} 回應解析失敗: {e}, body={}", response.body));
+    (response.status, value)
+}
+
+fn as_string_vec(value: &serde_json::Value, field: &str) -> Vec<String> {
+    value[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} 不是陣列: {value}"))
+        .iter()
+        .map(|item| item.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 對兩個字串陣列取聯集、去重，並依 `src/snapshot.rs::union_desc` 的慣例排序成遞減，
+/// 用來跟 `/api/all/...` 的回應比對——期望值是從同一份真實 fixture 的兩個單一
+/// assistant 回應「算」出來的，不是憑空猜的常數。
+fn union_desc_for_test(a: &[String], b: &[String]) -> Vec<String> {
+    let mut set: std::collections::BTreeSet<String> = a.iter().cloned().collect();
+    set.extend(b.iter().cloned());
+    set.into_iter().rev().collect()
+}
+
+/// 逐欄位比對「兩個單一 assistant 回應的 `summary.<field>` 相加」是否等於
+/// 「合併回應的 `summary.<field>`」，數值欄位取自真實 fixture，不是手算的常數。
+fn assert_summary_fields_sum(
+    merged: &serde_json::Value,
+    claude: &serde_json::Value,
+    codex: &serde_json::Value,
+    label: &str,
+) {
+    for field in [
+        "total_sessions",
+        "total_tokens",
+        "total_input_tokens",
+        "total_output_tokens",
+        "total_cache_read_tokens",
+        "total_cache_write_tokens",
+        "total_reasoning_tokens",
+        "total_duration_ms",
+        "total_requests",
+    ] {
+        let claude_value = claude["summary"][field].as_u64().unwrap();
+        let codex_value = codex["summary"][field].as_u64().unwrap();
+        let merged_value = merged["summary"][field].as_u64().unwrap();
+        assert_eq!(
+            merged_value,
+            claude_value + codex_value,
+            "{label}.summary.{field}"
+        );
+    }
+    let claude_cost = claude["summary"]["total_cost_usd"].as_f64().unwrap();
+    let codex_cost = codex["summary"]["total_cost_usd"].as_f64().unwrap();
+    let merged_cost = merged["summary"]["total_cost_usd"].as_f64().unwrap();
+    assert!(
+        (merged_cost - (claude_cost + codex_cost)).abs() < 1e-6,
+        "{label}.summary.total_cost_usd: merged={merged_cost} expected={}",
+        claude_cost + codex_cost
+    );
+}
+
+/// 比對 `agent_breakdown` 的兩個 assistant 鍵，數值必須「重新從各自頂層 summary 建構」，
+/// 而不是沿用來源回應裡巢狀的 agent_breakdown（PLAN.md 設計說明的「不信任巢狀既有值」）。
+fn assert_agent_breakdown_matches_summaries(
+    merged: &serde_json::Value,
+    claude: &serde_json::Value,
+    codex: &serde_json::Value,
+) {
+    let agent_breakdown = merged["agent_breakdown"].as_object().unwrap();
+    assert_eq!(agent_breakdown.len(), 2, "{agent_breakdown:?}");
+    for (assistant, source) in [("claude", claude), ("codex", codex)] {
+        for field in [
+            "total_tokens",
+            "total_input_tokens",
+            "total_output_tokens",
+            "total_cache_read_tokens",
+            "total_reasoning_tokens",
+            "total_sessions",
+        ] {
+            assert_eq!(
+                agent_breakdown[assistant][field], source["summary"][field],
+                "agent_breakdown.{assistant}.{field}"
+            );
+        }
+    }
+}
+
+#[test]
+fn all_scope_dates_months_years_return_deduped_union_sorted_desc() {
+    let root = unique_temp_dir("all-scope-lists");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+    std::fs::copy(two_assistant_snapshot_fixture_path(), &snapshot_path).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let result = if started {
+        Ok((
+            get_json(port, "/api/claude/dates"),
+            get_json(port, "/api/codex/dates"),
+            get_json(port, "/api/all/dates"),
+            get_json(port, "/api/claude/months"),
+            get_json(port, "/api/codex/months"),
+            get_json(port, "/api/all/months"),
+            get_json(port, "/api/claude/years"),
+            get_json(port, "/api/codex/years"),
+            get_json(port, "/api/all/years"),
+        ))
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let (
+        (claude_dates_status, claude_dates),
+        (codex_dates_status, codex_dates),
+        (all_dates_status, all_dates),
+        (claude_months_status, claude_months),
+        (codex_months_status, codex_months),
+        (all_months_status, all_months),
+        (claude_years_status, claude_years),
+        (codex_years_status, codex_years),
+        (all_years_status, all_years),
+    ) = result.unwrap();
+
+    for status in [
+        claude_dates_status,
+        codex_dates_status,
+        all_dates_status,
+        claude_months_status,
+        codex_months_status,
+        all_months_status,
+        claude_years_status,
+        codex_years_status,
+        all_years_status,
+    ] {
+        assert_eq!(status, 200);
+    }
+
+    let expected_dates = union_desc_for_test(
+        &as_string_vec(&claude_dates, "dates"),
+        &as_string_vec(&codex_dates, "dates"),
+    );
+    assert!(!expected_dates.is_empty());
+    assert!(expected_dates.contains(&FIXTURE_DATE.to_string()));
+    assert_eq!(as_string_vec(&all_dates, "dates"), expected_dates);
+
+    let expected_months = union_desc_for_test(
+        &as_string_vec(&claude_months, "months"),
+        &as_string_vec(&codex_months, "months"),
+    );
+    assert!(expected_months.contains(&FIXTURE_MONTH.to_string()));
+    assert_eq!(as_string_vec(&all_months, "months"), expected_months);
+
+    let expected_years = union_desc_for_test(
+        &as_string_vec(&claude_years, "years"),
+        &as_string_vec(&codex_years, "years"),
+    );
+    assert!(expected_years.contains(&FIXTURE_YEAR.to_string()));
+    assert_eq!(as_string_vec(&all_years, "years"), expected_years);
+}
+
+#[test]
+fn all_scope_usage_monthly_yearly_merge_totals_match_real_per_assistant_data() {
+    let root = unique_temp_dir("all-scope-merge");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+    std::fs::copy(two_assistant_snapshot_fixture_path(), &snapshot_path).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let result = if started {
+        Ok((
+            get_json(port, &format!("/api/claude/usage/{FIXTURE_DATE}")),
+            get_json(port, &format!("/api/codex/usage/{FIXTURE_DATE}")),
+            get_json(port, &format!("/api/all/usage/{FIXTURE_DATE}")),
+            get_json(port, &format!("/api/all/usage/{MISSING_DATE}")),
+            get_json(port, &format!("/api/claude/monthly/{FIXTURE_MONTH}")),
+            get_json(port, &format!("/api/codex/monthly/{FIXTURE_MONTH}")),
+            get_json(port, &format!("/api/all/monthly/{FIXTURE_MONTH}")),
+            get_json(port, &format!("/api/all/monthly/{MISSING_MONTH}")),
+            get_json(port, &format!("/api/claude/yearly/{FIXTURE_YEAR}")),
+            get_json(port, &format!("/api/codex/yearly/{FIXTURE_YEAR}")),
+            get_json(port, &format!("/api/all/yearly/{FIXTURE_YEAR}")),
+            get_json(port, &format!("/api/all/yearly/{MISSING_YEAR}")),
+        ))
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let (
+        (usage_claude_status, usage_claude),
+        (usage_codex_status, usage_codex),
+        (usage_all_status, usage_all),
+        (usage_missing_status, usage_missing),
+        (monthly_claude_status, monthly_claude),
+        (monthly_codex_status, monthly_codex),
+        (monthly_all_status, monthly_all),
+        (monthly_missing_status, monthly_missing),
+        (yearly_claude_status, yearly_claude),
+        (yearly_codex_status, yearly_codex),
+        (yearly_all_status, yearly_all),
+        (yearly_missing_status, yearly_missing),
+    ) = result.unwrap();
+
+    for status in [
+        usage_claude_status,
+        usage_codex_status,
+        monthly_claude_status,
+        monthly_codex_status,
+        yearly_claude_status,
+        yearly_codex_status,
+    ] {
+        assert_eq!(status, 200, "單一 assistant 讀真實 fixture 應該一定成功");
+    }
+
+    // ---- daily：加總正確，且 sessions／raw_entries 保留各自真實的來源 assistant_type ----
+    assert_eq!(usage_all_status, 200, "{usage_all}");
+    assert_summary_fields_sum(&usage_all, &usage_claude, &usage_codex, "usage");
+
+    let mut expected_session_types: Vec<String> = usage_claude["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(usage_codex["sessions"].as_array().unwrap())
+        .map(|s| s["assistant_type"].as_str().unwrap().to_string())
+        .collect();
+    expected_session_types.sort();
+    let mut actual_session_types: Vec<String> = usage_all["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["assistant_type"].as_str().unwrap().to_string())
+        .collect();
+    actual_session_types.sort();
+    assert_eq!(actual_session_types, expected_session_types);
+
+    // raw_entries 的 assistant_type 是這次應修的重點：合併邏輯必須保留每一筆真實的
+    // 來源標記，不能被覆寫成單一值（例如 "all"）——先前的測試只斷言 len()，這裡改成
+    // 逐筆比對，且明確要求集合裡同時出現 "claude" 與 "codex" 兩種真實值。
+    let mut expected_raw_types: Vec<String> = usage_claude["raw_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(usage_codex["raw_entries"].as_array().unwrap())
+        .map(|e| e["assistant_type"].as_str().unwrap().to_string())
+        .collect();
+    expected_raw_types.sort();
+    let mut actual_raw_types: Vec<String> = usage_all["raw_entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["assistant_type"].as_str().unwrap().to_string())
+        .collect();
+    actual_raw_types.sort();
+    assert_eq!(
+        actual_raw_types, expected_raw_types,
+        "合併後 raw_entries 的 assistant_type 必須逐筆保留真實來源，不能被覆寫成同一個值"
+    );
+    assert!(
+        actual_raw_types.contains(&"claude".to_string())
+            && actual_raw_types.contains(&"codex".to_string()),
+        "{actual_raw_types:?}"
+    );
+
+    // Fix 2：home_dir 要用真實值（來源之一的 home_dir），不是自己編的佔位字串
+    let claude_home_dir = usage_claude["home_dir"].as_str().unwrap();
+    let merged_home_dir = usage_all["home_dir"].as_str().unwrap();
+    assert_eq!(merged_home_dir, claude_home_dir);
+    assert!(
+        !merged_home_dir.contains("全部 Agent") && !merged_home_dir.contains("Google Drive"),
+        "home_dir 不應該是佔位字串: {merged_home_dir}"
+    );
+
+    assert_eq!(usage_missing_status, 404, "{usage_missing}");
+    assert_eq!(usage_missing["error"], "找不到該日期的使用量資料。");
+
+    // ---- monthly：真實舊格式（daily_breakdown 項目天生缺 agents）驗證優雅降級不 500 ----
+    assert_eq!(
+        monthly_all_status, 200,
+        "拿掉 #[serde(default)] 或合併邏輯壞掉都會讓這裡變 500: {monthly_all}"
+    );
+    assert_summary_fields_sum(&monthly_all, &monthly_claude, &monthly_codex, "monthly");
+    assert_agent_breakdown_matches_summaries(&monthly_all, &monthly_claude, &monthly_codex);
+
+    let claude_day = monthly_claude["daily_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["date"] == FIXTURE_DATE)
+        .unwrap();
+    let codex_day = monthly_codex["daily_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["date"] == FIXTURE_DATE)
+        .unwrap();
+    // fixture 前提：真實舊格式的來源資料本來就沒有巢狀 agents 欄位（見 fixture README）。
+    assert!(
+        claude_day.as_object().unwrap().get("agents").is_none(),
+        "fixture 前提破壞：來源資料不該有 agents 欄位，{claude_day}"
+    );
+    let merged_day = monthly_all["daily_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["date"] == FIXTURE_DATE)
+        .unwrap();
+    assert_eq!(
+        merged_day["total_tokens"].as_u64().unwrap(),
+        claude_day["total_tokens"].as_u64().unwrap() + codex_day["total_tokens"].as_u64().unwrap()
+    );
+    let merged_day_agents = merged_day["agents"].as_object().unwrap();
+    assert_eq!(merged_day_agents.len(), 2);
+    assert_eq!(
+        merged_day_agents["claude"]["total_tokens"],
+        claude_day["total_tokens"]
+    );
+    assert_eq!(
+        merged_day_agents["codex"]["total_tokens"],
+        codex_day["total_tokens"]
+    );
+
+    assert_eq!(monthly_missing_status, 404, "{monthly_missing}");
+    assert_eq!(monthly_missing["error"], "找不到該月份的使用量資料。");
+
+    // ---- yearly：同樣驗證真實舊格式（monthly_breakdown 項目天生缺 agents）優雅降級 ----
+    assert_eq!(
+        yearly_all_status, 200,
+        "拿掉 #[serde(default)] 或合併邏輯壞掉都會讓這裡變 500: {yearly_all}"
+    );
+    assert_summary_fields_sum(&yearly_all, &yearly_claude, &yearly_codex, "yearly");
+    assert_agent_breakdown_matches_summaries(&yearly_all, &yearly_claude, &yearly_codex);
+
+    let claude_month = yearly_claude["monthly_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["month"] == FIXTURE_MONTH)
+        .unwrap();
+    let codex_month = yearly_codex["monthly_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["month"] == FIXTURE_MONTH)
+        .unwrap();
+    assert!(
+        claude_month.as_object().unwrap().get("agents").is_none(),
+        "fixture 前提破壞：來源資料不該有 agents 欄位，{claude_month}"
+    );
+    let merged_month = yearly_all["monthly_breakdown"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["month"] == FIXTURE_MONTH)
+        .unwrap();
+    assert_eq!(
+        merged_month["total_tokens"].as_u64().unwrap(),
+        claude_month["total_tokens"].as_u64().unwrap()
+            + codex_month["total_tokens"].as_u64().unwrap()
+    );
+    let merged_month_agents = merged_month["agents"].as_object().unwrap();
+    assert_eq!(merged_month_agents.len(), 2);
+    assert_eq!(
+        merged_month_agents["claude"]["total_tokens"],
+        claude_month["total_tokens"]
+    );
+    assert_eq!(
+        merged_month_agents["codex"]["total_tokens"],
+        codex_month["total_tokens"]
+    );
+
+    assert_eq!(yearly_missing_status, 404, "{yearly_missing}");
+    assert_eq!(yearly_missing["error"], "找不到該年份的使用量資料。");
+}
+
+// PLAN.md 驗收條件 #7：session / rate-limit / model-sessions 三個需要明確單一來源的端點，
+// 帶 assistant=all 時仍須維持既有拒絕行為，不因這次放寬 dates/usage/monthly/yearly 而被誤放寬。
+#[test]
+fn all_scope_session_rate_limit_and_model_sessions_stay_rejected() {
+    let root = unique_temp_dir("all-scope-rejected");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+    std::fs::copy(two_assistant_snapshot_fixture_path(), &snapshot_path).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let result = if started {
+        Ok((
+            http_get(port, "/api/all/session/some-session"),
+            http_get(port, "/api/all/rate-limit"),
+            http_get(port, "/api/all/model-sessions"),
+        ))
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let (session_response, rate_limit_response, model_sessions_response) = result.unwrap();
+
+    let session_response = session_response.unwrap();
+    assert_eq!(
+        session_response.status, 400,
+        "body={}",
+        session_response.body
+    );
+
+    let rate_limit_response = rate_limit_response.unwrap();
+    assert_eq!(
+        rate_limit_response.status, 400,
+        "body={}",
+        rate_limit_response.body
+    );
+
+    // model-sessions 路由固定指向 unsupported_in_snapshot_mode（501），跟 assistant 參數無關。
+    let model_sessions_response = model_sessions_response.unwrap();
+    assert_eq!(
+        model_sessions_response.status, 501,
+        "body={}",
+        model_sessions_response.body
+    );
+}
+
+// 背景說明的相容性清單（非 PLAN.md 獨立編號驗收條件）：setup-info 也在 upstream
+// CHANGELOG 的相容性清單裡，一併確認放寬後仍能正常回應。
+#[test]
+fn all_scope_setup_info_still_responds_ok() {
+    let root = unique_temp_dir("all-scope-setup-info");
+    let insights_dir = root.join("insights");
+    std::fs::create_dir_all(&root).unwrap();
+    let snapshot_path = root.join("snapshot.json");
+    std::fs::copy(two_assistant_snapshot_fixture_path(), &snapshot_path).unwrap();
+
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let (mut child, started, lines) =
+        spawn_snapshot_server(&root, &insights_dir, &snapshot_path, port);
+
+    let response = if started {
+        http_get(port, "/api/all/setup-info")
+    } else {
+        Err(format!("snapshot 模式未啟動: {lines:?}"))
+    };
+
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(started, "snapshot 模式未啟動: {lines:?}");
+    let response = response.unwrap();
+    assert_eq!(response.status, 200, "body={}", response.body);
+}

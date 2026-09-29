@@ -8,6 +8,11 @@
 
 - Cloud Run 唯讀 snapshot 模式路由補齊 `/api/version`（回傳與正式模式一致的 `CARGO_PKG_VERSION`）
   與 mcode 助理，避免這次整合 upstream 後 snapshot 部署落後正式模式。
+- Cloud Run 唯讀 snapshot 模式新增支援 `assistant=all`（「全部 Agent」合併檢視）：`dates`／
+  `months`／`years`／`usage`／`monthly`／`yearly`／`setup-info` 這幾個唯讀報表端點跨已載入的
+  各 Agent 合併聯集與加總（daily/monthly/yearly 的 `agents` 分佈、`agent_breakdown`、
+  `projects`／`models` 排行皆比照本機標準模式的合併語意）；Session 詳情、Codex rate limit、
+  模型 Session 明細等需要明確來源的端點維持拒絕 `all`。
 
 ### 變更
 

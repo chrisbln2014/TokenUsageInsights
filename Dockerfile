@@ -5,6 +5,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY static ./static
 COPY pricing.csv ./
+COPY build.rs ./
+# .dockerignore 排除了 .git，build.rs 取不到 commit 日期；部署時用 --build-arg APP_BUILD_DATE=YYYY-MM-DD 傳入
+ARG APP_BUILD_DATE
 RUN cargo build --release
 
 FROM debian:bookworm-slim

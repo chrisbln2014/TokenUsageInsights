@@ -6,6 +6,22 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-10-15 - 修正整合 upstream v1.3.2 後 Cloud Run 映像無法建置
+
+- **問題**：整合 upstream v1.3.2 後，用 `Dockerfile` 建 Cloud Run 映像會在 `cargo build` 失敗。
+- **根因**：upstream `7d9a170` 新增 `build.rs`，產生編譯期環境變數 `APP_BUILD_DATE`，`src/main.rs` 以
+  `env!("APP_BUILD_DATE")` 讀取；`Dockerfile` 的 builder 階段只複製 `Cargo.toml`、`Cargo.lock`、`src`、
+  `static`、`pricing.csv`，沒有 `build.rs`，變數不存在即編譯錯誤。另外 `.dockerignore` 排除 `.git`，
+  即使有 `build.rs` 也取不到 commit 日期。
+- **修法**：builder 階段加 `COPY build.rs ./` 與 `ARG APP_BUILD_DATE`（`RUN` 之前），部署時可用
+  `--build-arg APP_BUILD_DATE=YYYY-MM-DD` 傳入日期；未傳時 `build_date` 為空字串，前端不顯示日期。
+- **影響檔案**：`Dockerfile`、`CHANGELOG.md`。
+- **驗證**：本機無 Docker，改以 Dockerfile `COPY` 行解析出的檔案組成無 `.git` 的建置目錄模擬：
+  無 `build.rs` → `error: environment variable APP_BUILD_DATE not defined at compile time`；
+  有 `build.rs` 並設 `APP_BUILD_DATE=2026-10-15` → 編譯成功，snapshot 模式 `/api/version` 回
+  `"build_date":"2026-10-15"`；未設 → `"build_date":""`，`/api/claude/dates` 皆 200。真正的
+  `docker build`／Cloud Build 尚待實測。
+
 ### 2026-09-23 - 修正 codex/claude/copilot/grok/pi/omp/muse 本地午夜前後被歸錯日期
 
 - **問題**：從 Claude Code 委派 codex 在本地時間凌晨執行，完成後看板日報查不到當天資料。

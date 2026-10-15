@@ -28,6 +28,9 @@
 
 - 修正 Cloud Run snapshot 模式下前端每 2 秒無限輪詢 `/api/version` 的問題：snapshot 模式沒有背景
   同步，但共用的版本端點永遠回報「初次同步未完成」；snapshot router 改用專屬端點，固定回報已完成同步。
+- 修正 Cloud Run 映像建置失敗：upstream v1.3.2 新增的 `build.rs` 會產生編譯期環境變數
+  `APP_BUILD_DATE`，但 `Dockerfile` 沒有複製它，`env!("APP_BUILD_DATE")` 直接編譯失敗。builder 階段改為
+  複製 `build.rs`，並新增 `ARG APP_BUILD_DATE`（映像內沒有 `.git`，建置日期需用 `--build-arg` 傳入，未傳則為空）。
 - 修正 Codex、Claude、Copilot（App／CLI Agent／VS Code Chat）、Grok、Pi、OMP、Muse 等助理的
   每日統計在本地時間午夜前後（UTC+8 為 00:00~07:59）被歸到前一天的問題：同步邏輯原本直接截取
   UTC timestamp 字串當日期，未轉換成本地時區；CLI／API 匯入路徑亦有同樣問題。Cursor 在對話缺少

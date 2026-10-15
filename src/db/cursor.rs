@@ -287,23 +287,25 @@ pub(super) fn open_cursor_state_db(state_db_path: &Path) -> Result<Connection, S
     .map_err(|error| format!("無法唯讀開啟 Cursor state.vscdb: {error}"))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|error| format!("設定 Cursor state.vscdb busy timeout 失敗: {error}"))?;
-    let has_cursor_disk_kv: bool = conn
-        .query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM sqlite_master
-                WHERE type = 'table' AND name = 'cursorDiskKV'
-            )",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))?;
-    if !has_cursor_disk_kv {
-        return Err("Cursor state.vscdb 缺少 cursorDiskKV 表".to_string());
-    }
     Ok(conn)
 }
 
+fn cursor_state_has_disk_kv_table(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'cursorDiskKV'
+        )",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("檢查 Cursor cursorDiskKV 表失敗: {error}"))
+}
+
 fn cursor_state_max_rowid(conn: &Connection) -> Result<i64, String> {
+    if !cursor_state_has_disk_kv_table(conn)? {
+        return Ok(0);
+    }
     conn.query_row(
         "SELECT COALESCE(MAX(rowid), 0) FROM cursorDiskKV",
         [],
@@ -943,20 +945,45 @@ pub(super) fn parse_cursor_session_file(
     Ok(results)
 }
 
+#[cfg(test)]
 pub(super) fn sync_cursor_usage_logs(
     conn: &mut Connection,
     cursor_dir: &Path,
 ) -> Result<(), String> {
+    sync_cursor_usage_logs_with_cancel(conn, cursor_dir, &|| false)
+}
+
+pub(super) fn sync_cursor_usage_logs_with_cancel(
+    conn: &mut Connection,
+    cursor_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_cursor_usage_logs_with_ledger_and_cancel(
+        conn,
+        cursor_dir,
+        &get_cursor_state_db_path(),
+        should_cancel,
+    )
+}
+
+pub(super) fn sync_cursor_usage_logs_with_ledger_and_cancel(
+    conn: &mut Connection,
+    cursor_dir: &Path,
+    state_db_path: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     run_cursor_model_attribution_migration(conn)?;
     run_cursor_cache_tokens_unknown_migration(conn)?;
 
-    let state_db_path = get_cursor_state_db_path();
     let source_id = if state_db_path.exists() {
-        let source_id = cursor_model_source_id(&state_db_path);
-        if let Err(error) = sync_cursor_session_metadata(conn, &state_db_path) {
+        let source_id = cursor_model_source_id(state_db_path);
+        if let Err(error) = sync_cursor_session_metadata(conn, state_db_path) {
             eprintln!("同步 Cursor composerData Session 中繼資料失敗: {error}");
         }
-        if let Err(error) = sync_cursor_model_signatures(conn, &state_db_path) {
+        if let Err(error) = sync_cursor_model_signatures(conn, state_db_path) {
             eprintln!("同步 Cursor agentKv 模型資訊失敗: {error}");
         }
         Some(source_id)
@@ -984,29 +1011,33 @@ pub(super) fn sync_cursor_usage_logs(
         return Ok(());
     }
 
-    let files = find_jsonl_files(&projects_dir);
+    let sync_states = super::load_sync_state_for_prefix(conn, "cursor");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> = find_jsonl_files(&projects_dir)
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = fs::metadata(&filepath).ok()?;
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((filepath, metadata.len(), mtime))
+        })
+        .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
 
-    for filepath in files {
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
+
         let state_path = filepath
             .strip_prefix(cursor_dir)
             .unwrap_or(&filepath)
             .to_string_lossy()
             .into_owned();
-        let state_key = format!("cursor:{}", state_path);
+        let state_key = source_sync_key("cursor", cursor_dir, &state_path);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
 
         if current_size != last_synced_size {
             let parsed_entries = match parse_cursor_session_file(
@@ -1127,6 +1158,8 @@ pub(super) fn sync_cursor_usage_logs(
                 if update_state_res.is_ok() {
                     if let Err(e) = tx.commit() {
                         eprintln!("Transaction COMMIT 失敗: {}", e);
+                    } else {
+                        super::bump_sync_data_revision();
                     }
                 }
             }
@@ -1520,6 +1553,33 @@ mod tests {
         assert_eq!(values, [None; 8]);
         assert_eq!(measured_values, [10, 20, 30, 40, 1, 2, 3, 4]);
         assert_eq!(migration_count, 1);
+    }
+
+    #[test]
+    fn cursor_state_db_without_cursor_disk_kv_table_is_treated_as_empty() {
+        let state_db_path = temp_jsonl_path("cursor-state-no-disk-kv").with_extension("vscdb");
+        let writer = Connection::open(&state_db_path).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE ItemTable (
+                    key TEXT UNIQUE ON CONFLICT REPLACE,
+                    value BLOB
+                 );
+                 INSERT INTO ItemTable (key, value) VALUES ('workbench.panel', X'7B7D');",
+            )
+            .unwrap();
+        drop(writer);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let metadata_source_id = sync_cursor_session_metadata(&mut conn, &state_db_path)
+            .expect("missing cursorDiskKV table should not fail session metadata sync");
+        let model_source_id = sync_cursor_model_signatures(&mut conn, &state_db_path)
+            .expect("missing cursorDiskKV table should not fail model signature sync");
+        assert_eq!(metadata_source_id, model_source_id);
+
+        let _ = fs::remove_file(&state_db_path);
     }
 
     #[test]

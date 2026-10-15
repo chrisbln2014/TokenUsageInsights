@@ -308,7 +308,7 @@ impl PreparedPricingRules {
         contains_match: bool,
     ) -> Option<usize> {
         let mut best_rule = None;
-        let mut best_base_len = 0;
+        let mut best_distance = usize::MAX;
         let mut best_has_threshold = false;
 
         for (index, prepared) in self.parsed.iter().enumerate() {
@@ -322,14 +322,20 @@ impl PreparedPricingRules {
                 continue;
             }
 
-            let base_len = prepared.base.len();
+            // 以規則名稱與模型名稱的長度差距作為「貼近程度」：
+            // - 模型名稱包含規則名稱（例如 `claude-opus-5-1m · high` 對 `Claude Opus 5`）
+            //   時，較長的規則名稱更具體，差距也較小；
+            // - 規則名稱包含模型名稱（例如 `opus-5` 對 `Claude Opus 5`）時，
+            //   較短的規則才是正確對象，避免被 `Claude Opus 5.5-fast` 之類的
+            //   更長名稱搶走。
+            let distance = prepared.base.len().abs_diff(model_base.len());
             let has_threshold = prepared.threshold.is_some();
-            let is_more_specific = base_len > best_base_len;
-            let is_same_base_with_threshold =
-                base_len == best_base_len && has_threshold && !best_has_threshold;
-            if best_rule.is_none() || is_more_specific || is_same_base_with_threshold {
+            let is_closer = distance < best_distance;
+            let is_same_distance_with_threshold =
+                distance == best_distance && has_threshold && !best_has_threshold;
+            if best_rule.is_none() || is_closer || is_same_distance_with_threshold {
                 best_rule = Some(index);
-                best_base_len = base_len;
+                best_distance = distance;
                 best_has_threshold = has_threshold;
             }
         }
@@ -528,6 +534,180 @@ mod tests {
                 "unexpected Opus 5 cost for {model_name}: {cost}"
             );
         }
+    }
+
+    /// 針對同一組模型標籤逐一驗證：各 1M 輸入、輸出與快取讀取 Token 的總成本。
+    fn assert_packaged_cost_per_million(
+        rules: &[PricingRule],
+        model_names: &[&str],
+        expected: f64,
+        label: &str,
+    ) {
+        for model_name in model_names {
+            let cost = calculate_usage_cost(
+                rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|err| panic!("{label} pricing missing for {model_name}: {err}"));
+
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected {label} cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_opus_5_5_variants_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 輸入 $4 + 輸出 $20 + 快取讀取 $0.20（0.05x）
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-opus-5-5",
+                "Claude Opus 5.5",
+                "claude-opus-5-5-1m · high",
+                "opus-5-5",
+            ],
+            24.2,
+            "Opus 5.5",
+        );
+    }
+
+    #[test]
+    fn claude_opus_5_5_fast_mode_uses_doubled_pricing() {
+        let rules = load_pricing_rules();
+
+        // Fast Mode 為 2x：輸入 $8 + 輸出 $40 + 快取讀取 $0.40
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-opus-5-5-fast",
+                "Claude Opus 5.5-fast",
+                "claude-opus-5-5-fast · high",
+            ],
+            48.4,
+            "Opus 5.5 fast",
+        );
+    }
+
+    #[test]
+    fn claude_sonnet_5_5_variants_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 輸入 $2 + 輸出 $10 + 快取讀取 $0.10（0.05x）
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-sonnet-5-5",
+                "Claude Sonnet 5.5",
+                "claude-sonnet-5-5-1m · high",
+            ],
+            12.1,
+            "Sonnet 5.5",
+        );
+    }
+
+    #[test]
+    fn claude_sonnet_5_uses_standard_price_after_launch_pricing_became_permanent() {
+        let rules = load_pricing_rules();
+
+        // 官方已將 $2 / $10 上市價轉為正式價，快取讀取維持 0.1x 即 $0.20；
+        // 同時確認不會誤配到 Sonnet 5.5 的規則。
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                "claude-sonnet-5 · high",
+            ],
+            12.2,
+            "Sonnet 5",
+        );
+    }
+
+    #[test]
+    fn claude_haiku_5_5_context_tiers_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        // 1. Short context (prompt tokens <= 100k): $0.10 / $0.01 / $0.50 per 1M tokens
+        for model_name in [
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            "Claude Haiku 5.5 (<100k)",
+            "claude-haiku-5.5",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                40_000,
+                10_000,
+                30_000,
+                20_000,
+                10_000,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            let expected = (40_000.0 / 1_000_000.0) * 0.10
+                + (30_000.0 / 1_000_000.0) * 0.01
+                + (20_000.0 / 1_000_000.0) * (0.10 * 1.25)
+                + (10_000.0 / 1_000_000.0) * (0.10 * 2.0)
+                + (10_000.0 / 1_000_000.0) * 0.50;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected short-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 2. Long context (prompt tokens > 100k): $0.50 / $0.05 / $2.50 per 1M tokens
+        for model_name in [
+            "claude-haiku-5-5",
+            "Claude Haiku 5.5",
+            "Claude Haiku 5.5 (>100k)",
+            "claude-haiku-5.5",
+        ] {
+            let cost =
+                calculate_usage_cost(&rules, Some(model_name), 60_000, 10_000, 30_000, 10_001, 0)
+                    .unwrap_or_else(|error| {
+                        panic!("{model_name} should have a pricing rule: {error}")
+                    });
+
+            let expected = (60_000.0 / 1_000_000.0) * 0.50
+                + (30_000.0 / 1_000_000.0) * 0.05
+                + (10_001.0 / 1_000_000.0) * (0.50 * 1.25)
+                + (10_000.0 / 1_000_000.0) * 2.50;
+            assert!(
+                (cost - expected).abs() < 1e-9,
+                "unexpected long-context cost for {model_name}: {cost}"
+            );
+        }
+
+        // 3. Regression test for session_id=c3e4ba13-5d3e-43aa-b96b-16d97d7c1224
+        // Turn 1: input=2, output=5, cache_read=17,871, cache_write_5m=62,584 -> prompt=80,457 (<=100k)
+        let turn_1_cost =
+            calculate_usage_cost(&rules, Some("claude-haiku-5-5"), 2, 5, 17_871, 62_584, 0)
+                .expect("claude-haiku-5-5 turn 1 cost should calculate successfully");
+        let expected_turn_1 = (2.0 / 1_000_000.0) * 0.10
+            + (17_871.0 / 1_000_000.0) * 0.01
+            + (62_584.0 / 1_000_000.0) * 0.125
+            + (5.0 / 1_000_000.0) * 0.50;
+        assert!((turn_1_cost - expected_turn_1).abs() < 1e-9);
+
+        // Turn 6: input=2, output=8, cache_read=98,807, cache_write_5m=3,546 -> prompt=102,355 (>100k)
+        let turn_6_cost =
+            calculate_usage_cost(&rules, Some("claude-haiku-5-5"), 2, 8, 98_807, 3_546, 0)
+                .expect("claude-haiku-5-5 turn 6 cost should calculate successfully");
+        let expected_turn_6 = (2.0 / 1_000_000.0) * 0.50
+            + (98_807.0 / 1_000_000.0) * 0.05
+            + (3_546.0 / 1_000_000.0) * 0.625
+            + (8.0 / 1_000_000.0) * 2.50;
+        assert!((turn_6_cost - expected_turn_6).abs() < 1e-9);
     }
 
     #[test]
@@ -803,6 +983,50 @@ mod tests {
         let flash_1 =
             calculate_usage_cost(&rules, Some("mai-code-1-flash"), 1_000_000, 0, 0, 0, 0).unwrap();
         assert!((flash_1 - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn gemini_4_argon_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Argon",
+            "Gemini 4 Argon (Medium)",
+            "Gemini 4 Argon (High)",
+            "Gemini 4 Argon (Low)",
+            "gemini-4-argon",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap();
+
+            // Standard input 4.00 + cache read 0.20 (95% off) + output 20.00 = 24.20
+            assert!(
+                (cost - 24.20).abs() < 1e-9,
+                "unexpected Gemini 4 Argon cost for {model_name}: {cost}"
+            );
+        }
+
+        // Regression test for session_id=575e5267-0e01-4a17-acb1-3174ccbe5b61 turn_no=1
+        let turn_1_cost = calculate_usage_cost(
+            &rules,
+            Some("Gemini 4 Argon (Medium)"),
+            18_389,
+            191,
+            0,
+            0,
+            0,
+        )
+        .expect("Gemini 4 Argon (Medium) turn 1 cost should calculate successfully");
+        let expected_turn_1 = (18_389.0 / 1_000_000.0) * 4.00 + (191.0 / 1_000_000.0) * 20.00;
+        assert!((turn_1_cost - expected_turn_1).abs() < 1e-9);
     }
 
     #[test]

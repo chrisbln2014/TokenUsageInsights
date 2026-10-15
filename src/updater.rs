@@ -371,11 +371,11 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
     use std::os::windows::ffi::OsStringExt;
 
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -456,11 +456,11 @@ fn get_process_cmdline(pid: u32) -> Option<Vec<String>> {
 #[cfg(windows)]
 fn get_process_ppid(pid: u32) -> Option<u32> {
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -803,11 +803,11 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
 #[cfg(windows)]
 fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -878,7 +878,7 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
 
         while all_u16.len() * 2 < MAX_ENV_BYTES {
             let bytes_to_page_end = 4096 - (curr_ptr & 0xFFF);
-            let read_size = bytes_to_page_end.max(512).min(4096);
+            let read_size = bytes_to_page_end.clamp(512, 4096);
             let mut page_buf = vec![0u8; read_size];
             let mut chunk_bytes_read = 0usize;
 
@@ -901,8 +901,8 @@ fn get_process_relevant_envs(pid: u32) -> Option<Vec<(String, String)>> {
 
             // 檢查是否已出現雙重 NUL 結尾
             let mut start = 0;
-            for i in 0..all_u16.len() {
-                if all_u16[i] == 0 {
+            for (i, &unit) in all_u16.iter().enumerate() {
+                if unit == 0 {
                     if i == start {
                         block_terminated = true;
                         break;
@@ -951,11 +951,11 @@ fn get_process_cwd(pid: u32) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
 
     unsafe {
-        let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr());
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         if ntdll.is_null() {
             return None;
         }
-        let func_ptr = GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr());
+        let func_ptr = GetProcAddress(ntdll, c"NtQueryInformationProcess".as_ptr().cast());
         if func_ptr.is_null() {
             return None;
         }
@@ -1527,34 +1527,14 @@ pub fn parse_config_yaml(content: &str) -> (Option<bool>, Option<i64>) {
 }
 
 pub fn load_update_config() -> (Option<bool>, Option<i64>) {
-    let mut candidates = vec![crate::db::get_insights_dir().join("config.yaml")];
-
-    #[cfg(windows)]
-    if let Some(data_dir) = dirs::data_local_dir() {
-        let def = data_dir.join("TokenUsageInsights").join("config.yaml");
-        if !candidates.contains(&def) {
-            candidates.push(def);
+    match crate::config::read_config_file() {
+        Ok(Some((_, content))) => parse_config_yaml(&content),
+        Ok(None) => (None, None),
+        Err(error) => {
+            eprintln!("⚠️ {error}");
+            (None, None)
         }
     }
-    #[cfg(not(windows))]
-    if let Some(home) = dirs::home_dir() {
-        let def = home.join(".token-usage-insights").join("config.yaml");
-        if !candidates.contains(&def) {
-            candidates.push(def);
-        }
-    }
-
-    let local_cfg = PathBuf::from("config.yaml");
-    if !candidates.contains(&local_cfg) {
-        candidates.push(local_cfg);
-    }
-
-    for path in candidates {
-        if let Ok(content) = fs::read_to_string(&path) {
-            return parse_config_yaml(&content);
-        }
-    }
-    (None, None)
 }
 
 #[cfg(unix)]
@@ -7092,6 +7072,8 @@ update_check_interval: 5 # check every 5 days
         let leftovers: Vec<String> = fs::read_dir(&readonly_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            // 以 root 執行時寫入會成功，目標檔本身不算殘留暫存檔
+            .filter(|name| !(res.is_ok() && name == ".committed"))
             .collect();
         assert!(
             leftovers.is_empty(),

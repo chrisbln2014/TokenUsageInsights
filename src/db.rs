@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 mod claude;
@@ -14,7 +14,65 @@ mod cursor;
 use claude::{find_claude_session_files, parse_claude_session_file};
 use codex::{find_codex_session_files, parse_codex_session_file_with_diagnostics};
 pub(crate) use cursor::parse_cursor_timestamp;
+#[cfg(test)]
 use cursor::sync_cursor_usage_logs;
+
+static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static INITIAL_SYNC_COMPLETED: AtomicBool = AtomicBool::new(false);
+static SYNC_DATA_REVISION: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SyncRuntimeStatus {
+    pub syncing: bool,
+    pub initial_sync_completed: bool,
+    pub data_revision: u64,
+}
+
+pub fn set_sync_in_progress(in_progress: bool) {
+    SYNC_IN_PROGRESS.store(in_progress, Ordering::Relaxed);
+}
+
+pub fn mark_initial_sync_completed() {
+    INITIAL_SYNC_COMPLETED.store(true, Ordering::Relaxed);
+}
+
+pub fn bump_sync_data_revision() {
+    SYNC_DATA_REVISION.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn get_sync_runtime_status() -> SyncRuntimeStatus {
+    SyncRuntimeStatus {
+        syncing: SYNC_IN_PROGRESS.load(Ordering::Relaxed),
+        initial_sync_completed: INITIAL_SYNC_COMPLETED.load(Ordering::Relaxed),
+        data_revision: SYNC_DATA_REVISION.load(Ordering::Relaxed),
+    }
+}
+
+pub(crate) fn load_sync_state_for_prefix(
+    conn: &Connection,
+    prefix: &str,
+) -> HashMap<String, (u64, i64)> {
+    let mut map = HashMap::new();
+    let pattern = format!("{prefix}:%");
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT filename, last_synced_size, last_synced_time FROM sync_state WHERE filename LIKE ?1",
+    ) else {
+        return map;
+    };
+    let Ok(rows) = stmt.query_map(params![pattern], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, u64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    }) else {
+        return map;
+    };
+    for (filename, size, time) in rows.flatten() {
+        map.insert(filename, (size, time));
+    }
+    map
+}
 
 fn find_jsonl_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -158,7 +216,7 @@ pub struct UsageImportRollbackSummary {
     pub removed_records: usize,
 }
 
-const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v7";
+const CODEX_PARSER_MIGRATION_KEY: &str = "migration:codex_session_identity_v9";
 const CODEX_SOURCE_KIND_MIGRATION_KEY: &str = "migration:codex_source_kind_v1";
 const CODEX_ROLLOUT_IDENTITY_MIGRATION_KEY: &str = "migration:codex_rollout_identity_v1";
 const CODEX_CLI_SOURCE_KIND: &str = "codex-cli";
@@ -715,6 +773,11 @@ pub fn get_db_conn() -> Result<Connection, String> {
 
     let conn = Connection::open(&db_path).map_err(|e| format!("無法開啟資料庫: {}", e))?;
     let _ = conn.busy_timeout(std::time::Duration::from_millis(15000));
+    let _ = conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
+         PRAGMA temp_store = MEMORY;",
+    );
     Ok(conn)
 }
 
@@ -946,6 +1009,18 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("建立助理類型索引 idx_assistant_type 失敗: {}", e))?;
 
     conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_date ON usage_entries(assistant_type, date)",
+        [],
+    )
+    .map_err(|e| format!("建立助理與日期複合索引 idx_assistant_date 失敗: {}", e))?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_assistant_session ON usage_entries(assistant_type, session_id)",
+        [],
+    )
+    .map_err(|e| format!("建立助理與會話複合索引 idx_assistant_session 失敗: {}", e))?;
+
+    conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_assistant_transcript_path
          ON usage_entries(assistant_type, transcript_path)",
         [],
@@ -953,6 +1028,22 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
     .map_err(|e| {
         format!(
             "建立 transcript 路徑索引 idx_assistant_transcript_path 失敗: {}",
+            e
+        )
+    })?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_codex_local_transcript_path
+         ON usage_entries(transcript_path)
+         WHERE assistant_type = 'codex'
+           AND transcript_path IS NOT NULL
+           AND import_source_id IS NULL
+           AND import_batch_id IS NULL",
+        [],
+    )
+    .map_err(|e| {
+        format!(
+            "建立 Codex 本機 transcript 索引 idx_codex_local_transcript_path 失敗: {}",
             e
         )
     })?;
@@ -1458,8 +1549,8 @@ fn normalize_legacy_claude_usage_entry(entry: &mut UsageEntry) {
     normalize_legacy_claude_token_stats(&mut entry.delta_tokens);
 }
 
-fn get_antigravity_session_name(session_id: &str) -> Option<String> {
-    let path = get_antigravity_dir()
+fn get_antigravity_session_name(base_dir: &Path, session_id: &str) -> Option<String> {
+    let path = base_dir
         .join("brain")
         .join(session_id)
         .join(".system_generated/logs/transcript_full.jsonl");
@@ -1505,8 +1596,110 @@ fn get_antigravity_session_name(session_id: &str) -> Option<String> {
     selector.into_name()
 }
 
-fn get_copilot_session_name(session_id: &str) -> Option<String> {
-    let copilot_dir = get_copilot_dir();
+/// Native records supersede hook snapshots only for the same source/session.
+fn sync_antigravity_usage_logs_with_cancel(
+    conn: &mut Connection,
+    root: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let root = crate::config::absolute_root(root);
+    sync_hook_usage_logs_with_cancel(conn, "antigravity", &root, should_cancel)?;
+    let source_key = encode_hex(root.as_os_str().as_encoded_bytes());
+    let source_kind = crate::antigravity::SOURCE_KIND;
+    let sync_states = load_sync_state_for_prefix(conn, "antigravity");
+    for path in crate::antigravity::find_session_files(&root)? {
+        if should_cancel() {
+            return Ok(());
+        }
+        let session_id =
+            crate::antigravity::session_id(&path).ok_or("無效的 Antigravity session 路徑")?;
+        let transcript = path.to_string_lossy().into_owned();
+        let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+        // Metadata may arrive after the transcript (including in SQLite WAL).
+        // Include all source revisions so a later model resolution is imported.
+        let modified = {
+            use std::hash::{Hash, Hasher};
+            let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
+            crate::antigravity::PARSER_VERSION.hash(&mut fingerprint);
+            for file in [
+                path.clone(),
+                root.join("conversations").join(format!("{session_id}.db")),
+                root.join("conversations")
+                    .join(format!("{session_id}.db-wal")),
+            ] {
+                if let Ok(meta) = fs::metadata(file) {
+                    meta.len().hash(&mut fingerprint);
+                    meta.modified().ok().hash(&mut fingerprint);
+                }
+            }
+            (fingerprint.finish() & i64::MAX as u64) as i64
+        };
+        let state_key =
+            source_sync_key("antigravity", &root, &portable_relative_path(&root, &path));
+        let legacy_rows: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM usage_entries WHERE assistant_type = 'antigravity'
+             AND source_kind = 'legacy' AND session_id = ? AND transcript_path = ?)",
+                params![session_id, transcript],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if sync_states.get(&state_key) == Some(&(metadata.len(), modified)) && !legacy_rows {
+            continue;
+        }
+        // Wait for the writer to finish its last line before replacing a snapshot.
+        if metadata.len() > 0 {
+            let mut file = File::open(&path).map_err(|e| e.to_string())?;
+            file.seek(SeekFrom::End(-1)).map_err(|e| e.to_string())?;
+            let mut byte = [0];
+            file.read_exact(&mut byte).map_err(|e| e.to_string())?;
+            if byte[0] != b'\n' {
+                continue;
+            }
+        }
+        let mut entries = match crate::antigravity::parse_session(&path) {
+            Ok(entries) => entries,
+            Err(error) => {
+                eprintln!("解析 Antigravity session {} 失敗: {error}", path.display());
+                continue;
+            }
+        };
+        // Old transcripts may lack usage entirely. Preserve their hook records.
+        if entries.is_empty() {
+            continue;
+        }
+        let name = get_antigravity_session_name(&root, session_id);
+        for entry in &mut entries {
+            entry.source_dir_key = Some(source_key.clone());
+            entry.session_name = name.clone();
+            if entry.model.is_none() {
+                entry.model = Some("Unknown Model".to_owned());
+            }
+        }
+        if should_cancel() {
+            return Ok(());
+        }
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM usage_entries WHERE assistant_type = 'antigravity' AND session_id = ?
+             AND ((source_kind = ? AND source_dir_key = ?)
+                  OR (source_kind = 'legacy' AND transcript_path = ?))",
+            params![session_id, source_kind, source_key, transcript],
+        )
+        .map_err(|e| e.to_string())?;
+        register_usage_source_directory(&tx, "antigravity", source_kind, &source_key, &root)?;
+        insert_usage_entries(&tx, "antigravity", "Antigravity", &entries)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, ?, ?)",
+            params![state_key, metadata.len() as i64, modified],
+        ).map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())?;
+        bump_sync_data_revision();
+    }
+    Ok(())
+}
+
+fn get_copilot_session_name(copilot_dir: &Path, session_id: &str) -> Option<String> {
     let events_path = copilot_dir
         .join("session-state")
         .join(session_id)
@@ -1561,12 +1754,52 @@ fn get_copilot_session_name(session_id: &str) -> Option<String> {
     selector.into_name()
 }
 
+pub(crate) fn hook_transcript_path(
+    base_dir: &Path,
+    assistant: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if !crate::session_files::is_safe_session_id(session_id) {
+        return None;
+    }
+    let paths = if assistant == "antigravity" {
+        vec![base_dir
+            .join("brain")
+            .join(session_id)
+            .join(".system_generated/logs/transcript_full.jsonl")]
+    } else {
+        vec![
+            base_dir
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl"),
+            base_dir
+                .join("session-state")
+                .join(format!("{session_id}.jsonl")),
+        ]
+    };
+    paths.into_iter().find(|path| path.is_file())
+}
+
 /// Sync usage logs for hooks-based assistant (Antigravity or Copilot)
+#[cfg(test)]
 fn sync_hook_usage_logs(
     conn: &mut Connection,
     assistant_type: &str,
     base_dir: &Path,
 ) -> Result<(), String> {
+    sync_hook_usage_logs_with_cancel(conn, assistant_type, base_dir, &|| false)
+}
+
+fn sync_hook_usage_logs_with_cancel(
+    conn: &mut Connection,
+    assistant_type: &str,
+    base_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     if assistant_type == "antigravity" {
         // Perform migration if we haven't tracked it yet to update antigravity session names
         let migration_done: bool = conn
@@ -1605,19 +1838,28 @@ fn sync_hook_usage_logs(
         "legacy"
     };
 
-    for entry in entries.flatten() {
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
+    let sync_states = load_sync_state_for_prefix(conn, assistant_type);
+    let mut usage_files: Vec<(String, PathBuf, u64)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_file() {
+                return None;
+            }
+            let filename = entry.file_name().to_string_lossy().into_owned();
+            if !filename.starts_with("usage-") || !filename.ends_with(".jsonl") {
+                return None;
+            }
+            let current_size = entry.metadata().ok()?.len();
+            Some((filename, entry.path(), current_size))
+        })
+        .collect();
+    // Sort newest-first so today's / recent usage logs are synced before older days
+    usage_files.sort_by(|left, right| right.0.cmp(&left.0));
 
-        if !file_type.is_file() {
-            continue;
-        }
-
-        let filename = entry.file_name().to_string_lossy().into_owned();
-        if !filename.starts_with("usage-") || !filename.ends_with(".jsonl") {
-            continue;
+    for (filename, filepath, current_size) in usage_files {
+        if should_cancel() {
+            return Ok(());
         }
 
         let date_str = filename
@@ -1625,25 +1867,13 @@ fn sync_hook_usage_logs(
             .trim_end_matches(".jsonl")
             .to_string();
 
-        let filepath = entry.path();
-
         // Scope the sync_state key with the assistant prefix to prevent key collision
-        let state_key = format!("{}:{}", assistant_type, filename);
+        let state_key = source_sync_key(assistant_type, base_dir, &filename);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let mut file =
-            File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
-        let metadata = file
-            .metadata()
-            .map_err(|e| format!("無法取得檔案資訊 {}: {}", filename, e))?;
-        let current_size = metadata.len();
 
         let start_pos = if current_size < last_synced_size {
             0
@@ -1652,6 +1882,8 @@ fn sync_hook_usage_logs(
         };
 
         if current_size > start_pos {
+            let mut file =
+                File::open(&filepath).map_err(|e| format!("無法開啟日誌檔 {}: {}", filename, e))?;
             file.seek(SeekFrom::Start(start_pos))
                 .map_err(|e| format!("Seek 失敗 {}: {}", filename, e))?;
             let mut buffer = Vec::new();
@@ -1677,13 +1909,43 @@ fn sync_hook_usage_logs(
                     continue;
                 }
 
+                for entry in &mut parsed_entries {
+                    if let Some(path) =
+                        hook_transcript_path(base_dir, assistant_type, &entry.session_id)
+                    {
+                        entry.transcript_path = Some(path.to_string_lossy().into_owned());
+                    }
+                }
+
                 let tx = conn
                     .transaction()
                     .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
 
                 let mut success = true;
                 let mut resolved_names = HashMap::<String, Option<String>>::new();
+                let mut session_names_to_update = HashMap::<String, String>::new();
                 for entry in &parsed_entries {
+                    // Once native usage is authoritative, hook updates must not
+                    // reintroduce totals while a transcript is being written or
+                    // temporarily unreadable. Matching the path isolates roots.
+                    if assistant_type == "antigravity" {
+                        let native_exists: bool = tx
+                            .query_row(
+                                "SELECT EXISTS(SELECT 1 FROM usage_entries
+                             WHERE assistant_type = 'antigravity' AND source_kind = ?
+                             AND session_id = ? AND transcript_path = ?)",
+                                params![
+                                    crate::antigravity::SOURCE_KIND,
+                                    entry.session_id,
+                                    entry.transcript_path.as_deref()
+                                ],
+                                |row| row.get(0),
+                            )
+                            .map_err(|e| format!("檢查 Antigravity 原生使用量失敗: {e}"))?;
+                        if native_exists {
+                            continue;
+                        }
+                    }
                     let tokens = entry.tokens.as_ref();
                     let delta = entry.delta_tokens.as_ref();
                     let cost = entry.cost.as_ref();
@@ -1691,12 +1953,18 @@ fn sync_hook_usage_logs(
                     let resolved_name = resolved_names
                         .entry(entry.session_id.clone())
                         .or_insert_with(|| match assistant_type {
-                            "antigravity" => get_antigravity_session_name(&entry.session_id),
-                            "copilot" => get_copilot_session_name(&entry.session_id),
+                            "antigravity" => {
+                                get_antigravity_session_name(base_dir, &entry.session_id)
+                            }
+                            "copilot" => get_copilot_session_name(base_dir, &entry.session_id),
                             _ => None,
                         })
                         .clone()
                         .or_else(|| entry.session_name.clone());
+
+                    if let Some(name) = &resolved_name {
+                        session_names_to_update.insert(entry.session_id.clone(), name.clone());
+                    }
 
                     let insert_res = tx.execute(
                         "INSERT OR IGNORE INTO usage_entries (
@@ -1744,15 +2012,17 @@ fn sync_hook_usage_logs(
                         success = false;
                         break;
                     }
+                }
 
-                    if let Some(name) = resolved_name.as_deref() {
+                if success {
+                    for (session_id, name) in &session_names_to_update {
                         if let Err(error) = tx.execute(
                             "UPDATE usage_entries
                              SET session_name = ?
                              WHERE assistant_type = ?
                                AND source_kind = ?
                                AND session_id = ?",
-                            params![name, assistant_type, source_kind, entry.session_id],
+                            params![name, assistant_type, source_kind, session_id],
                         ) {
                             eprintln!("[{}] 更新會話名稱失敗: {}", assistant_type, error);
                             success = false;
@@ -1775,6 +2045,8 @@ fn sync_hook_usage_logs(
                     if update_state_res.is_ok() {
                         if let Err(e) = tx.commit() {
                             eprintln!("Transaction COMMIT 失敗: {}", e);
+                        } else {
+                            bump_sync_data_revision();
                         }
                     }
                 }
@@ -1873,23 +2145,33 @@ fn vscode_sync_signature(filepath: &Path, metadata: &fs::Metadata) -> (u64, i64)
     (size, modified)
 }
 
-fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
+fn sync_vscode_chat_sessions_from_with_cancel(
+    conn: &mut Connection,
+    roots: &[PathBuf],
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     let mut seen_sessions = HashSet::new();
+    let sync_states = load_sync_state_for_prefix(conn, "vscode");
 
-    for filepath in crate::vscode::discover_session_files() {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
+    let mut session_files: Vec<(PathBuf, u64, i64)> = crate::vscode::session_files_in(roots)
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = fs::metadata(&filepath).ok()?;
+            let (current_size, modified_time) = vscode_sync_signature(&filepath, &metadata);
+            Some((filepath, current_size, modified_time))
+        })
+        .collect();
+    session_files.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, modified_time) in session_files {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_key = format!("vscode:{}", filepath.to_string_lossy());
-        let previous_state: Option<(u64, i64)> = conn
-            .query_row(
-                "SELECT last_synced_size, last_synced_time FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
+        let previous_state: Option<(u64, i64)> = sync_states.get(&state_key).copied();
 
         if previous_state == Some((current_size, modified_time)) {
             continue;
@@ -1946,6 +2228,7 @@ fn sync_vscode_chat_sessions(conn: &mut Connection) -> Result<(), String> {
         .map_err(|error| format!("更新 VS Code 同步狀態失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 VS Code 同步交易失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -1971,12 +2254,11 @@ fn run_codex_parser_migration(conn: &mut Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("修正 Codex self-parent 資料失敗: {}", e))?;
+        // Additional roots use absolute transcript paths in their cursor keys.
+        // Reset those too so existing child titles receive the parser fix.
         tx.execute(
             "DELETE FROM sync_state
-             WHERE filename LIKE 'codex:sessions/%'
-                OR filename LIKE 'codex:sessions\\%'
-                OR filename LIKE 'codex:archived_sessions/%'
-                OR filename LIKE 'codex:archived_sessions\\%'",
+             WHERE filename LIKE 'codex:%' AND filename NOT LIKE 'codex:claude:%'",
             [],
         )
         .map_err(|e| format!("清除 Codex 同步狀態失敗: {}", e))?;
@@ -2129,6 +2411,33 @@ fn run_codex_rollout_identity_migration(conn: &mut Connection) -> Result<(), Str
         .map_err(|error| format!("Codex rollout 身分遷移 COMMIT 失敗: {error}"))
 }
 
+/// Source-scoped cursors prevent equal relative names/sizes on different
+/// computers from hiding new usage. Keep the assistant prefix for migrations.
+fn source_sync_key(assistant: &str, root: &Path, relative_path: &str) -> String {
+    let root = crate::config::absolute_root(root);
+    let primary = match assistant {
+        "antigravity" => get_antigravity_dir(),
+        "copilot" => get_copilot_dir(),
+        "claude" => get_claude_dir(),
+        "cursor" => get_cursor_dir(),
+        "grok" => get_grok_dir(),
+        "pi" => get_pi_dir(),
+        "omp" => get_omp_dir(),
+        "muse" => get_muse_dir(),
+        "mcode" => get_mcode_dir(),
+        _ => root.clone(),
+    };
+    // Preserve the primary home's existing cursor, particularly hook offsets:
+    // replaying old hook rows can resurrect totals already split into agents.
+    if root == crate::config::absolute_root(&primary) {
+        return format!("{assistant}:{relative_path}");
+    }
+    format!(
+        "{assistant}:source:{}:{relative_path}",
+        encode_hex(root.as_os_str().as_encoded_bytes())
+    )
+}
+
 fn portable_relative_path(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -2247,8 +2556,12 @@ fn decode_registered_path(bytes: Vec<u8>) -> Option<PathBuf> {
 /// receive additional API calls after the first sync, affected turns are
 /// re-aggregated from the full event history (not just `created_at > cursor`)
 /// and upserted via `INSERT OR REPLACE` keyed on `import_source_id`.
+#[cfg(test)]
 fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let app_dir = crate::paths::copilot_app_dir();
+    sync_copilot_app_usage_logs_from(conn, &crate::paths::copilot_app_dir())
+}
+
+fn sync_copilot_app_usage_logs_from(conn: &mut Connection, app_dir: &Path) -> Result<(), String> {
     let session_store_path = app_dir.join("session-store.db");
 
     // Canonicalize the source directory so the cursor is stable across trailing
@@ -2257,7 +2570,9 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
     // injective (no two distinct paths map to the same key) and free of LIKE
     // wildcard characters (`%`, `_`). Encoding raw bytes (not lossy UTF-8) avoids
     // collisions from Unicode replacement chars and from `\\` vs `/` normalization.
-    let canonical_app_dir = app_dir.canonicalize().unwrap_or_else(|_| app_dir.clone());
+    let canonical_app_dir = app_dir
+        .canonicalize()
+        .unwrap_or_else(|_| app_dir.to_path_buf());
     let source_key = encode_hex(canonical_app_dir.as_os_str().as_encoded_bytes());
     register_usage_source_directory(
         conn,
@@ -2446,7 +2761,7 @@ fn sync_copilot_app_usage_logs(conn: &mut Connection) -> Result<(), String> {
             Ok((session_id, turn_index, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
                 if matches!(
-                    classify_copilot_app_session(&app_dir, &app_session_ids, &session_id),
+                    classify_copilot_app_session(app_dir, &app_session_ids, &session_id),
                     CopilotAppSessionKind::App
                 ) && touched_set.insert((session_id.clone(), turn_index))
                 {
@@ -3158,8 +3473,15 @@ struct CopilotCliAgentRow {
 /// ([`COPILOT_CLI_AGENT_MIGRATION_KEY`]) performs the first backfill of all
 /// existing CLI sessions. Both the cursor and the migration key are
 /// independent of the Copilot App collector's state.
+#[cfg(test)]
 fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let copilot_dir = get_copilot_dir();
+    sync_copilot_cli_agent_usage_logs_from(conn, &get_copilot_dir())
+}
+
+fn sync_copilot_cli_agent_usage_logs_from(
+    conn: &mut Connection,
+    copilot_dir: &Path,
+) -> Result<(), String> {
     let session_store_path = copilot_dir.join("session-store.db");
 
     // Canonicalize for a stable, per-COPILOT_DIR cursor key (mirrors the App
@@ -3167,7 +3489,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
     // LIKE wildcards.
     let canonical_copilot_dir = copilot_dir
         .canonicalize()
-        .unwrap_or_else(|_| copilot_dir.clone());
+        .unwrap_or_else(|_| copilot_dir.to_path_buf());
     let source_key = encode_hex(canonical_copilot_dir.as_os_str().as_encoded_bytes());
     let cursor_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_CURSOR_PREFIX, source_key);
     let pending_key_prefix = format!("{}{}::", COPILOT_CLI_AGENT_PENDING_PREFIX, source_key);
@@ -3285,7 +3607,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             Ok((session_id, created_at, id)) => {
                 max_event_cursor = Some((created_at, id));
                 if matches!(
-                    classify_copilot_app_session(&copilot_dir, &app_session_ids, &session_id),
+                    classify_copilot_app_session(copilot_dir, &app_session_ids, &session_id),
                     CopilotAppSessionKind::Cli
                 ) {
                     touched_cli_sessions.insert(session_id);
@@ -3328,7 +3650,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             continue;
         };
         if matches!(
-            classify_copilot_app_session(&copilot_dir, &app_session_ids, session_id),
+            classify_copilot_app_session(copilot_dir, &app_session_ids, session_id),
             CopilotAppSessionKind::Cli
         ) {
             touched_cli_sessions.insert(session_id.to_string());
@@ -3352,7 +3674,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
             match sid_res {
                 Ok(sid) => {
                     if matches!(
-                        classify_copilot_app_session(&copilot_dir, &app_session_ids, &sid),
+                        classify_copilot_app_session(copilot_dir, &app_session_ids, &sid),
                         CopilotAppSessionKind::Cli
                     ) {
                         touched_cli_sessions.insert(sid);
@@ -3603,7 +3925,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     _ => (row.session_id.clone(), None, None, "main".to_string(), None),
                 };
 
-            let session_name = get_copilot_session_name(&row.session_id);
+            let session_name = get_copilot_session_name(copilot_dir, &row.session_id);
             let session_name = match (&row.agent_id, &session_name) {
                 (Some(agent), Some(name)) if !agent.is_empty() => {
                     Some(format!("{} (subagent {})", name, agent))
@@ -3639,7 +3961,7 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     parent_session_id, agent_nickname, agent_role
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?,
-                    NULL, ?, NULL, ?, ?, ?,
+                    ?, ?, NULL, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, NULL, ?, NULL,
@@ -3653,6 +3975,8 @@ fn sync_copilot_cli_agent_usage_logs(conn: &mut Connection) -> Result<(), String
                     date_str,
                     row_session_id,
                     session_name,
+                    hook_transcript_path(copilot_dir, "copilot", &row.session_id)
+                        .map(|path| path.to_string_lossy().into_owned()),
                     row.cwd.as_deref(),
                     // CLI sessions aggregate across all turns into a single
                     // row per agent, so turn_no is fixed at 1.
@@ -3993,6 +4317,7 @@ struct CodexTranscript {
     path: PathBuf,
     identity: String,
     size: u64,
+    active: bool,
 }
 
 fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
@@ -4010,6 +4335,7 @@ fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
             path: filepath,
             identity,
             size: metadata.len(),
+            active: dir.file_name().is_some_and(|name| name == "sessions"),
         });
     }
 
@@ -4020,13 +4346,10 @@ fn collect_codex_transcripts(dir: &Path) -> Vec<CodexTranscript> {
 /// copy wins: more content first, then the live `sessions` directory (Codex
 /// only moves a transcript to `archived_sessions` once it stops appending to
 /// it), and finally the path so the choice never depends on directory order.
-fn codex_transcript_canonical_rank(
-    sessions_dir: &Path,
-    transcript: &CodexTranscript,
-) -> (u64, bool, String) {
+fn codex_transcript_canonical_rank(transcript: &CodexTranscript) -> (u64, bool, String) {
     (
         transcript.size,
-        transcript.path.starts_with(sessions_dir),
+        transcript.active,
         transcript.path.to_string_lossy().into_owned(),
     )
 }
@@ -4034,11 +4357,10 @@ fn codex_transcript_canonical_rank(
 /// Highest ranked copy of a rollout that parses completely *and* covers more
 /// turns than the canonical transcript could provide, or `None` when no copy can
 /// stand in for the canonical file.
-fn usable_codex_duplicate<'a>(
-    sessions_dir: &Path,
-    duplicates: &'a [CodexTranscript],
+fn usable_codex_duplicate(
+    duplicates: &[CodexTranscript],
     canonical_entries: usize,
-) -> Option<&'a CodexTranscript> {
+) -> Option<&CodexTranscript> {
     duplicates
         .iter()
         .filter(|duplicate| {
@@ -4048,7 +4370,7 @@ fn usable_codex_duplicate<'a>(
                     && parsed.entries.len() > canonical_entries
             )
         })
-        .max_by_key(|duplicate| codex_transcript_canonical_rank(sessions_dir, duplicate))
+        .max_by_key(|duplicate| codex_transcript_canonical_rank(duplicate))
 }
 
 /// Stored transcript path spellings whose rows must disappear once the
@@ -4162,18 +4484,40 @@ fn codex_transcript_needs_sync(
     }
 }
 
+#[cfg(test)]
 fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    let codex_dir = get_codex_dir();
+    sync_codex_usage_logs_from(conn, &[get_codex_dir()])
+}
+
+#[cfg(test)]
+fn sync_codex_usage_logs_from(conn: &mut Connection, roots: &[PathBuf]) -> Result<(), String> {
+    sync_codex_usage_logs_from_with_cancel(conn, roots, &|| false)
+}
+
+fn sync_codex_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    roots: &[PathBuf],
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
+    let Some(codex_dir) = roots.first() else {
+        return Ok(());
+    };
 
     run_codex_parser_migration(conn)?;
     run_codex_source_kind_migration(conn)?;
     run_codex_rollout_identity_migration(conn)?;
 
-    let sessions_dir = codex_dir.join("sessions");
-    let mut transcripts = collect_codex_transcripts(&sessions_dir);
-    transcripts.extend(collect_codex_transcripts(
-        &codex_dir.join("archived_sessions"),
-    ));
+    let mut transcripts = Vec::new();
+    for root in roots {
+        if should_cancel() {
+            return Ok(());
+        }
+        transcripts.extend(collect_codex_transcripts(&root.join("sessions")));
+        transcripts.extend(collect_codex_transcripts(&root.join("archived_sessions")));
+    }
 
     if transcripts.is_empty() {
         return Ok(());
@@ -4196,11 +4540,17 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
     }
 
     let transcript_paths = load_codex_transcript_paths(conn)?;
+    let mut sync_states = load_sync_state_for_prefix(conn, "codex");
 
-    for (identity, group) in transcripts_by_identity {
+    // Process newest rollouts first (`rollout-YYYY-MM-DD...` keys sort chronologically)
+    // so today's and recent sessions appear on the dashboard immediately.
+    for (identity, group) in transcripts_by_identity.into_iter().rev() {
+        if should_cancel() {
+            return Ok(());
+        }
         let Some(canonical) = group
             .iter()
-            .max_by_key(|transcript| codex_transcript_canonical_rank(&sessions_dir, transcript))
+            .max_by_key(|transcript| codex_transcript_canonical_rank(transcript))
             .cloned()
         else {
             continue;
@@ -4217,10 +4567,11 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 
         sync_codex_transcript(
             conn,
-            &codex_dir,
+            codex_dir,
             &identity,
             &canonical,
             &transcript_paths,
+            &mut sync_states,
             &duplicates,
             true,
         )?;
@@ -4230,27 +4581,22 @@ fn sync_codex_usage_logs(conn: &mut Connection) -> Result<(), String> {
 }
 
 /// Sync one Codex rollout transcript, replacing every row of that rollout.
+// Internal helper passing preloaded transcript_paths and sync_states caches to avoid per-file queries.
+#[allow(clippy::too_many_arguments)]
 fn sync_codex_transcript(
     conn: &mut Connection,
     codex_dir: &Path,
     identity: &str,
     transcript: &CodexTranscript,
     transcript_paths: &HashMap<String, Vec<String>>,
+    sync_states: &mut HashMap<String, (u64, i64)>,
     duplicates: &[CodexTranscript],
     allow_fallback: bool,
 ) -> Result<(), String> {
     let state_path = portable_relative_path(codex_dir, &transcript.path);
     let state_key = format!("codex:{}", state_path);
 
-    let last_synced_state: Option<(u64, i64)> = conn
-        .query_row(
-            "SELECT last_synced_size, last_synced_time
-             FROM sync_state
-             WHERE filename = ?",
-            params![state_key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .ok();
+    let last_synced_state: Option<(u64, i64)> = sync_states.get(&state_key).copied();
 
     let current_size = transcript.size;
     let transcript_path = transcript.path.to_string_lossy().into_owned();
@@ -4276,6 +4622,7 @@ fn sync_codex_transcript(
             remove_stale_codex_copy_rows(&tx, &stale_copy_paths)?;
             tx.commit()
                 .map_err(|error| format!("Transaction COMMIT 失敗: {error}"))?;
+            bump_sync_data_revision();
         }
         return Ok(());
     }
@@ -4299,9 +4646,7 @@ fn sync_codex_transcript(
             Ok(parsed) => parsed.entries.len(),
             Err(_) => 0,
         };
-        let sessions_dir = codex_dir.join("sessions");
-        if let Some(fallback) = usable_codex_duplicate(&sessions_dir, duplicates, canonical_entries)
-        {
+        if let Some(fallback) = usable_codex_duplicate(duplicates, canonical_entries) {
             let remaining: Vec<CodexTranscript> = duplicates
                 .iter()
                 .filter(|duplicate| duplicate.path != fallback.path)
@@ -4313,6 +4658,7 @@ fn sync_codex_transcript(
                 identity,
                 fallback,
                 transcript_paths,
+                sync_states,
                 &remaining,
                 false,
             );
@@ -4338,6 +4684,7 @@ fn sync_codex_transcript(
             ],
         )
         .map_err(|error| format!("記錄空白 Codex transcript 同步狀態失敗: {error}"))?;
+        sync_states.insert(state_key, (current_size, CODEX_EMPTY_TRANSCRIPT_SYNC_TIME));
         return Ok(());
     }
 
@@ -4483,6 +4830,11 @@ fn sync_codex_transcript(
         if update_state_res.is_ok() {
             if let Err(e) = tx.commit() {
                 eprintln!("Transaction COMMIT 失敗: {}", e);
+            } else {
+                sync_states.insert(state_key, (current_size, last_synced_time));
+                if wrote_local_rows || parsed_completely {
+                    bump_sync_data_revision();
+                }
             }
         }
     }
@@ -4507,7 +4859,24 @@ fn migrate_legacy_claude_usage_entries(conn: &Connection) -> Result<usize, Strin
 }
 
 /// Sync Claude Code local transcripts into the dashboard's Claude Code assistant slot.
+#[cfg(test)]
 fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
+    sync_claude_usage_logs_from(conn, &get_claude_dir())
+}
+
+#[cfg(test)]
+fn sync_claude_usage_logs_from(conn: &mut Connection, claude_dir: &Path) -> Result<(), String> {
+    sync_claude_usage_logs_from_with_cancel(conn, claude_dir, &|| false)
+}
+
+fn sync_claude_usage_logs_from_with_cancel(
+    conn: &mut Connection,
+    claude_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
     // Move Claude Code data that was previously written into the Codex slot.
     let migration_done: bool = conn
         .query_row(
@@ -4552,35 +4921,59 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
         );
     }
 
-    let claude_dir = get_claude_dir();
+    // Re-sync existing Claude Code transcripts once so main sessions previously
+    // overwritten by subagent transcripts (which shared the parent's `sessionId`)
+    // and all subagent sessions are restored with distinct session IDs.
+    let subagent_migration_done: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_state WHERE filename = 'migration:claude_code_subagents_v2')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !subagent_migration_done {
+        let _ = conn.execute("DELETE FROM sync_state WHERE filename LIKE 'claude:%'", []);
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES ('migration:claude_code_subagents_v2', 1, 0)",
+            [],
+        );
+    }
+
     let projects_dir = claude_dir.join("projects");
     if !projects_dir.exists() {
         return Ok(());
     }
 
-    let files = find_claude_session_files(&projects_dir);
+    let sync_states = load_sync_state_for_prefix(conn, "claude");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> =
+        find_claude_session_files(&projects_dir)
+            .into_iter()
+            .filter_map(|filepath| {
+                let metadata = fs::metadata(&filepath).ok()?;
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((filepath, metadata.len(), mtime))
+            })
+            .collect();
+    // Sort newest-first so recent Claude Code sessions sync first
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
 
-    for filepath in files {
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
+
         let state_path = filepath
-            .strip_prefix(&claude_dir)
+            .strip_prefix(claude_dir)
             .unwrap_or(&filepath)
             .to_string_lossy()
             .into_owned();
-        let state_key = format!("claude:{}", state_path);
+        let state_key = source_sync_key("claude", claude_dir, &state_path);
 
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0u64);
-
-        let metadata = match fs::metadata(&filepath) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let current_size = metadata.len();
 
         if current_size != last_synced_size {
             let parsed_entries = match parse_claude_session_file(&filepath) {
@@ -4594,6 +4987,15 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
             let tx = conn
                 .transaction()
                 .map_err(|e| format!("Transaction BEGIN 失敗: {}", e))?;
+
+            let transcript_path_str = filepath.to_string_lossy().into_owned();
+            if let Err(e) = tx.execute(
+                "DELETE FROM usage_entries WHERE assistant_type = 'claude' AND transcript_path = ?",
+                params![transcript_path_str],
+            ) {
+                eprintln!("清空舊 Claude Code Transcript 資料失敗: {}", e);
+                continue;
+            }
 
             // First delete old entries for this session
             let session_ids: HashSet<String> = parsed_entries
@@ -4686,6 +5088,8 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
                 if update_state_res.is_ok() {
                     if let Err(e) = tx.commit() {
                         eprintln!("Transaction COMMIT 失敗: {}", e);
+                    } else {
+                        bump_sync_data_revision();
                     }
                 }
             }
@@ -4695,27 +5099,49 @@ fn sync_claude_usage_logs(conn: &mut Connection) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Result<(), String> {
-    for filepath in crate::grok::find_session_update_files(grok_dir) {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!(
-                    "讀取 Grok Build session 檔案 {:?} 失敗: {}",
-                    filepath, error
-                );
-                continue;
-            }
-        };
-        let current_size = metadata.len();
+    sync_grok_usage_logs_with_cancel(conn, grok_dir, &|| false)
+}
+
+pub(crate) fn sync_grok_usage_logs_with_cancel(
+    conn: &mut Connection,
+    grok_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, "grok");
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> =
+        crate::grok::find_session_update_files(grok_dir)
+            .into_iter()
+            .filter_map(|filepath| {
+                let metadata = match fs::metadata(&filepath) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        eprintln!(
+                            "讀取 Grok Build session 檔案 {:?} 失敗: {}",
+                            filepath, error
+                        );
+                        return None;
+                    }
+                };
+                let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                Some((filepath, metadata.len(), mtime))
+            })
+            .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_name = portable_relative_path(grok_dir, &filepath);
-        let state_key = format!("grok:{state_name}");
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let state_key = source_sync_key("grok", grok_dir, &state_name);
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
@@ -4840,6 +5266,7 @@ pub(crate) fn sync_grok_usage_logs(conn: &mut Connection, grok_dir: &Path) -> Re
         .map_err(|error| format!("更新 Grok Build sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 Grok Build transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -4858,27 +5285,40 @@ fn sync_pi_family_usage_logs(
     session_files: Vec<PathBuf>,
     dir: &Path,
     parse_file: impl Fn(&Path) -> Result<Vec<UsageEntry>, String>,
+    should_cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<(), String> {
-    for filepath in session_files {
-        let metadata = match fs::metadata(&filepath) {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                eprintln!(
-                    "讀取 {assistant_label} session 檔案 {:?} 失敗: {}",
-                    filepath, error
-                );
-                continue;
-            }
-        };
-        let current_size = metadata.len();
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, assistant_type);
+    let mut files_with_meta: Vec<(PathBuf, u64, SystemTime)> = session_files
+        .into_iter()
+        .filter_map(|filepath| {
+            let metadata = match fs::metadata(&filepath) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    eprintln!(
+                        "讀取 {assistant_label} session 檔案 {:?} 失敗: {}",
+                        filepath, error
+                    );
+                    return None;
+                }
+            };
+            let mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((filepath, metadata.len(), mtime))
+        })
+        .collect();
+    files_with_meta.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| right.0.cmp(&left.0)));
+
+    for (filepath, current_size, _) in files_with_meta {
+        if should_cancel() {
+            return Ok(());
+        }
         let state_name = portable_relative_path(dir, &filepath);
-        let state_key = format!("{assistant_type}:{state_name}");
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let state_key = source_sync_key(assistant_type, dir, &state_name);
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
@@ -4943,6 +5383,7 @@ fn sync_pi_family_usage_logs(
         .map_err(|error| format!("更新 {assistant_label} sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 {assistant_label} transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -4989,12 +5430,12 @@ fn insert_usage_entries(
                     assistant_type, source_kind, usage_identity, timestamp, date, session_id, session_name, transcript_path, cwd, version, turn_no, model, model_id,
                     tokens_input, tokens_output, tokens_cache_read, tokens_cache_write, tokens_reasoning, tokens_total,
                     delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning, delta_total,
-                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort
+                    duration_ms, premium_requests, reported_cost_usd, reasoning_effort, source_dir_key
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?
+                    ?, ?, ?, ?, ?
                 )",
             params![
                 assistant_type,
@@ -5026,6 +5467,7 @@ fn insert_usage_entries(
                 cost.and_then(|value| value.total_premium_requests.map(|v| v as i64)),
                 cost.and_then(|value| value.reported_cost_usd),
                 entry.reasoning_effort.as_deref(),
+                entry.source_dir_key.as_deref(),
             ],
         )
         .map_err(|error| format!("寫入 {assistant_label} 資料庫失敗: {error}"))?;
@@ -5034,7 +5476,16 @@ fn insert_usage_entries(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn sync_pi_usage_logs(conn: &mut Connection, pi_dir: &Path) -> Result<(), String> {
+    sync_pi_usage_logs_with_cancel(conn, pi_dir, &|| false)
+}
+
+pub(crate) fn sync_pi_usage_logs_with_cancel(
+    conn: &mut Connection,
+    pi_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::pi::find_session_files(pi_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5043,10 +5494,20 @@ pub(crate) fn sync_pi_usage_logs(conn: &mut Connection, pi_dir: &Path) -> Result
         session_files,
         pi_dir,
         |path| crate::pi::parse_session_usage_file(path, crate::pi::SOURCE_KIND),
+        should_cancel,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Result<(), String> {
+    sync_omp_usage_logs_with_cancel(conn, omp_dir, &|| false)
+}
+
+pub(crate) fn sync_omp_usage_logs_with_cancel(
+    conn: &mut Connection,
+    omp_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::omp::find_session_files(omp_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5055,10 +5516,15 @@ pub(crate) fn sync_omp_usage_logs(conn: &mut Connection, omp_dir: &Path) -> Resu
         session_files,
         omp_dir,
         crate::omp::parse_session_usage_file,
+        should_cancel,
     )
 }
 
-pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Result<(), String> {
+pub(crate) fn sync_muse_usage_logs_with_cancel(
+    conn: &mut Connection,
+    muse_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
     let session_files = crate::muse::find_session_files(muse_dir);
     sync_pi_family_usage_logs(
         conn,
@@ -5067,6 +5533,7 @@ pub(crate) fn sync_muse_usage_logs(conn: &mut Connection, muse_dir: &Path) -> Re
         session_files,
         muse_dir,
         crate::muse::parse_session_usage_file,
+        should_cancel,
     )
 }
 
@@ -5150,13 +5617,53 @@ fn complete_file_len(path: &Path) -> Option<u64> {
 /// unit is the directory rather than a single file. The incremental
 /// fingerprint is therefore the combined size of the session's JSONL files,
 /// and the rebuild is scoped to the session's `messages.jsonl` path.
+#[cfg(test)]
 pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> Result<(), String> {
-    let session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    sync_mcode_usage_logs_with_ledger(conn, mcode_dir, &get_mcode_state_db_path())
+}
+
+pub(crate) fn sync_mcode_usage_logs_with_cancel(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    sync_mcode_usage_logs_with_ledger_and_cancel(
+        conn,
+        mcode_dir,
+        &get_mcode_state_db_path(),
+        should_cancel,
+    )
+}
+
+#[cfg(test)]
+fn sync_mcode_usage_logs_with_ledger(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    ledger: &Path,
+) -> Result<(), String> {
+    sync_mcode_usage_logs_with_ledger_and_cancel(conn, mcode_dir, ledger, &|| false)
+}
+
+fn sync_mcode_usage_logs_with_ledger_and_cancel(
+    conn: &mut Connection,
+    mcode_dir: &Path,
+    ledger: &Path,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    if should_cancel() {
+        return Ok(());
+    }
+    let sync_states = load_sync_state_for_prefix(conn, "mcode");
+    let mut session_dirs = crate::mcode::find_session_dirs(mcode_dir);
+    session_dirs.sort_by(|left, right| right.cmp(left));
     // The runtime ledger is opened lazily and only when a session actually
     // changed, so an uninstalled MiniMax Code runtime costs nothing.
     let mut runtime_meta: Option<HashMap<String, McodeRuntimeSessionMeta>> = None;
 
     for session_dir in session_dirs {
+        if should_cancel() {
+            return Ok(());
+        }
         let files = crate::mcode::session_jsonl_files(&session_dir);
         if files.is_empty() {
             continue;
@@ -5178,21 +5685,18 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
         }
 
         let state_name = portable_relative_path(mcode_dir, &session_dir);
-        let state_key = format!("mcode:{state_name}");
-        let last_synced_size: u64 = conn
-            .query_row(
-                "SELECT last_synced_size FROM sync_state WHERE filename = ?",
-                params![state_key],
-                |row| row.get(0),
-            )
+        let state_key = source_sync_key("mcode", mcode_dir, &state_name);
+        let last_synced_size: u64 = sync_states
+            .get(&state_key)
+            .map(|(size, _)| *size)
             .unwrap_or(0);
 
         if current_size == last_synced_size {
             continue;
         }
 
-        let runtime_meta = runtime_meta
-            .get_or_insert_with(|| load_mcode_runtime_session_meta(&get_mcode_state_db_path()));
+        let runtime_meta =
+            runtime_meta.get_or_insert_with(|| load_mcode_runtime_session_meta(ledger));
         let session_id = crate::mcode::read_session_metadata(&session_dir);
         let runtime_session = runtime_meta.get(&session_id);
         let cwd = runtime_session
@@ -5235,6 +5739,7 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
         .map_err(|error| format!("更新 MiniMax Code sync state 失敗: {error}"))?;
         tx.commit()
             .map_err(|error| format!("提交 MiniMax Code transaction 失敗: {error}"))?;
+        bump_sync_data_revision();
     }
 
     Ok(())
@@ -5242,88 +5747,137 @@ pub(crate) fn sync_mcode_usage_logs(conn: &mut Connection, mcode_dir: &Path) -> 
 
 /// Unified sync function triggering sync for all supported assistants
 pub fn sync_usage_logs(conn: &mut Connection) -> Result<(), String> {
-    // 1. Sync Cursor metadata first so model and mode attribution is available
-    // before the potentially slower transcript collectors finish.
-    let cursor_dir = get_cursor_dir();
-    if let Err(e) = sync_cursor_usage_logs(conn, &cursor_dir) {
-        eprintln!("❌ 同步 Cursor 失敗: {}", e);
-    }
+    sync_usage_logs_with_cancel(conn, &|| false)
+}
 
-    // 2. Sync Google Antigravity CLI
-    let antigravity_dir = get_antigravity_dir();
-    if let Err(e) = sync_hook_usage_logs(conn, "antigravity", &antigravity_dir) {
-        eprintln!("❌ 同步 Antigravity 失敗: {}", e);
-    }
+pub fn sync_usage_logs_with_cancel(
+    conn: &mut Connection,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    let config = crate::config::SourceConfig::load()?;
+    sync_configured_sources_with_cancel(conn, &config, should_cancel)
+}
 
-    // 3. Sync GitHub Copilot CLI
-    let copilot_dir = get_copilot_dir();
-    if let Err(e) = sync_hook_usage_logs(conn, "copilot", &copilot_dir) {
-        eprintln!("❌ 同步 Copilot 失敗: {}", e);
-    }
-
-    // 3b. Sync GitHub Copilot sessions created in VS Code
-    if let Err(e) = sync_vscode_chat_sessions(conn) {
-        eprintln!("❌ 同步 VS Code Copilot 失敗: {}", e);
-    }
-
-    // 4. Sync GitHub Copilot App (Tauri desktop) usage
-    if let Err(e) = sync_copilot_app_usage_logs(conn) {
-        eprintln!("❌ 同步 Copilot App 失敗: {}", e);
-    }
-
-    // 5. Reconcile Copilot CLI subagent usage against session-store.db. Runs
-    // after the hook and App collectors so CLI sessions are classified against
-    // the authoritative App registry and the hook merged rows are available
-    // for total validation. Falls back to hook rows when session-store is
-    // missing, unclassifiable, or fails total validation.
-    if let Err(e) = sync_copilot_cli_agent_usage_logs(conn) {
-        eprintln!("❌ 同步 Copilot CLI agent reconciliation 失敗: {}", e);
-    }
-
-    // 5b. Backfill CWD for Copilot rows written before CWD was resolved from
-    // session-store.db.sessions.
-    if let Err(e) = backfill_copilot_cwd(conn) {
-        eprintln!("❌ 補填 Copilot CWD 失敗: {}", e);
-    }
-
-    // 6. Sync Codex CLI and Desktop
-    if let Err(e) = sync_codex_usage_logs(conn) {
-        eprintln!("❌ 同步 Codex 失敗: {}", e);
-    }
-
-    // 5. Sync Claude Code
-    if let Err(e) = sync_claude_usage_logs(conn) {
-        eprintln!("❌ 同步 Claude Code 失敗: {}", e);
-    }
-
-    // 8. Sync Grok Build sessions
-    let grok_dir = get_grok_dir();
-    if let Err(e) = sync_grok_usage_logs(conn, &grok_dir) {
-        eprintln!("❌ 同步 Grok Build 失敗: {}", e);
-    }
-
-    // 9. Sync Pi Coding Agent sessions
-    let pi_dir = get_pi_dir();
-    if let Err(e) = sync_pi_usage_logs(conn, &pi_dir) {
-        eprintln!("❌ 同步 Pi Coding Agent 失敗: {}", e);
-    }
-
-    // 10. Sync OMP sessions (Pi fork)
-    let omp_dir = get_omp_dir();
-    if let Err(e) = sync_omp_usage_logs(conn, &omp_dir) {
-        eprintln!("❌ 同步 OMP 失敗: {}", e);
-    }
-
-    // 11. Sync Muse sessions
-    let muse_dir = get_muse_dir();
-    if let Err(e) = sync_muse_usage_logs(conn, &muse_dir) {
-        eprintln!("❌ 同步 Muse 失敗: {}", e);
-    }
-
-    // 12. Sync MiniMax Code sessions
-    let mcode_dir = get_mcode_dir();
-    if let Err(e) = sync_mcode_usage_logs(conn, &mcode_dir) {
-        eprintln!("❌ 同步 MiniMax Code 失敗: {}", e);
+fn sync_configured_sources_with_cancel(
+    conn: &mut Connection,
+    config: &crate::config::SourceConfig,
+    should_cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<(), String> {
+    use crate::config::Harness;
+    // Preserve collector order: Cursor metadata first; Copilot hook/App rows
+    // before CLI reconciliation. A failed or offline source does not block others.
+    for harness in [
+        Harness::Cursor,
+        Harness::Antigravity,
+        Harness::Copilot,
+        Harness::Vscode,
+        Harness::CopilotApp,
+        Harness::Codex,
+        Harness::Claude,
+        Harness::Grok,
+        Harness::Pi,
+        Harness::Omp,
+        Harness::Muse,
+        Harness::Mcode,
+    ] {
+        if should_cancel() {
+            return Ok(());
+        }
+        let roots = config.roots(harness);
+        if harness == Harness::Vscode {
+            if let Err(error) = sync_vscode_chat_sessions_from_with_cancel(
+                conn,
+                &crate::vscode::workspace_storage_roots(&roots),
+                should_cancel,
+            ) {
+                eprintln!("❌ 同步 VS Code Copilot 失敗: {error}");
+            }
+            continue;
+        }
+        if harness == Harness::Codex {
+            if let Err(error) = sync_codex_usage_logs_from_with_cancel(conn, &roots, should_cancel)
+            {
+                eprintln!("❌ 同步 Codex 失敗: {error}");
+            }
+            continue;
+        }
+        let sqlite_total_changes = |c: &Connection| -> i64 {
+            c.query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap_or(0)
+        };
+        for (index, root) in roots.iter().enumerate() {
+            if should_cancel() {
+                return Ok(());
+            }
+            let changes_before = sqlite_total_changes(conn);
+            let result = match harness {
+                Harness::Cursor if index == 0 => {
+                    cursor::sync_cursor_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Cursor => cursor::sync_cursor_usage_logs_with_ledger_and_cancel(
+                    conn,
+                    root,
+                    &root.join("state.vscdb"),
+                    should_cancel,
+                ),
+                Harness::Antigravity => {
+                    sync_antigravity_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Copilot => {
+                    sync_hook_usage_logs_with_cancel(conn, "copilot", root, should_cancel)
+                }
+                Harness::CopilotApp => sync_copilot_app_usage_logs_from(conn, root),
+                Harness::Claude => {
+                    sync_claude_usage_logs_from_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Grok => sync_grok_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Pi => sync_pi_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Omp => sync_omp_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Muse => sync_muse_usage_logs_with_cancel(conn, root, should_cancel),
+                Harness::Mcode if index == 0 => {
+                    sync_mcode_usage_logs_with_cancel(conn, root, should_cancel)
+                }
+                Harness::Mcode => sync_mcode_usage_logs_with_ledger_and_cancel(
+                    conn,
+                    root,
+                    &root.join("sqlite/runtime-state.sqlite"),
+                    should_cancel,
+                ),
+                Harness::Vscode | Harness::Codex => unreachable!("handled as a group above"),
+            };
+            if matches!(harness, Harness::CopilotApp) && sqlite_total_changes(conn) > changes_before
+            {
+                bump_sync_data_revision();
+            }
+            if let Err(error) = result {
+                eprintln!("❌ 同步 {harness:?} ({}) 失敗: {error}", root.display());
+            }
+        }
+        if harness == Harness::CopilotApp {
+            for root in config.roots(Harness::Copilot) {
+                if should_cancel() {
+                    return Ok(());
+                }
+                let changes_before = sqlite_total_changes(conn);
+                if let Err(error) = sync_copilot_cli_agent_usage_logs_from(conn, &root) {
+                    eprintln!(
+                        "❌ 同步 Copilot CLI agent ({}) 失敗: {error}",
+                        root.display()
+                    );
+                } else if sqlite_total_changes(conn) > changes_before {
+                    bump_sync_data_revision();
+                }
+            }
+            if should_cancel() {
+                return Ok(());
+            }
+            let changes_before = sqlite_total_changes(conn);
+            if let Err(error) = backfill_copilot_cwd(conn) {
+                eprintln!("❌ 補填 Copilot CWD 失敗: {error}");
+            } else if sqlite_total_changes(conn) > changes_before {
+                bump_sync_data_revision();
+            }
+        }
     }
     Ok(())
 }
@@ -7714,11 +8268,11 @@ mod tests {
         std::env::set_var("COPILOT_DIR", &copilot_dir);
 
         assert_eq!(
-            get_antigravity_session_name("antigravity-session").as_deref(),
+            get_antigravity_session_name(&get_antigravity_dir(), "antigravity-session").as_deref(),
             Some("第二條提示")
         );
         assert_eq!(
-            get_copilot_session_name("copilot-session").as_deref(),
+            get_copilot_session_name(&get_copilot_dir(), "copilot-session").as_deref(),
             Some("Second prompt")
         );
 
@@ -7792,6 +8346,239 @@ mod tests {
             entry.delta_tokens.as_ref().map(|tokens| tokens.input),
             Some(42_530)
         );
+    }
+
+    #[test]
+    fn antigravity_native_sync_without_statusline_is_scoped_and_idempotent() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-native").with_extension("");
+        let other = root.join("other");
+        let relative = "brain/shared/.system_generated/logs/transcript_full.jsonl";
+        let path = root.join(relative);
+        let other_path = other.join(relative);
+        let record = "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"cache_read_tokens\":80,\"output_tokens\":3}\n";
+        for file in [&path, &other_path] {
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            fs::write(file, record).unwrap();
+        }
+        for dir in [&root, &other, &root] {
+            sync_antigravity_usage_logs_with_cancel(&mut conn, dir, &|| false).unwrap();
+        }
+        let totals: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), SUM(delta_input), SUM(delta_cache_read), SUM(delta_total)
+             FROM usage_entries WHERE assistant_type = 'antigravity'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(totals, (2, 24, 160, 190));
+        // Partial writes leave the previous snapshot intact, then import on completion.
+        fs::write(&path, format!("{record}{{\"type\":")).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        fs::write(&path, format!("{record}{record}")).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        // Truncation replaces only this source; malformed data preserves prior rows.
+        fs::write(&path, "invalid\n").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let healthy_path =
+            root.join("brain/z-healthy/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(healthy_path.parent().unwrap()).unwrap();
+        fs::write(&healthy_path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 4);
+        fs::write(&path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_native_reloads_late_metadata_and_preserves_model_on_read_error() {
+        fn field(number: u32, value: &[u8]) -> Vec<u8> {
+            let mut tag = (number << 3) | 2;
+            let mut bytes = Vec::new();
+            while tag >= 128 {
+                bytes.push((tag as u8 & 127) | 128);
+                tag >>= 7;
+            }
+            bytes.push(tag as u8);
+            assert!(value.len() < 128);
+            bytes.push(value.len() as u8);
+            bytes.extend_from_slice(value);
+            bytes
+        }
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-late-metadata").with_extension("");
+        let path = root.join("brain/a-session/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let record = "{\"type\":\"PLANNER_RESPONSE\",\"step_index\":7,\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"output_tokens\":3}\n";
+        fs::write(&path, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        let model = |conn: &Connection| -> String {
+            conn.query_row(
+                "SELECT model FROM usage_entries WHERE session_id = 'a-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(model(&conn), "Unknown Model");
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let database = root.join("conversations/a-session.db");
+        {
+            let metadata = Connection::open(&database).unwrap();
+            metadata.execute_batch("CREATE TABLE gen_metadata (data BLOB); CREATE TABLE steps (idx INTEGER, metadata BLOB);").unwrap();
+            let mut generation = field(4, b"generation-id");
+            generation.extend(field(1, &field(19, b"agy-demo-medium")));
+            metadata
+                .execute_batch(
+                    "CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB);",
+                )
+                .unwrap();
+            metadata
+                .execute(
+                    "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                    params![field(7, b"file:///example/project")],
+                )
+                .unwrap();
+            metadata
+                .execute("INSERT INTO gen_metadata VALUES (?)", params![generation])
+                .unwrap();
+            metadata
+                .execute(
+                    "INSERT INTO steps VALUES (7, ?)",
+                    params![field(12, b"generation-id")],
+                )
+                .unwrap();
+        }
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(model(&conn), "Gemini 4 Argon (Medium)");
+        let cwd = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT cwd FROM usage_entries WHERE session_id = 'a-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(cwd(&conn).as_deref(), Some("/example/project"));
+        // Simulate an unchanged snapshot imported by the previous parser, whose
+        // fingerprint omitted a parser version and whose CWD was always NULL.
+        use std::hash::{Hash, Hasher};
+        let mut old_fingerprint = std::collections::hash_map::DefaultHasher::new();
+        for file in [
+            &path,
+            &database,
+            &root.join("conversations/a-session.db-wal"),
+        ] {
+            if let Ok(metadata) = fs::metadata(file) {
+                metadata.len().hash(&mut old_fingerprint);
+                metadata.modified().ok().hash(&mut old_fingerprint);
+            }
+        }
+        let old_revision = (old_fingerprint.finish() & i64::MAX as u64) as i64;
+        conn.execute(
+            "UPDATE usage_entries SET cwd = NULL WHERE session_id = 'a-session'",
+            [],
+        )
+        .unwrap();
+        let canonical_root = crate::config::absolute_root(&root);
+        let state_key = source_sync_key(
+            "antigravity",
+            &canonical_root,
+            &portable_relative_path(
+                &canonical_root,
+                &canonical_root
+                    .join("brain/a-session/.system_generated/logs/transcript_full.jsonl"),
+            ),
+        );
+        conn.execute(
+            "UPDATE sync_state SET last_synced_time = ? WHERE filename = ?",
+            params![old_revision, state_key],
+        )
+        .unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(cwd(&conn).as_deref(), Some("/example/project"));
+        // The transcript did not change. A temporarily invalid metadata database
+        // must preserve the established model without starving later sessions.
+        fs::write(&database, b"temporarily invalid SQLite data").unwrap();
+        let healthy = root.join("brain/z-session/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(healthy.parent().unwrap()).unwrap();
+        fs::write(&healthy, record).unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &root, &|| false).unwrap();
+        assert_eq!(model(&conn), "Gemini 4 Argon (Medium)");
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM usage_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn antigravity_native_replaces_hooks_but_preserves_legacy_only_sessions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let root = temp_jsonl_path("antigravity-mixed").with_extension("");
+        let path = root.join("brain/native/.system_generated/logs/transcript_full.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("usage")).unwrap();
+        let mut native_hook = sample_import_record().entry;
+        native_hook.session_id = "native".to_owned();
+        let mut legacy_hook = native_hook.clone();
+        legacy_hook.session_id = "legacy-only".to_owned();
+        let hook = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&native_hook).unwrap(),
+            serde_json::to_string(&legacy_hook).unwrap()
+        );
+        fs::write(root.join("usage/usage-2026-10-10.jsonl"), &hook).unwrap();
+        fs::write(&path, "{\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-10-10T01:00:00Z\",\"input_tokens\":12,\"output_tokens\":3}\n").unwrap();
+        let non_canonical_root = root.join("usage").join("..");
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
+        // Newly arriving hook snapshots must not resurrect duplicate costs.
+        native_hook.turn_no += 1;
+        fs::write(
+            root.join("usage/usage-2026-10-10.jsonl"),
+            format!("{hook}{}\n", serde_json::to_string(&native_hook).unwrap()),
+        )
+        .unwrap();
+        fs::write(&path, "{\"type\":").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
+        native_hook.turn_no += 1;
+        fs::write(
+            root.join("usage/usage-2026-10-11.jsonl"),
+            format!("{}\n", serde_json::to_string(&native_hook).unwrap()),
+        )
+        .unwrap();
+        fs::write(&path, "invalid\n").unwrap();
+        sync_antigravity_usage_logs_with_cancel(&mut conn, &non_canonical_root, &|| false).unwrap();
+        let rows: (i64, i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(source_kind = 'legacy'), SUM(source_kind = 'antigravity-session') FROM usage_entries", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        assert_eq!(rows, (2, 1, 1));
+        let model: String = conn
+            .query_row(
+                "SELECT model FROM usage_entries WHERE source_kind = 'antigravity-session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "Unknown Model");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10820,6 +11607,76 @@ mod tests {
     }
 
     #[test]
+    fn sync_codex_usage_logs_refreshes_subagent_names_in_additional_sources() {
+        let root = std::env::temp_dir().join(format!(
+            "codex-subagent-name-sync-{}-{}",
+            std::process::id(),
+            TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let primary = root.join("primary");
+        let additional = root.join("additional");
+        let archive = additional.join("archived_sessions");
+        fs::create_dir_all(&archive).unwrap();
+        let path = archive.join("rollout-2026-10-04T10-00-00-child.jsonl");
+        fs::write(
+            &path,
+            r#"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"主代理的提示詞"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n"},{"type":"encrypted_content","encrypted_content":"unreadable-test-data"}]}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"#,
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let roots = [primary, additional];
+        sync_codex_usage_logs_from(&mut conn, &roots).unwrap();
+
+        // Simulate v8 data whose transcript size and path have not changed.
+        conn.execute(
+            "UPDATE usage_entries SET session_name = '/root/reviewer'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "DELETE FROM sync_state WHERE filename = ?",
+            params![CODEX_PARSER_MIGRATION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_state (filename, last_synced_size, last_synced_time)
+             VALUES ('migration:codex_session_identity_v8', 1, 0),
+                    ('claude:untouched.jsonl', 123, 456)",
+            [],
+        )
+        .unwrap();
+
+        // Reparse once, then verify an incremental sync keeps the same totals.
+        for _ in 0..2 {
+            sync_codex_usage_logs_from(&mut conn, &roots).unwrap();
+            let stored: (String, u64, u64) = conn
+                .query_row(
+                    "SELECT session_name, SUM(delta_total), COUNT(*)
+                     FROM usage_entries WHERE session_id = 'child'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, ("reviewer".to_string(), 110, 1));
+        }
+        let unrelated_cursor: u64 = conn
+            .query_row(
+                "SELECT last_synced_size FROM sync_state WHERE filename = 'claude:untouched.jsonl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unrelated_cursor, 123);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn sync_codex_usage_logs_writes_recomputed_delta_totals() {
         let _guard = ENV_LOCK.lock().unwrap();
         let old_codex_dir = std::env::var("CODEX_DIR").ok();
@@ -11261,6 +12118,163 @@ mod tests {
         if chrono::Local::now().offset().local_minus_utc() != 0 {
             assert_ne!(date, "2026-09-21", "不應停留在舊 bug 的 UTC 日期");
         }
+    }
+
+    #[test]
+    fn sync_claude_usage_logs_preserves_main_session_and_subagents_and_migrates_legacy_rows() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let claude_dir = temp_jsonl_path("claude-subagent-sync").with_extension("");
+        let project_dir = claude_dir.join("projects").join("test-project");
+        let session_id = "c3e4ba13-5d3e-43aa-b96b-16d97d7c1224";
+        let subagents_dir = project_dir.join(session_id).join("subagents");
+        let wf_dir = subagents_dir.join("workflows").join("wf_01ABC");
+        fs::create_dir_all(&wf_dir).unwrap();
+
+        let main_path = project_dir.join(format!("{}.jsonl", session_id));
+        fs::write(
+            &main_path,
+            concat!(
+                "{\"type\":\"user\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Orchestrate workflow\"}}\n",
+                "{\"type\":\"assistant\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:00:05Z\",\"uuid\":\"m1\",\"requestId\":\"req_main\",\"message\":{\"id\":\"msg_main\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Starting subagents\"}],\"usage\":{\"input_tokens\":100,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":20}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let sub1_path = subagents_dir.join("agent-a111.jsonl");
+        let sub1_meta = subagents_dir.join("agent-a111.meta.json");
+        fs::write(
+            &sub1_meta,
+            r#"{"agentType":"general-purpose","description":"Explore repo"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &sub1_path,
+            concat!(
+                "{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"a111\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:01:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Scan files\"}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"a111\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:01:05Z\",\"uuid\":\"s1\",\"requestId\":\"req_sub1\",\"message\":{\"id\":\"msg_sub1\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Scanned\"}],\"usage\":{\"input_tokens\":50,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":10}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let wf_sub_path = wf_dir.join("agent-a222.jsonl");
+        let wf_sub_meta = wf_dir.join("agent-a222.meta.json");
+        fs::write(
+            &wf_sub_meta,
+            r#"{"agentType":"workflow","name":"lead","workflowPhase":"implement","description":"Implement feature"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &wf_sub_path,
+            concat!(
+                "{\"type\":\"user\",\"isSidechain\":true,\"agentId\":\"a222\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:02:00Z\",\"message\":{\"role\":\"user\",\"content\":\"Write code\"}}\n",
+                "{\"type\":\"assistant\",\"isSidechain\":true,\"agentId\":\"a222\",\"sessionId\":\"c3e4ba13-5d3e-43aa-b96b-16d97d7c1224\",\"timestamp\":\"2026-10-08T01:02:05Z\",\"uuid\":\"s2\",\"requestId\":\"req_sub2\",\"message\":{\"id\":\"msg_sub2\",\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":[{\"type\":\"text\",\"text\":\"Implemented\"}],\"usage\":{\"input_tokens\":80,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":30}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        // Simulate legacy broken state where wf_sub overwrote the parent session_id
+        conn.execute(
+            "INSERT INTO usage_entries (
+                session_id, parent_session_id, session_name, agent_nickname, agent_role,
+                assistant_type, model, timestamp, date, tokens_input, tokens_output,
+                tokens_cache_read, tokens_cache_write, tokens_reasoning, turn_no,
+                delta_input, delta_output, delta_cache_read, delta_cache_write, delta_reasoning,
+                transcript_path
+            ) VALUES (?1, NULL, 'Write code', NULL, NULL, 'claude', 'claude-opus-4-6', '2026-10-08T01:02:05Z', '2026-10-08', 80, 30, 0, 0, 0, 1, 80, 30, 0, 0, 0, ?2)",
+            params![session_id, wf_sub_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        for p in [&main_path, &sub1_path, &wf_sub_path] {
+            let state_path = p
+                .strip_prefix(&claude_dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned();
+            let state_key = source_sync_key("claude", &claude_dir, &state_path);
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_state (filename, last_synced_size, last_synced_time) VALUES (?, 999999, 9999999999)",
+                params![state_key],
+            )
+            .unwrap();
+        }
+
+        sync_claude_usage_logs_from(&mut conn, &claude_dir).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT session_id, parent_session_id, session_name, agent_nickname, agent_role, tokens_input, tokens_output
+                 FROM usage_entries
+                 WHERE assistant_type = 'claude'
+                 ORDER BY timestamp ASC",
+            )
+            .unwrap();
+        type SubagentSyncRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            u64,
+            u64,
+        );
+        let rows: Vec<SubagentSyncRow> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            })
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0],
+            (
+                session_id.to_string(),
+                None,
+                Some("Orchestrate workflow".to_string()),
+                None,
+                None,
+                100,
+                20,
+            )
+        );
+        assert_eq!(
+            rows[1],
+            (
+                "agent-a111".to_string(),
+                Some(session_id.to_string()),
+                Some("Explore repo".to_string()),
+                None,
+                Some("general-purpose".to_string()),
+                50,
+                10,
+            )
+        );
+        assert_eq!(
+            rows[2],
+            (
+                "agent-a222".to_string(),
+                Some(session_id.to_string()),
+                Some("Implement feature".to_string()),
+                Some("lead".to_string()),
+                Some("implement".to_string()),
+                80,
+                30,
+            )
+        );
+
+        fs::remove_dir_all(claude_dir).unwrap();
     }
 
     #[test]

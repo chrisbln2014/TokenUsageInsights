@@ -12,8 +12,11 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+mod antigravity;
+mod antigravity_metadata;
 mod browser;
 mod cli;
+mod config;
 mod db;
 mod grok;
 mod handlers;
@@ -29,6 +32,7 @@ mod session_files;
 mod session_identity;
 mod session_search;
 mod snapshot;
+mod statusline_command;
 mod timeline;
 mod updater;
 mod vscode;
@@ -38,6 +42,8 @@ use handlers::*;
 const MAX_IMPORT_PAYLOAD_BYTES: usize = 200_000_000;
 const DEFAULT_BIND_HOST: &str = "0.0.0.0";
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// ISO date (YYYY-MM-DD) of the source commit, or empty when git metadata was unavailable.
+const APP_BUILD_DATE: &str = env!("APP_BUILD_DATE");
 
 fn import_usage_route() -> axum::routing::MethodRouter {
     post(import_usage_day).layer(DefaultBodyLimit::max(MAX_IMPORT_PAYLOAD_BYTES))
@@ -167,20 +173,29 @@ fn spawn_usage_sync_task() -> UsageSyncTask {
             }
 
             let should_migrate = migrate_legacy_databases;
+            let cancel_rx = shutdown_rx.clone();
+            db::set_sync_in_progress(true);
             let sync_res = tokio::task::spawn_blocking(move || {
                 let mut conn = db::get_db_conn()?;
                 if should_migrate {
                     db::migrate_old_databases(&mut conn)?;
                 }
-                db::sync_usage_logs(&mut conn)
+                db::sync_usage_logs_with_cancel(&mut conn, &|| *cancel_rx.borrow())
             })
             .await;
+            db::set_sync_in_progress(false);
 
             match sync_res {
+                Ok(Ok(())) if *shutdown_rx.borrow() => {
+                    break;
+                }
                 Ok(Ok(())) if should_migrate => {
+                    db::mark_initial_sync_completed();
                     println!("✅ SQLite 資料庫已成功載入並完成增量同步！");
                 }
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    db::mark_initial_sync_completed();
+                }
                 Ok(Err(error)) => eprintln!("⚠️ 背景日誌同步失敗: {error}"),
                 Err(error) => eprintln!("⚠️ 背景日誌同步任務異常: {error:?}"),
             }

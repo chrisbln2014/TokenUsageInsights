@@ -46,7 +46,7 @@ http://localhost:3003
 
 | 工具 | 是否需要额外设置 | 默认数据源 | 说明 |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | 需要 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | 通过 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 数据 |
+| Google Antigravity CLI | 不需要 | `~/.gemini/antigravity-cli/brain/` / `conversations/` | 直接读取原生会话 Token 与模型信息；兼容旧版 `usage/` 收集文件 |
 | GitHub Copilot CLI | 需要 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | 通过 `statusline-token.sh` 或 Windows `statusline-token.ps1` 收集 Token 数据 |
 | GitHub Copilot App | 不需要 | `~/.copilot/data.db`、`~/.copilot/session-store.db` | 看板直接读取 Copilot 桌面应用的本地 SQLite |
 | GitHub Copilot Chat（VS Code） | 不需要 | VS Code `workspaceStorage/chatSessions` | 看板直接扫描 VS Code Stable 与 Insiders 的本地聊天 Session |
@@ -149,58 +149,24 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI 设置
+## Google Antigravity CLI 本地数据来源
 
-Antigravity CLI 需要将本项目的 Status Line 脚本连接到 `settings.json`。脚本会把每次对话后的 Token 累计值与增量写入：
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. 安装收集脚本
-
-完成一行安装后，执行：
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-如果使用自定义安装位置，请将命令中的 `~/.local/share/token-usage-insights` 替换为 `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` 指定的位置。
-
-### 2. 设置 `~/.gemini/antigravity-cli/settings.json`
-
-如果文件不存在，可以创建以下内容。如果文件已经存在，请只合并 `statusLine` 区块，不要覆盖原有设置。
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-请将 `/ABSOLUTE/HOME` 替换为 `echo $HOME` 显示的实际主目录路径，例如 `/Users/your-name` 或 `/home/your-name`。
-
-### 3. 验证
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-完成后重新进入 Antigravity CLI Session，状态栏会输出类似格式：
+**Antigravity CLI 无需设置 Status Line、Hook 或安装额外收集脚本。** 使用 CLI 对话后，看板会直接读取原生记录：
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+看板读取每次响应的输入、缓存读取与输出 Token，并从对应会话数据库取得模型信息以估算费用。估算费用不等于 Antigravity 实际扣款；模型或价格无法识别时无法可靠估算，也不代表免费。
+
+Windows 默认目录为 `%USERPROFILE%\.gemini\antigravity-cli`；可用 `ANTIGRAVITY_DIR` 或额外数据来源设置指定其他位置。复制历史数据时请保留 `brain/` 与 `conversations/`。旧版 `usage/usage-YYYY-MM-DD.jsonl` 仍受支持，无需删除现有记录或设置。
 
 * * *
 
 ## GitHub Copilot CLI 设置
 
-Copilot CLI 与 Antigravity CLI 一样，需要将本项目的 Status Line 脚本连接到 `settings.json`。脚本会把 Token 数据写入：
+Copilot CLI 需要将本项目的 Status Line 脚本连接到 `settings.json`。脚本会把 Token 数据写入：
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -589,6 +555,53 @@ update_check_interval: 1   # 自动检查更新的间隔周期（天）
 
 优先级：命令行标志（如 `--no-auto-update`） > 环境变量（如 `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`） > `config.yaml` 配置文件 > 默认值。
 
+<a id="additional-sources"></a>
+
+#### 额外数据来源：多个工具目录与跨电脑集中分析
+
+在同一份 `config.yaml` 中添加 `additional_sources`，为每种工具指定多个额外数据根目录。适用于不同的 `CODEX_HOME`，以及从云盘下载到本机的其他电脑日志。
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- 额外路径会**追加**到主要来源。默认目录仍会扫描；`CODEX_DIR` 等现有环境变量仍可覆盖主要目录。无需使用的工具可省略或填 `[]`。
+- 启动、后台同步和**立即同步**都会重新读取配置。保存后点击立即同步，无需重启。
+- 支持绝对路径、`~`、`$HOME`、`%USERPROFILE%`、`%LOCALAPPDATA%` 和 `%APPDATA%`。相对路径以配置文件所在目录为基准；Windows 路径建议使用 YAML 单引号，例如 `'D:\Cloud Drive\laptop\.codex'`。
+- 每台电脑保留独立目录和原有子目录结构，先将云端文件下载到本机。看板读取本地文件，云盘负责传输；无需共享 `token_usage_insights.db`。
+- 重复路径和指向同一目录的符号链接只扫描一次；Codex 相同 rollout 副本会去重，其他工具保留现有 Session 身份规则。不存在的目录会跳过并在下次重试。移除来源不会删除已导入用量，但对话详情仍需可访问的源文件。
+- 配置查找顺序为数据目录（优先 `INSIGHTS_DIR`）、平台默认数据目录、当前工作目录，只读取第一份存在的 `config.yaml`。YAML 或列表格式错误时，同步会报错，不会静默切换配置。
+
+| 配置键 | 根目录内预期的数据 |
+| --- | --- |
+| `codex` | `sessions/` 与 `archived_sessions/`；填写 `CODEX_HOME`，无需填写这两个子目录 |
+| `claude`、`cursor` | `projects/` |
+| `copilot` | `usage/`、`session-state/`、`session-store.db`；同目录的 App 数据也会导入 |
+| `copilot_app` | 独立 App 目录内的 `data.db`、`session-store.db`、`session-state/` |
+| `antigravity` | `brain/` 与 `conversations/` 原生记录；也支持旧版 `usage/` |
+| `grok`、`muse` | `sessions/` |
+| `pi`、`omp` | `agent/sessions/` |
+| `mcode` | `.minimax/v2` 下的 `sessions/` 及可选的 `sqlite/runtime-state.sqlite` |
+| `vscode` | VS Code 用户数据目录下的 `User/workspaceStorage/` |
+
+Cursor 额外根目录可放入该电脑的 `state.vscdb`（原位于 `User/globalStorage/`）以补充模型信息。MiniMax Code 额外根目录使用自己的 `sqlite/runtime-state.sqlite`。主要来源仍遵循 `CURSOR_STATE_DB` 和 `MCODE_STATE_DB`。
+
+
 > **默认绑定 `0.0.0.0`，同一局域网内的其他设备可能连接到看板。只需在本机浏览时，请将 `HOST` 设置为 `127.0.0.1`。**
 
 示例：
@@ -782,14 +795,14 @@ token-usage-insights update --check
 # 原地自我更新至最新版本（亦支持 --force 强制覆盖、--target-version 指定版本）
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.1.1
+token-usage-insights update --target-version v1.1.4
 ```
 
 环境变量可控制版本与安装路径（均为可选）：
 
 | 变量 | 适用平台 | 说明 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.1.1`。默认 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 指定要安装的 Release tag，例如 `v1.1.4`。默认 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | 安装目录，会传递给 `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | 可执行文件链接目录，会传递给 `install.sh` |
 
@@ -903,7 +916,7 @@ systemctl --user reset-failed
 按工具检查数据源是否存在：
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -916,12 +929,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI 与 Copilot CLI 还需要确认 `settings.json` 已设置 `statusLine`，且脚本具有执行权限。
+Copilot CLI 还需要确认 `settings.json` 已设置 `statusLine`，且脚本具有执行权限。
 
 Windows PowerShell 可直接检查原生数据目录：
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -934,7 +947,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line 脚本无法执行
+### Status Line 脚本无法执行 （Copilot CLI 或可选的旧版 Antigravity 收集器）
 
 ```bash
 command -v jq
@@ -949,6 +962,14 @@ Status Line 脚本依赖 `jq` 解析 CLI 传入的 JSON。
 ```powershell
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
+
+Windows 的 `settings.json` 请直接使用看板设置向导生成的 `command`：路径改用 `/`、且不要加任何引号，例如：
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI 与 Copilot CLI 会把 `command` 按空白切割后直接执行，不会经过 shell；若用 `\"...\"` 包住路径或保留 `\\` 反斜杠，`powershell.exe -File` 会收到含引号的路径而找不到脚本。若脚本路径含空白、`&`、非 ASCII 等任何可能被切割或被 `cmd.exe` 解读的字符，看板会改为生成 `-EncodedCommand <Base64>` 形式（内容为 `& '<path>' -Assistant antigravity` 的 UTF-16LE Base64），对任何宿主都是单一安全的 token。
 
 ### 配置文件 JSON 格式错误
 

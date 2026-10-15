@@ -46,7 +46,7 @@ http://localhost:3003
 
 | Tool | Additional setup | Default data source | Description |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | Required | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
+| Google Antigravity CLI | Not required | `~/.gemini/antigravity-cli/brain/` / `conversations/` | Reads native session tokens and model metadata; legacy `usage/` files remain supported |
 | GitHub Copilot CLI | Required | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | Collects token data through `statusline-token.sh` or the Windows `statusline-token.ps1` |
 | GitHub Copilot App | Not required | `~/.copilot/data.db`, `~/.copilot/session-store.db` | The dashboard reads the desktop app's local SQLite databases directly |
 | GitHub Copilot Chat (VS Code) | Not required | VS Code `workspaceStorage/chatSessions` | The dashboard scans local chat sessions from VS Code Stable and Insiders directly |
@@ -149,58 +149,24 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI setup
+## Google Antigravity CLI Local data sources
 
-Antigravity CLI requires connecting this project's Status Line script to `settings.json`. The script writes cumulative and incremental tokens after each conversation to:
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. Install the collector script
-
-After the one-line installation, run:
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-If you use a custom installation location, replace `~/.local/share/token-usage-insights` in the command with the location specified by `TOKEN_USAGE_INSIGHTS_INSTALL_DIR`.
-
-### 2. Configure `~/.gemini/antigravity-cli/settings.json`
-
-If the file does not exist, you can create it with the following content. If it already exists, merge only the `statusLine` block; do not overwrite the existing settings.
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-Replace `/ABSOLUTE/HOME` with the actual home-directory path shown by `echo $HOME`, such as `/Users/your-name` or `/home/your-name`.
-
-### 3. Verify
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-Afterward, re-enter an Antigravity CLI session. The status line will output a format similar to:
+**Antigravity CLI requires no Status Line setup, hooks, or collector scripts.** After using the CLI, the dashboard reads these native records:
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+Input, cache-read, and output tokens are read per response. Model metadata from the session database is used to estimate costs. Estimates are not actual Antigravity charges; unknown models or prices prevent reliable estimates and do not mean usage is free.
+
+On Windows, the default root is `%USERPROFILE%\.gemini\antigravity-cli`. Override it with `ANTIGRAVITY_DIR` or additional source settings. When copying historical data, keep both `brain/` and `conversations/`. Legacy `usage/usage-YYYY-MM-DD.jsonl` files remain supported; existing files and settings do not need to be removed.
 
 * * *
 
 ## GitHub Copilot CLI setup
 
-Like Antigravity CLI, Copilot CLI requires connecting this project's Status Line script to `settings.json`. The script writes token data to:
+Copilot CLI requires connecting this project's Status Line script to `settings.json`. The script writes token data to:
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -589,6 +555,53 @@ update_check_interval: 1   # Update check interval in days
 
 Precedence: CLI flags (e.g. `--no-auto-update`) > Environment variables (e.g. `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` > Defaults.
 
+<a id="additional-sources"></a>
+
+#### Additional sources: multiple homes and computers
+
+Add `additional_sources` to the same `config.yaml` to scan any number of extra data roots for each tool, including separate `CODEX_HOME` directories and folders downloaded by a cloud drive.
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- These paths **extend** the primary source. Default locations remain enabled; existing variables such as `CODEX_DIR` still override the primary location. Omit unused tools or use `[]`.
+- Startup, background sync, and **Sync Now** reload the file. Save changes and click Sync Now; no restart is required.
+- Paths accept absolute paths, `~`, `$HOME`, `%USERPROFILE%`, `%LOCALAPPDATA%`, and `%APPDATA%`. Relative paths resolve against the selected config file's directory. Use YAML single quotes for Windows paths, e.g. `'D:\Cloud Drive\laptop\.codex'`.
+- Keep separate folders per computer and preserve each tool's directory structure. Download cloud files locally before syncing. The dashboard reads local files; your cloud drive handles transfer. Sharing `token_usage_insights.db` is unnecessary.
+- Repeated paths and symlinks to the same directory are scanned once. Copied Codex rollouts are deduplicated; other tools retain their existing session identity rules. Missing directories are skipped and retried later. Removing a source keeps imported usage; transcript details still require accessible source files.
+- Config search order is the insights directory (`INSIGHTS_DIR` if set), the platform default insights directory, then the working directory. Only the first existing `config.yaml` is used. Invalid YAML or source lists produce a sync error instead of silently falling back.
+
+| Key | Expected contents of each root |
+| --- | --- |
+| `codex` | `sessions/` and `archived_sessions/`; specify the `CODEX_HOME` root, not these subfolders |
+| `claude`, `cursor` | `projects/` |
+| `copilot` | `usage/`, `session-state/`, `session-store.db`; App data in the same home is also imported |
+| `copilot_app` | `data.db`, `session-store.db`, `session-state/` in a separate App home |
+| `antigravity` | Native `brain/` and `conversations/` records; also supports legacy `usage/` |
+| `grok`, `muse` | `sessions/` |
+| `pi`, `omp` | `agent/sessions/` |
+| `mcode` | `sessions/` and optional `sqlite/runtime-state.sqlite` under `.minimax/v2` |
+| `vscode` | `User/workspaceStorage/` under the VS Code user data root |
+
+Extra Cursor roots can include that computer's `state.vscdb` (copied from `User/globalStorage/`) for model metadata. Extra MiniMax Code roots use their own `sqlite/runtime-state.sqlite`. Primary sources still honor `CURSOR_STATE_DB` and `MCODE_STATE_DB`.
+
+
 > **The default binding is `0.0.0.0`, so other devices on the same local network may connect to the dashboard. For local-only browsing, set `HOST` to `127.0.0.1`.**
 
 Example:
@@ -782,14 +795,14 @@ token-usage-insights update --check
 # Self-update to the latest release (also supports --force and --target-version)
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.1.1
+token-usage-insights update --target-version v1.1.4
 ```
 
 Environment variables can control the version and installation paths (all optional):
 
 | Variable | Platforms | Description |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v1.1.1`; defaults to `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | Release tag to install, such as `v1.1.4`; defaults to `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | Installation directory, passed to `install.sh` |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | Executable-link directory, passed to `install.sh` |
 
@@ -903,7 +916,7 @@ systemctl --user reset-failed
 Check whether the data source exists for each tool:
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -916,12 +929,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI and Copilot CLI also require `settings.json` to define `statusLine` and the scripts to have execute permission.
+Copilot CLI also requires `settings.json` to define `statusLine` and the scripts to have execute permission.
 
 On Windows PowerShell, inspect the native data directories directly:
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -934,7 +947,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line script cannot run
+### Status Line script cannot run (Copilot CLI or optional legacy Antigravity collector)
 
 ```bash
 command -v jq
@@ -949,6 +962,14 @@ The `jq` requirement above applies only to `.sh` collectors. You can test the Wi
 ```powershell
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
+
+On Windows, use the `command` generated by the dashboard setup wizard in `settings.json`: forward slashes and no quotes at all, for example:
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI and Copilot CLI split `command` on whitespace and run it directly without a shell. Wrapping the path in `\"...\"` or keeping `\\` backslashes makes `powershell.exe -File` receive a path that still contains the quotes, so the script is not found. When the script path contains spaces, `&`, non-ASCII characters, or anything else that could be split or interpreted by `cmd.exe`, the dashboard generates the `-EncodedCommand <Base64>` form instead (the UTF-16LE Base64 of `& '<path>' -Assistant antigravity`), which is a single safe token for every host.
 
 ### Configuration file has invalid JSON
 

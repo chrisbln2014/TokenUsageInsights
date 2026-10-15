@@ -20,6 +20,9 @@
   至本 fork 的合併分支。
 - 整合 upstream v1.1.1（新增「全部 Agent」合併檢視，並修正 `copilot-search-b` 缺少價格規則時的
   錯誤提示）至本 fork 的合併分支；細節詳見下方新併入的 `[1.1.1]`／`[1.1.0]` 版本區塊。
+- 整合 upstream v1.3.2（v1.1.2 ~ v1.3.2：Antigravity 改讀原生會話記錄、`config.yaml` 額外資料來源、
+  Claude Code subagent 歸屬、Statusline 改寫 UTC 時間戳等上游變更）至本 fork 的合併分支；保留 Cloud
+  Run snapshot「全部 Agent」支援與 all-scope 月／年 `agents` 累加修正，細節詳見下方新併入的版本區塊。
 
 ### 修正
 
@@ -42,6 +45,165 @@
 
 - 前端（`static/app.js`、`static/chart-utils.js`）目前仍以 UTC 切分「日」的邊界，與本次後端寫入
   點改為本地時區的修復不完全一致；此問題刻意排除在本次範圍外，留待後續任務處理。
+
+
+## [1.3.2] - 2026-10-15
+
+### 新增與改善
+
+- 側邊欄版本資訊會依建置來源 commit 日期顯示日期，無須在 HTML 手動維護；可用建置期環境變數 `APP_BUILD_DATE` 指定日期，缺少有效日期時隱藏日期。
+
+### 相容性
+
+- `/api/version` 新增 `build_date` 欄位，既有欄位維持不變；未變更資料庫結構、執行期環境變數或安裝流程。
+
+## [1.3.1] - 2026-10-15
+
+承接未完成發佈的 `v1.3.0`，納入 Antigravity 同步根目錄正規化順序修正。以下列出相較上一個正式版本 `v1.2.2` 的完整變更。
+
+### 新增與改善
+
+- Antigravity CLI 可直接讀取原生會話記錄中的 Token 與會話資料庫模型資訊，不再需要事先設定 Status Line；保留舊版 `usage/` 收集檔相容性，並更新資料來源偵測、五種語言的使用指南與空白狀態說明。模型或價格不明時，費用無法可靠估算。
+- 補齊 Antigravity 原生會話的工作目錄（CWD），從會話 workspace URI 還原路徑，並在同步時補齊既有歷史資料；不以工具臨時工作目錄猜測會話目錄。
+
+### 修正
+
+- 修正舊版或尚未初始化 Composer／Agent DiskKV 儲存的 Cursor `state.vscdb` 缺少 `cursorDiskKV` 資料表時，每次同步皆輸出 `同步 Cursor composerData Session 中繼資料失敗` 與 `同步 Cursor agentKv 模型資訊失敗` 錯誤訊息的問題；現在缺少 `cursorDiskKV` 表時視為空表處理，並在資料庫重置時正常清理快取。
+- 修正 Antigravity 同步在根目錄包含符號連結（如 macOS `/var` → `/private/var`）或 Windows 8.3 短檔名時，先以未正規化路徑執行舊版 Hook 同步再正規化掃描原生會話，導致 `transcript_path` 不一致而無法去重的問題。
+
+### 資料影響
+
+- Antigravity CLI 同步會自動掃描原生會話記錄（`brain/<session-id>/.system_generated/logs/transcript_full.jsonl`）與會話資料庫模型中繼資料，並為既有原生會話回補工作目錄（CWD），同時與舊版 `usage/` 收集檔去重；原始會話檔案維持唯讀不變。
+
+### 相容性
+
+- 保留舊版 Antigravity `usage/` 狀態列收集檔相容性；未變更資料庫結構、環境變數或安裝流程。
+
+## [1.3.0] - 2026-10-15
+
+此標籤於 macOS 與 Windows 執行 Antigravity 舊版 Hook 與原生會話混合去重單元測試時，因暫存目錄符號連結與 Windows 8.3 短路徑正規化順序不一致而失敗，發佈未完成；未建立正式 GitHub Release 或 npm 版本，標籤維持原狀。相關功能與修正合併記錄於 `1.3.1`。
+
+## [1.2.2] - 2026-10-14
+
+### 新增與改善
+
+- 大幅加速背景日誌同步並支援協作式停機中斷（Cooperative Cancellation）：收到 `Ctrl+C` 或 `SIGTERM` 時於完成目前單檔交易後立即安全結束背景同步，解決背景尚有日誌同步時關閉程式需長時間等待的問題。
+- 各 Agent 日誌掃描改採「最新檔案優先（Newest-first）」順序，搭配預載入 `sync_state` 記憶體快取、SQLite `WAL` 模式、複合索引（`idx_assistant_date`、`idx_assistant_session`、`idx_codex_local_transcript_path`）與 Codex / Claude 串流輕量解析，讓近期最新資料在啟動後數秒內優先入庫，並消除歷史檔案重複掃描與逐筆 `fs::metadata` 造成的大量 I/O。
+- 前端啟動期間透過 `/api/version` 追蹤背景同步的 `data_revision`，當最新日誌同步完成時自動漸進刷新目前檢視畫面與日期清單，無須等待歷史舊檔全部掃描完成或手動重新整理。
+- 重新設計頂部工具列深淺色主題切換按鈕（`#theme-toggle-btn`）圖示，改用直覺的標準太陽（深色模式）與新月（淺色模式）動態切換線條圖示，並支援平滑旋轉過渡與 `prefers-reduced-motion` 無障礙設定。
+
+### 修正
+
+- 修正從「月度」檢視切換至「每日」檢視時，因網址月份參數（`YYYY-MM`）被套用至 `<input type="date">` 導致日期欄位留白的問題，並確保從月度或年度分頁切換至每日分頁時預設顯示 UTC 今天日期。
+
+### 相容性
+
+- SQLite 連線自動啟用 `WAL` 模式與 `synchronous = NORMAL` 並自動建立複合索引；`/api/version` 回應新增 `syncing`、`initial_sync_completed`、`data_revision` 欄位（向下相容）；未變更環境變數或安裝流程。
+
+## [1.2.1] - 2026-10-10
+
+### 新增與改善
+
+- 新增 `Claude Opus 5.5`（`claude-opus-5-5`）、`Claude Opus 5.5-fast`（`claude-opus-5-5-fast`，Fast Mode 2x 計價）與 `Claude Sonnet 5.5`（`claude-sonnet-5-5`）的 Anthropic 官方標準定價規則，含 Global 與 Cursor 清單條目；快取讀取依官方公告採輸入價格的 0.05x 計算。
+- Claude Code 會話解析現會讀取 `usage.speed`，Fast Mode 回合的模型名稱自動加上 `-fast` 後綴（例如 `claude-opus-5-5-fast`），以套用 Fast Mode 2x 計價，避免費用被低估一半。
+- 新增 GitHub Actions 工作流程 `windows-statusline.yml`，於 Windows 執行 Rust 測試、原生 collector 測試，並以空白切割與 `cmd.exe` 兩種方式實際執行看板產生的 `statusLine.command` 進行端對端驗證。
+
+### 修正
+
+- 修正 `Claude Sonnet 5` / `claude-sonnet-5` 價格：官方已將上市優惠價 $2 / $10 轉為正式價格並取消原訂 2026/9/1 調漲，原本登錄的 $3 / $15 會高估估算費用。
+- 修正價格規則模糊比對：簡短模型名稱（如 `opus-5`）改以名稱長度最接近的規則為準，避免新增 `Claude Opus 5.5-fast` 等較長名稱後被誤配成 Fast Mode 價格。
+- 修正 Windows 設定精靈產生的 `statusLine.command`：Antigravity CLI / Copilot CLI 會以空白切割命令後直接執行，原本以 `\"...\"` 包住的腳本路徑會讓 `powershell.exe -File` 找不到檔案。現改為不加引號並以 `/` 分隔路徑；腳本路徑含空白、`&`、非 ASCII 等非安全字元時改用 `-EncodedCommand <Base64>` 形式，避免被空白切割或被 `cmd.exe` 解讀。另修正 Windows 設定精靈顯示的資料目錄與腳本路徑帶有 `\\?\` verbatim 前綴的問題。命令字串改由後端 `/api/<assistant>/setup-info` 的 `statusline_command` 欄位提供（#64）。
+
+### 相容性
+
+- 未變更資料庫結構、API、環境變數或安裝流程。
+
+## [1.2.0] - 2026-10-08
+
+### 新增與改善
+
+- 月度與年度報表的「最常活動的專案目錄」表格新增估算費用欄位，呈現各專案累計估算費用。
+
+### 修正
+
+- 估算費用四捨五入後達 1,000 美元時改以整數及千分位分隔符顯示；未達此金額時保留兩位小數。
+
+### 相容性
+
+- 未變更資料庫結構、API、環境變數或安裝流程。
+
+## [1.1.6] - 2026-10-08
+
+### 新增與改善
+
+- Claude Code 現可將主會話、一般子代理與工作流子代理分開記錄，並顯示子代理階層及中介資料；同步會自動重新解析既有逐字稿，復原先前遭子代理覆蓋的主會話與其他子代理紀錄。
+- Claude Code 對話時間軸可正確合併分行記錄的思考內容與文字回覆；同一回合收到較完整的串流用量時會更新 Token 數，並改善斜線命令提示詞與子代理名稱的辨識。
+- Antigravity、Copilot 與 Windows Statusline Hook 改用 UTC 時間戳記及日期檔名，避免本機時區造成跨日歸類不一致。
+
+### 修正
+
+- 補上 `Claude Haiku 5.5`（`claude-haiku-5-5`，含 `≤100K` 與 `>100K` 上下文門檻及 Cursor 清單條目）的 Anthropic 官方標準定價規則，修正 Claude 會話出現 `claude-haiku-5-5` 時找不到可用模型價格規則、無法估算成本的問題。
+
+### 資料影響
+
+- Claude Code 下次同步時會自動重新解析既有逐字稿，以分離主會話與子代理資料並清除舊的重複紀錄；資料來源檔案不會變更。
+
+### 相容性
+
+- 未變更資料庫結構或環境變數；新增的 Claude 子代理辨識與 UTC 時戳記沿用既有資料來源及安裝方式。
+
+## [1.1.5] - 2026-10-08
+
+### 修正
+
+- 補上 `Gemini 4 Argon`（含 `Medium`、`High`、`Low` 思考層級變體）的 Google AI 官方標準定價規則，修正 Antigravity 會話出現 `Gemini 4 Argon (Medium)` 時找不到可用模型價格規則、無法估算成本的問題；快取輸入價格依官方費率設為一般輸入的 5%（折減 95%）。
+
+### 相容性
+
+- 本次新增模型定價資料與回歸測試；未變更資料庫結構或環境變數。
+
+## [1.1.4] - 2026-10-04
+
+承接未完成發佈的 `v1.1.3`，納入 Windows 測試環境修正。以下列出相較上一個正式版本 `v1.1.2` 的完整變更。
+
+### 新增與改善
+
+- `config.yaml` 新增 `additional_sources`，支援每種工具追加多個資料根目錄；可集中分析不同 `CODEX_HOME` 或由雲端硬碟同步到本機的多台電腦紀錄。
+- 啟動、背景同步與「立即同步」會重新載入額外來源；Codex 自動掃描 `sessions` 與 `archived_sessions`，跨目錄的相同 rollout 副本維持去重。
+- 額外來源採用獨立同步游標，對話明細與來源安裝狀態也支援設定的目錄；更新 README 與多語系介紹網頁的設定範例。
+- 會話列表的提示詞欄位由 150px 加寬至 210px（增加 40%），讓提示詞與子代理任務名稱更容易辨識。
+
+### 修正
+
+- 修正多資料來源整合測試在 Windows 清空子程序環境時遺漏 `SystemRoot`，導致 Winsock 初始化失敗（錯誤 10106）而阻斷 Release 工作流程的問題；保留測試資料目錄隔離。
+- 子代理會話改為顯示自身名稱，不再被主代理的提示詞覆蓋。Codex 會優先使用交辦給該子代理的首次 `NEW_TASK` 明文內容；交辦內容加密時顯示任務名稱，並省略內部代理路徑。
+- 繁體與簡體中文的子代理標籤統一為「子代理」，並翻譯上層代理的提示文字。
+- 修正展開模型佔比後，Session 清單中的 `CLI` 等來源標籤被擠壓換行的問題。
+- 修正會話列表的樹狀連接線覆蓋「子代理」標籤的問題，線條與標籤保留固定間距。
+
+### 資料影響
+
+- Codex 解析遷移標記升級至 `migration:codex_session_identity_v9`，首次同步會重新解析預設與額外來源中的既有紀錄，更新子代理名稱；不需手動重建資料庫。
+- 額外來源只讀取本機可用檔案，不負責雲端傳輸；請先下載同步資料並保留各工具的子目錄結構。移除來源設定不會刪除已收集的用量。
+
+### 相容性
+
+- `additional_sources` 為選用設定；未設定時沿用預設目錄與既有環境變數。相對路徑以設定檔所在目錄為準，僅使用搜尋順序中第一份存在的設定檔。
+- 不變更資料庫結構或新增環境變數；除上述 Codex 一次性重新解析外，保留主要來源既有的同步進度。
+
+## [1.1.3] - 2026-10-04
+
+此標籤的 Windows 多資料來源整合測試因測試環境缺少 `SystemRoot` 而失敗，發佈未完成；未建立正式 GitHub Release 或 npm 版本，標籤維持原狀。相關功能與修正合併記錄於 `1.1.4`。
+
+## [1.1.2] - 2026-09-30
+
+### 修正
+
+- 補上 `gpt-6.1-sol` 的 Global 與 Cursor 定價規則，修正該模型找不到可用價格規則、無法估算成本的問題；涵蓋 272K 上下文門檻與 Batch/Flex 費率，快取輸入價格依官方費率設為一般輸入的 5%。
+
+### 相容性
+
+- 僅新增模型定價資料；既有資料、API、CLI 參數與安裝流程均可沿用，未變更資料庫結構或環境變數。
 
 ## [1.1.1] - 2026-09-28
 
@@ -842,7 +1004,18 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.1...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.2...HEAD
+[1.3.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.1...v1.3.2
+[1.3.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.0...v1.3.1
+[1.3.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.2.2...v1.3.0
+[1.2.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.6...v1.2.0
+[1.1.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.5...v1.1.6
+[1.1.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.4...v1.1.5
+[1.1.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.3...v1.1.4
+[1.1.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.2...v1.1.3
+[1.1.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.6...v1.1.0
 [1.0.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.0.5...v1.0.6

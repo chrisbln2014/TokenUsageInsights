@@ -18,11 +18,32 @@ struct UsageDayExportResponse {
 #[derive(Serialize)]
 pub struct AppVersionResponse {
     pub version: &'static str,
+    pub build_date: &'static str,
+    pub syncing: bool,
+    pub initial_sync_completed: bool,
+    pub data_revision: u64,
 }
 
 pub async fn get_app_version() -> Json<AppVersionResponse> {
+    let sync_status = db::get_sync_runtime_status();
     Json(AppVersionResponse {
         version: crate::APP_VERSION,
+        build_date: crate::APP_BUILD_DATE,
+        syncing: sync_status.syncing,
+        initial_sync_completed: sync_status.initial_sync_completed,
+        data_revision: sync_status.data_revision,
+    })
+}
+
+/// Cloud Run snapshot 模式沒有背景同步，資料在載入 snapshot 時即已就緒；
+/// 回報為已完成同步，避免前端每 2 秒無限輪詢 /api/version。
+pub async fn get_snapshot_app_version() -> Json<AppVersionResponse> {
+    Json(AppVersionResponse {
+        version: crate::APP_VERSION,
+        build_date: crate::APP_BUILD_DATE,
+        syncing: false,
+        initial_sync_completed: true,
+        data_revision: 0,
     })
 }
 
@@ -425,6 +446,7 @@ mod tests {
         let Json(response) = get_app_version().await;
 
         assert_eq!(response.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(response.build_date, crate::APP_BUILD_DATE);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "token-usage-insights"
-version = "1.1.1"
+version = "1.3.2"
 edition = "2021"
 default-run = "token-usage-insights"
 
@@ -9,6 +9,7 @@ axum = "0.7"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["raw_value"] }
+serde_yaml_ng = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 tower-http = { version = "0.5", features = ["fs", "cors", "set-header"] }
 tower = { version = "0.5", features = ["util"] }
@@ -21,6 +22,7 @@ flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 self-replace = "1.5.0"
+base64 = "0.22"
 
 [dev-dependencies]
 

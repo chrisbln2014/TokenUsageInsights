@@ -46,7 +46,7 @@ http://localhost:3003
 
 | 도구 | 추가 설정 | 기본 데이터 원본 | 설명 |
 | --- | --- | --- | --- |
-| Google Antigravity CLI | 필요 | `~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
+| Google Antigravity CLI | 불필요 | `~/.gemini/antigravity-cli/brain/` / `conversations/` | 기본 Session Token 및 모델 정보를 읽으며 기존 `usage/` 파일도 지원 |
 | GitHub Copilot CLI | 필요 | `~/.copilot/usage/usage-YYYY-MM-DD.jsonl` | `statusline-token.sh` 또는 Windows의 `statusline-token.ps1`로 Token 데이터를 수집 |
 | GitHub Copilot App | 불필요 | `~/.copilot/data.db`, `~/.copilot/session-store.db` | 대시보드가 데스크톱 앱의 로컬 SQLite를 직접 읽음 |
 | GitHub Copilot Chat(VS Code) | 불필요 | VS Code `workspaceStorage/chatSessions` | VS Code Stable 및 Insiders의 로컬 채팅 Session을 직접 스캔 |
@@ -149,58 +149,24 @@ http://localhost:3003/?agent=copilot&tab=daily&date=2026-08-09&dir=~/projects/To
 
 * * *
 
-## Google Antigravity CLI 설정
+## Google Antigravity CLI 로컬 데이터 소스
 
-Antigravity CLI는 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 각 대화 후 누적 Token과 증분을 다음 위치에 기록합니다.
-
-```text
-~/.gemini/antigravity-cli/usage/usage-YYYY-MM-DD.jsonl
-```
-
-### 1. 수집 스크립트 설치
-
-한 줄 설치가 끝난 후 다음을 실행합니다.
-
-```bash
-mkdir -p ~/.gemini/antigravity-cli && cp ~/.local/share/token-usage-insights/shell/antigravity/statusline-token.sh ~/.gemini/antigravity-cli/statusline-token.sh && chmod +x ~/.gemini/antigravity-cli/statusline-token.sh
-```
-
-사용자 지정 설치 위치를 사용한다면 명령의 `~/.local/share/token-usage-insights`를 `TOKEN_USAGE_INSIGHTS_INSTALL_DIR`로 지정한 위치로 바꾸세요.
-
-### 2. `~/.gemini/antigravity-cli/settings.json` 설정
-
-파일이 없다면 다음 내용으로 만들 수 있습니다. 이미 존재한다면 `statusLine` 블록만 병합하고 기존 설정을 덮어쓰지 마세요.
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "/ABSOLUTE/HOME/.gemini/antigravity-cli/statusline-token.sh",
-    "padding": 1
-  }
-}
-```
-
-`/ABSOLUTE/HOME`을 `echo $HOME`에 표시되는 실제 홈 디렉터리 경로(예: `/Users/your-name` 또는 `/home/your-name`)로 바꾸세요.
-
-### 3. 확인
-
-```bash
-echo '{}' | ~/.gemini/antigravity-cli/statusline-token.sh
-jq . ~/.gemini/antigravity-cli/settings.json
-```
-
-그 후 Antigravity CLI Session에 다시 들어가면 상태 표시줄에 다음과 비슷한 형식이 출력됩니다.
+**Antigravity CLI는 Status Line 설정, Hook 또는 수집 스크립트가 필요하지 않습니다.** CLI에서 대화한 후 다음 기본 기록을 직접 읽습니다.
 
 ```text
-model-name • #3 • input 12.3k • cache 4.5k/0 • output 1.2k • reasoning 500 • total 18.5k
+~/.gemini/antigravity-cli/brain/<session-id>/.system_generated/logs/transcript_full.jsonl
+~/.gemini/antigravity-cli/conversations/<session-id>.db
 ```
+
+각 응답의 입력, 캐시 읽기, 출력 Token과 Session 데이터베이스의 모델 정보로 비용을 추정합니다. 추정치는 Antigravity의 실제 청구 금액과 다를 수 있습니다. 모델이나 가격을 알 수 없으면 신뢰할 수 있는 추정이 불가능하며 무료를 의미하지 않습니다.
+
+Windows 기본 디렉터리는 `%USERPROFILE%\.gemini\antigravity-cli`입니다. `ANTIGRAVITY_DIR` 또는 추가 데이터 소스 설정으로 변경할 수 있습니다. 기록을 복사할 때 `brain/`과 `conversations/`를 모두 보관하세요. 기존 `usage/usage-YYYY-MM-DD.jsonl`도 지원하므로 기존 기록이나 설정을 삭제할 필요가 없습니다.
 
 * * *
 
 ## GitHub Copilot CLI 설정
 
-Copilot CLI도 Antigravity CLI와 마찬가지로 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 Token 데이터를 다음 위치에 기록합니다.
+Copilot CLI는 이 프로젝트의 Status Line 스크립트를 `settings.json`에 연결해야 합니다. 스크립트는 Token 데이터를 다음 위치에 기록합니다.
 
 ```text
 ~/.copilot/usage/usage-YYYY-MM-DD.jsonl
@@ -589,6 +555,53 @@ update_check_interval: 1   # 업데이트 확인 주기 (일 단위)
 
 우선순위: 명령줄 플래그(예: `--no-auto-update`) > 환경 변수(예: `TOKEN_USAGE_INSIGHTS_AUTO_UPDATE`) > `config.yaml` 설정 파일 > 기본값.
 
+<a id="additional-sources"></a>
+
+#### 추가 데이터 소스: 여러 홈과 컴퓨터 통합
+
+같은 `config.yaml`에 `additional_sources`를 추가하면 도구별로 여러 데이터 루트를 지정할 수 있습니다. 서로 다른 `CODEX_HOME`이나 클라우드 드라이브에서 로컬로 내려받은 다른 컴퓨터의 로그를 함께 분석하세요.
+
+```yaml
+additional_sources:
+  codex:
+    - '~/work-codex'
+    - '~/Cloud Drive/laptop/.codex'
+    - '~/Cloud Drive/desktop/.codex'
+  claude: ['~/Cloud Drive/laptop/.claude']
+  copilot: ['~/Cloud Drive/laptop/.copilot']
+  copilot_app: ['~/Cloud Drive/desktop/.copilot']
+  cursor: ['~/Cloud Drive/laptop/.cursor']
+  antigravity: ['~/Cloud Drive/laptop/antigravity-cli']
+  grok: ['~/Cloud Drive/laptop/.grok']
+  pi: ['~/Cloud Drive/laptop/.pi']
+  omp: ['~/Cloud Drive/laptop/.omp']
+  muse: ['~/Cloud Drive/laptop/muse']
+  mcode: ['~/Cloud Drive/laptop/.minimax/v2']
+  vscode: ['~/Cloud Drive/laptop/Code']
+```
+
+- 추가 경로는 기본 소스에 **추가**됩니다. 기본 디렉터리는 계속 검색하며 `CODEX_DIR` 등 기존 환경 변수는 주 소스를 재정의합니다. 사용하지 않는 도구는 생략하거나 `[]`로 설정하세요.
+- 시작 시, 백그라운드 동기화, **지금 동기화** 실행 시 설정을 다시 읽습니다. 저장 후 지금 동기화를 누르면 재시작 없이 적용됩니다.
+- 절대 경로, `~`, `$HOME`, `%USERPROFILE%`, `%LOCALAPPDATA%`, `%APPDATA%`를 지원합니다. 상대 경로는 선택된 설정 파일의 디렉터리를 기준으로 합니다. Windows 경로는 YAML 작은따옴표로 감싸세요. 예: `'D:\Cloud Drive\laptop\.codex'`.
+- 컴퓨터별로 별도 폴더와 원래 하위 디렉터리 구조를 유지하고 클라우드 파일을 로컬에 다운로드하세요. 전송은 클라우드 드라이브가 담당하며 `token_usage_insights.db`를 공유할 필요가 없습니다.
+- 중복 경로와 같은 디렉터리를 가리키는 심볼릭 링크는 한 번만 읽습니다. 동일한 Codex rollout 사본은 중복 제거하며 다른 도구는 기존 Session 식별 규칙을 유지합니다. 없는 디렉터리는 건너뛰고 다음에 다시 시도합니다. 설정에서 소스를 제거해도 가져온 사용량은 남지만 대화 상세에는 원본 파일이 필요합니다.
+- 데이터 디렉터리(`INSIGHTS_DIR` 우선), 플랫폼 기본 데이터 디렉터리, 작업 디렉터리 순서로 검색하여 처음 존재하는 `config.yaml`만 읽습니다. YAML 또는 목록 형식이 잘못되면 동기화 오류를 표시합니다.
+
+| 키 | 루트 내부의 데이터 |
+| --- | --- |
+| `codex` | `sessions/`, `archived_sessions/`. 하위 폴더 대신 `CODEX_HOME` 지정 |
+| `claude`, `cursor` | `projects/` |
+| `copilot` | `usage/`, `session-state/`, `session-store.db`. 같은 홈의 App 데이터도 가져옴 |
+| `copilot_app` | 별도 App 홈의 `data.db`, `session-store.db`, `session-state/` |
+| `antigravity` | 기본 `brain/`, `conversations/` 기록 및 기존 `usage/` 지원 |
+| `grok`, `muse` | `sessions/` |
+| `pi`, `omp` | `agent/sessions/` |
+| `mcode` | `.minimax/v2` 아래 `sessions/` 및 선택적 `sqlite/runtime-state.sqlite` |
+| `vscode` | VS Code 사용자 데이터 루트 아래 `User/workspaceStorage/` |
+
+Cursor 추가 루트에 해당 컴퓨터의 `state.vscdb`(원래 `User/globalStorage/`에 위치)를 두면 모델 정보를 보완합니다. MiniMax Code 추가 루트는 자체 `sqlite/runtime-state.sqlite`를 사용합니다. 주 소스에는 기존 `CURSOR_STATE_DB` 및 `MCODE_STATE_DB` 설정이 적용됩니다.
+
+
 > **기본 바인딩은 `0.0.0.0`이므로 같은 로컬 네트워크의 다른 장치가 대시보드에 연결할 수 있습니다. 로컬에서만 보려면 `HOST`를 `127.0.0.1`로 설정하세요.**
 
 예:
@@ -782,14 +795,14 @@ token-usage-insights update --check
 # 최신 버전으로 자동 업데이트 (--force, --target-version 지원)
 token-usage-insights update
 token-usage-insights update --force
-token-usage-insights update --target-version v1.1.1
+token-usage-insights update --target-version v1.1.4
 ```
 
 환경 변수로 버전과 설치 경로를 제어할 수 있습니다(모두 선택 사항).
 
 | 변수 | 대상 플랫폼 | 설명 |
 | --- | --- | --- |
-| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v1.1.1`); 기본값은 `latest` |
+| `TOKEN_USAGE_INSIGHTS_VERSION` | Linux / macOS / Windows | 설치할 Release tag(예: `v1.1.4`); 기본값은 `latest` |
 | `TOKEN_USAGE_INSIGHTS_INSTALL_DIR` | Linux / macOS | `install.sh`에 전달할 설치 디렉터리 |
 | `TOKEN_USAGE_INSIGHTS_BIN_DIR` | Linux / macOS | `install.sh`에 전달할 실행 파일 링크 디렉터리 |
 
@@ -903,7 +916,7 @@ systemctl --user reset-failed
 도구별로 데이터 원본이 존재하는지 확인합니다.
 
 ```bash
-ls ~/.gemini/antigravity-cli/usage
+ls ~/.gemini/antigravity-cli/brain
 ls ~/.copilot/usage
 ls ~/.copilot/data.db ~/.copilot/session-store.db
 ls ~/.codex/sessions
@@ -916,12 +929,12 @@ ls ~/.omp/agent/sessions
 ls ~/.local/share/muse/sessions
 ```
 
-Antigravity CLI와 Copilot CLI는 `settings.json`에 `statusLine`이 설정되어 있고 스크립트에 실행 권한이 있는지도 확인해야 합니다.
+Copilot CLI는 `settings.json`에 `statusLine`이 설정되어 있고 스크립트에 실행 권한이 있는지도 확인해야 합니다.
 
 Windows PowerShell에서는 네이티브 데이터 디렉터리를 직접 확인할 수 있습니다.
 
 ```powershell
-Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\usage"
+Get-ChildItem "$env:USERPROFILE\.gemini\antigravity-cli\brain"
 Get-ChildItem "$env:USERPROFILE\.copilot\usage"
 Get-ChildItem "$env:USERPROFILE\.copilot\data.db", "$env:USERPROFILE\.copilot\session-store.db"
 Get-ChildItem "$env:USERPROFILE\.codex\sessions"
@@ -934,7 +947,7 @@ Get-ChildItem "$env:USERPROFILE\.omp\agent\sessions"
 Get-ChildItem "$env:USERPROFILE\.local\share\muse\sessions"
 ```
 
-### Status Line 스크립트를 실행할 수 없음
+### Status Line 스크립트를 실행할 수 없음 (Copilot CLI 또는 선택적인 기존 Antigravity 수집기)
 
 ```bash
 command -v jq
@@ -949,6 +962,14 @@ Status Line 스크립트는 CLI가 전달한 JSON을 분석하기 위해 `jq`에
 ```powershell
 Write-Output '{}' | powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.gemini\antigravity-cli\statusline-token.ps1" -Assistant antigravity
 ```
+
+Windows의 `settings.json`에는 대시보드 설정 마법사가 생성한 `command`를 그대로 사용하세요. 경로는 `/`로 구분하고 따옴표는 붙이지 않습니다. 예:
+
+```json
+"command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:/Users/YOUR_NAME/.gemini/antigravity-cli/statusline-token.ps1 -Assistant antigravity"
+```
+
+Antigravity CLI와 Copilot CLI는 `command`를 공백으로 나눈 뒤 셸을 거치지 않고 직접 실행합니다. 경로를 `\"...\"`로 감싸거나 `\\` 역슬래시를 남기면 `powershell.exe -File`이 따옴표가 포함된 경로를 받아 스크립트를 찾지 못합니다. 스크립트 경로에 공백, `&`, 비 ASCII 문자 등 분할되거나 `cmd.exe`가 해석할 수 있는 문자가 있으면 대시보드는 `-EncodedCommand <Base64>` 형식(`& '<path>' -Assistant antigravity`의 UTF-16LE Base64)을 생성합니다. 이는 어떤 호스트에서도 단일한 안전한 토큰입니다.
 
 ### 설정 파일 JSON 형식 오류
 

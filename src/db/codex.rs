@@ -23,7 +23,7 @@ pub(super) fn find_codex_session_files(dir: &Path) -> Vec<PathBuf> {
 
 fn codex_content_to_text(content: &serde_json::Value) -> String {
     if let Some(text) = content.as_str() {
-        return text.replace('\r', "").replace('\n', " ");
+        return text.to_string();
     }
 
     let mut parts = Vec::new();
@@ -32,14 +32,36 @@ fn codex_content_to_text(content: &serde_json::Value) -> String {
             match item.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                 "input_text" | "output_text" | "text" => {
                     if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.replace('\r', "").replace('\n', " "));
+                        parts.push(text.to_string());
                     }
                 }
                 _ => {}
             }
         }
     }
-    parts.join(" ")
+    parts.join("\n")
+}
+
+fn codex_subagent_task_name(payload: &serde_json::Value, agent_path: &str) -> Option<String> {
+    // Forked transcripts can contain other agents' assignments. Only use the
+    // first NEW_TASK addressed to the agent identified by this rollout.
+    if payload.get("recipient").and_then(|value| value.as_str()) != Some(agent_path) {
+        return None;
+    }
+    let content = codex_content_to_text(payload.get("content")?).replace('\r', "");
+    let (header, prompt) = content.split_once("\nPayload:")?;
+    if header.lines().next()?.trim() != "Message Type: NEW_TASK" {
+        return None;
+    }
+
+    // Some Codex versions encrypt the assignment body. Show only the task name
+    // from its readable agent path; the full path is used for matching above.
+    let name = if prompt.trim().is_empty() {
+        agent_path.rsplit('/').find(|part| !part.is_empty())?
+    } else {
+        prompt.trim()
+    };
+    Some(name.replace('\n', " ").chars().take(100).collect())
 }
 
 fn codex_source_kind_from_metadata(payload: &serde_json::Value) -> &'static str {
@@ -163,8 +185,23 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
         .trim_start_matches("rollout-")
         .to_string();
 
-    let mut events = Vec::new();
+    let mut session_id = fallback_session_id.clone();
+    let mut session_name_selector = InitialUserPromptSelector::default();
+    let mut subagent_path: Option<String> = None;
+    let mut subagent_task_name = None;
+    let mut session_cwd: Option<String> = None;
+    let mut session_version: Option<String> = None;
+    let mut parent_session_id: Option<String> = None;
+    let mut agent_nickname: Option<String> = None;
+    let mut agent_role: Option<String> = None;
+    let mut current_model = "GPT-5.3-Codex".to_string();
+    let mut reasoning_effort: Option<String> = None;
+    let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
+    let mut session_identity_locked = false;
+    let mut completed_task_duration_ms: Option<u64> = None;
+    let mut turn_and_token_events = Vec::new();
     let mut malformed_lines = 0usize;
+
     for line_res in reader.lines() {
         let line = match line_res {
             Ok(line) => line,
@@ -176,26 +213,29 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) {
-            events.push(event);
-        } else {
-            malformed_lines += 1;
+
+        let name_selection_done = session_name_selector.is_complete()
+            && (subagent_path.is_none() || subagent_task_name.is_some());
+        if name_selection_done
+            && !line.contains("token_count")
+            && !line.contains("turn_context")
+            && !line.contains("session_meta")
+            && !line.contains("task_complete")
+        {
+            if serde_json::from_str::<serde::de::IgnoredAny>(&line).is_err() {
+                malformed_lines += 1;
+            }
+            continue;
         }
-    }
 
-    let mut session_id = fallback_session_id.clone();
-    let mut session_name_selector = InitialUserPromptSelector::default();
-    let mut session_cwd: Option<String> = None;
-    let mut session_version: Option<String> = None;
-    let mut parent_session_id: Option<String> = None;
-    let mut agent_nickname: Option<String> = None;
-    let mut agent_role: Option<String> = None;
-    let mut current_model = "GPT-5.3-Codex".to_string();
-    let mut reasoning_effort: Option<String> = None;
-    let mut source_kind = CODEX_OTHER_SOURCE_KIND.to_string();
-    let mut session_identity_locked = false;
+        let event = match serde_json::from_str::<serde_json::Value>(&line) {
+            Ok(event) => event,
+            Err(_) => {
+                malformed_lines += 1;
+                continue;
+            }
+        };
 
-    for event in &events {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let payload = match event.get("payload") {
             Some(payload) => payload,
@@ -211,6 +251,11 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
                 source_kind = detected_source_kind.to_string();
             }
             if !session_identity_locked {
+                subagent_path = payload
+                    .pointer("/source/subagent/thread_spawn/agent_path")
+                    .and_then(|value| value.as_str())
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_string);
                 if let Some(id) = payload
                     .get("id")
                     .and_then(|id| id.as_str())
@@ -272,6 +317,11 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
         }
 
         match (event_type, payload_type) {
+            ("response_item", "agent_message") if subagent_task_name.is_none() => {
+                if let Some(agent_path) = subagent_path.as_deref() {
+                    subagent_task_name = codex_subagent_task_name(payload, agent_path);
+                }
+            }
             ("event_msg", "user_message") => {
                 if let Some(message) = payload.get("message").and_then(|message| message.as_str()) {
                     session_name_selector.observe_user_prompt(message);
@@ -293,26 +343,26 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
             {
                 session_name_selector.observe_non_user_message();
             }
+            ("event_msg", "task_complete") => {
+                if let Some(duration_ms) = payload.get("duration_ms").and_then(|v| v.as_u64()) {
+                    completed_task_duration_ms = Some(
+                        completed_task_duration_ms
+                            .unwrap_or_default()
+                            .saturating_add(duration_ms),
+                    );
+                }
+            }
             _ => {}
+        }
+
+        if event_type == "turn_context"
+            || (event_type == "event_msg" && payload_type == "token_count")
+        {
+            turn_and_token_events.push(event);
         }
     }
 
-    let session_name = session_name_selector.into_name();
-    let completed_task_duration_ms = events
-        .iter()
-        .filter_map(|event| {
-            if event.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
-                return None;
-            }
-            let payload = event.get("payload")?;
-            if payload.get("type").and_then(|value| value.as_str()) != Some("task_complete") {
-                return None;
-            }
-            payload.get("duration_ms").and_then(|value| value.as_u64())
-        })
-        .fold(None::<u64>, |total, duration_ms| {
-            Some(total.unwrap_or_default().saturating_add(duration_ms))
-        });
+    let session_name = subagent_task_name.or_else(|| session_name_selector.into_name());
 
     if parent_session_id.as_deref() == Some(session_id.as_str()) {
         parent_session_id = None;
@@ -323,7 +373,7 @@ pub(super) fn parse_codex_session_file_with_diagnostics(
     let mut effort_for_turn = reasoning_effort.clone();
     let mut previous_total_usage: Option<CodexTokenUsage> = None;
 
-    for event in events {
+    for event in turn_and_token_events {
         let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = event
             .get("timestamp")
@@ -572,6 +622,58 @@ mod tests {
             Some("parent-session")
         );
         assert_ne!(entries[0].session_id, "parent-session");
+    }
+
+    #[test]
+    fn parse_codex_subagent_uses_its_assigned_prompt_instead_of_inherited_messages() {
+        let path = temp_jsonl_path("codex-subagent-prompt");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"主代理的提示詞"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":"主代理的回覆"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/another","content":"Message Type: NEW_TASK\nTask name: /root/another\nSender: /root\nPayload:\n其他代理的任務"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"# AGENTS.md instructions"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n"},{"type":"input_text","text":"檢查資料匯入的錯誤處理。\n只回報具體問題。"}]}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n後續任務"}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        fs::write(&path, content).unwrap();
+
+        let parsed = parse_codex_session_file_with_diagnostics(&path).unwrap();
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(parsed.malformed_lines, 0);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(
+            parsed.entries[0].session_name.as_deref(),
+            Some("檢查資料匯入的錯誤處理。 只回報具體問題。")
+        );
+    }
+
+    #[test]
+    fn parse_codex_subagent_uses_task_name_when_assigned_prompt_is_encrypted() {
+        let path = temp_jsonl_path("codex-subagent-encrypted");
+        let content = r##"{"type":"session_meta","payload":{"id":"child","parent_thread_id":"parent","source":{"subagent":{"thread_spawn":{"agent_path":"/root/reviewer"}}}}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":"# AGENTS.md instructions"}}
+{"type":"response_item","payload":{"type":"agent_message","recipient":"/root/reviewer","content":[{"type":"input_text","text":"Message Type: NEW_TASK\nTask name: /root/reviewer\nSender: /root\nPayload:\n"},{"type":"encrypted_content","encrypted_content":"unreadable-test-data"}]}}
+{"timestamp":"2026-10-04T10:00:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110}}}}
+"##;
+        for (agent_path, expected_name) in [
+            ("/root/kyc250r1_auth_test_plan", "kyc250r1_auth_test_plan"),
+            ("/root/reviewer/auth_test_plan", "auth_test_plan"),
+            ("reviewer", "reviewer"),
+        ] {
+            fs::write(&path, content.replace("/root/reviewer", agent_path)).unwrap();
+
+            let parsed = parse_codex_session_file_with_diagnostics(&path).unwrap();
+
+            assert_eq!(parsed.malformed_lines, 0);
+            assert_eq!(parsed.entries.len(), 1);
+            assert_eq!(
+                parsed.entries[0].session_name.as_deref(),
+                Some(expected_name)
+            );
+        }
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

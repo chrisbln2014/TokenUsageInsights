@@ -1,4 +1,4 @@
-import i18n from './i18n.js?v=37';
+import i18n from './i18n.js?v=38';
 import {
   aggregateDailyTokenCandles,
   calculateCandleViewport,
@@ -267,17 +267,17 @@ function getUrlDateForTab(tab) {
   if (!urlDate) return null;
   
   if (tab === 'daily') {
-    return urlDate;
+    return /^\d{4}-\d{2}-\d{2}$/.test(urlDate) ? urlDate : null;
   } else if (tab === 'monthly') {
     if (/^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
       return urlDate.substring(0, 7);
     }
-    return urlDate;
+    return /^\d{4}-\d{2}$/.test(urlDate) ? urlDate : null;
   } else if (tab === 'yearly') {
-    if (/^\d{4}-\d{2}(-\d{2})?$/.test(urlDate)) {
+    if (/^\d{4}(-\d{2}(-\d{2})?)?$/.test(urlDate)) {
       return urlDate.substring(0, 4);
     }
-    return urlDate;
+    return null;
   }
   return urlDate;
 }
@@ -337,6 +337,8 @@ let currentSessionReasoningTokens = 0;
 let currentSessionCwd = '';
 let currentSessionModel = '';
 let currentSessionAssistantType = '';
+let currentSessionAgentNickname = '';
+let currentSessionAgentRole = '';
 let availableDates = [];
 let pricingRules = [];
 
@@ -660,7 +662,7 @@ function setSetupModalTitle(assistant) {
 function setSetupModalBody(assistant) {
   const bodyIds = {
     all: 'setup-body-all',
-    antigravity: 'setup-body-statusline',
+    antigravity: 'setup-body-antigravity',
     copilot: 'setup-body-statusline',
     codex: 'setup-body-codex',
     claude: 'setup-body-claude',
@@ -769,9 +771,40 @@ function updateLanguageUI() {
   updateCodexRateLimit();
 }
 
+let startupSyncKnownRevision = null;
+let startupSyncRefreshInFlight = false;
+
+async function refreshDashboardAfterSyncAdvance() {
+  if (startupSyncRefreshInFlight) return;
+  startupSyncRefreshInFlight = true;
+  try {
+    const dateSelect = document.getElementById('date-select');
+    const wasFollowingLatestDate =
+      activeTab === 'daily' &&
+      !initialUrlParams.get('date') &&
+      (!dateSelect?.value ||
+        availableDates.length === 0 ||
+        dateSelect.value === availableDates[0]);
+
+    if (wasFollowingLatestDate && dateSelect) {
+      dateSelect.value = '';
+    }
+
+    await fetchDates(wasFollowingLatestDate ? null : dateSelect?.value || null);
+    if (activeTab === 'monthly') {
+      await reloadMonthlyData();
+    } else if (activeTab === 'yearly') {
+      await reloadYearlyData();
+    }
+  } catch (error) {
+    console.error('背景同步完成後自動刷新失敗', error);
+  } finally {
+    startupSyncRefreshInFlight = false;
+  }
+}
+
 async function loadAppVersion() {
   const versionElement = document.getElementById('app-version');
-  if (!versionElement) return;
 
   try {
     const response = await fetch('/api/version', { cache: 'no-store' });
@@ -781,11 +814,33 @@ async function loadAppVersion() {
 
     const payload = await response.json();
     const version = typeof payload.version === 'string' ? payload.version.trim() : '';
-    if (!version) {
-      throw new Error('版本 API 未提供有效版本');
+    if (version && versionElement) {
+      versionElement.textContent = `v${version}`;
     }
 
-    versionElement.textContent = `v${version}`;
+    const buildDateElement = document.getElementById('app-build-date');
+    const buildDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(typeof payload.build_date === 'string' ? payload.build_date : '');
+    if (buildDateElement && buildDateMatch) {
+      const [, year, month, day] = buildDateMatch;
+      buildDateElement.dateTime = payload.build_date;
+      buildDateElement.textContent = `(${Number(year)}/${Number(month)}/${Number(day)})`;
+      buildDateElement.hidden = false;
+    }
+
+    if (typeof payload.data_revision === 'number') {
+      if (startupSyncKnownRevision === null) {
+        startupSyncKnownRevision = payload.data_revision;
+      } else if (payload.data_revision > startupSyncKnownRevision) {
+        startupSyncKnownRevision = payload.data_revision;
+        await refreshDashboardAfterSyncAdvance();
+      }
+    }
+
+    if (payload.syncing || payload.initial_sync_completed === false) {
+      window.setTimeout(() => {
+        void loadAppVersion();
+      }, 2000);
+    }
   } catch (error) {
     console.error('無法載入應用程式版本', error);
   }
@@ -1519,10 +1574,17 @@ function initApp() {
 // =========================================================================
 // Tab 切換邏輯
 // =========================================================================
-function switchTab(tab) {
+function switchTab(tab, options = {}) {
   if (activeTab === tab) return;
   activeTab = tab;
   setCookie('active_tab', tab);
+
+  if (tab === 'daily') {
+    const dateSelect = document.getElementById('date-select');
+    if (dateSelect && (!dateSelect.value || !options.preserveDate)) {
+      dateSelect.value = getUtcDateString();
+    }
+  }
   updateUrlParams();
 
   // Update custom hover dropdown UI
@@ -1585,7 +1647,10 @@ function switchTab(tab) {
 
     // 載入當前日期的數據
     const dateSelect = document.getElementById('date-select');
-    if (dateSelect.value && availableDates.length > 0) {
+    if (dateSelect && !dateSelect.value) {
+      dateSelect.value = getUtcDateString();
+    }
+    if (dateSelect && dateSelect.value && availableDates.length > 0) {
       loadUsageData(dateSelect.value);
     } else if (availableDates.length === 0) {
       toggleEmptyState(true, currentAssistant);
@@ -1776,6 +1841,7 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     if (currentAssistant !== resolvedAssistant) return;
     
     const dateSelect = document.getElementById('date-select');
+    const todayStr = getUtcDateString();
     availableDates = data.dates || [];
 
     if (availableDates.length === 0) {
@@ -1783,9 +1849,9 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
       currentMonthlyData = null;
       currentYearlyData = null;
       if (dateSelect) {
-        dateSelect.value = '';
+        dateSelect.value = todayStr;
         dateSelect.min = '';
-        dateSelect.max = '';
+        dateSelect.max = todayStr;
       }
       toggleEmptyState(true, resolvedAssistant);
       return;
@@ -1794,7 +1860,6 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     // 設定日曆最小與最大值
     const oldestDate = availableDates.length > 0 ? availableDates[availableDates.length - 1] : null;
     const newestDate = availableDates.length > 0 ? availableDates[0] : null;
-    const todayStr = getUtcDateString();
     
     if (oldestDate) dateSelect.min = oldestDate;
     dateSelect.max = todayStr;
@@ -1803,13 +1868,14 @@ async function fetchDates(selectedDate = null, keepDate = false, assistant = cur
     if (keepDate) {
       // 切換 agent：保留目前日期，不自動跳轉
       dateToLoad = dateSelect.value || todayStr;
+      dateSelect.value = dateToLoad;
     } else {
       const urlDate = getUrlDateForTab('daily');
       dateToLoad = selectedDate || urlDate || dateSelect.value;
       if (!dateToLoad || (!selectedDate && !urlDate && !availableDates.includes(dateToLoad))) {
-        // 若有啟用即時刷新，預設為今日；否則預設為最新有日誌的日期
+        // 若有啟用即時刷新或目前不在每日分頁，預設為 UTC 今日；否則預設為最新有日誌的日期
         const liveToggle = document.getElementById('live-toggle');
-        if (liveToggle && liveToggle.checked) {
+        if ((liveToggle && liveToggle.checked) || activeTab !== 'daily') {
           dateToLoad = todayStr;
         } else {
           dateToLoad = newestDate || todayStr;
@@ -4479,8 +4545,8 @@ function sortAndGetFlatSessions(sessions, sortCol, sortDir) {
     flat.push({
       ...node,
       depth,
-      isSubagent: depth > 0,
-      parentName
+      isSubagent: depth > 0 || Boolean(node.parent_session_id),
+      parentName: parentName || node.parent_session_id || null
     });
     node.children
       .sort(compare)
@@ -4681,7 +4747,7 @@ function renderSessionTable(sessions) {
 
     const astColumn = (currentAssistant === 'all' || currentAssistant.includes(',')) ? `<td class="session-agent-column">${assistantBadge}</td>` : '';
 
-    // 依據 depth 縮排會話名稱，並呈現└─ 符號與 subagent tag
+    // 依據 depth 縮排會話名稱，並呈現樹狀連接線與子代理標籤
     let nameCellContent = '';
     if (s.isSubagent) {
       const paddingLeft = s.depth * 16;
@@ -4690,11 +4756,10 @@ function renderSessionTable(sessions) {
       // Subagent 第一列只顯示具實際語意的角色，排除與 Subagent badge 重複的 sub-agent/subagent
       const rawRole = (s.agent_role || '').trim();
       const semanticRole = rawRole && !['sub-agent', 'subagent'].includes(rawRole.toLowerCase()) ? rawRole : '';
-      // Subagent 顯示 parent session title，避免 collector 自動產生的 (subagent call_xxx) 後綴
-      const subagentDisplayName = s.parentName || s.session_name;
+      const subagentDisplayName = s.session_name || s.session_id;
       nameCellContent = `
         <div class="session-name-wrapper is-subagent" style="padding-left: ${paddingLeft}px;">
-          <span class="tree-connector" style="left: ${connectorLeft}px;">└─</span>
+          ${s.depth > 0 ? `<span class="tree-connector" style="left: ${connectorLeft}px;" aria-hidden="true"></span>` : ''}
           <div style="display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-bottom: 3px;">
             <span class="badge subagent-badge" title="${escapeHtml(t('subagent_parent_label'))}: ${escapeHtml(s.parentName || '')}">${escapeHtml(t('subagent_label'))}</span>
             ${nameSourceBadge}
@@ -4803,6 +4868,8 @@ async function openSessionTimeline(session) {
   currentSessionCwd = cwd || '';
   currentSessionModel = model || '';
   currentSessionAssistantType = assistantType || '';
+  currentSessionAgentNickname = agentNickname || '';
+  currentSessionAgentRole = agentRole || '';
 
   // 設定基礎抬頭 (截斷至 100 字元，滑鼠移過去可以看到全部)
   let displayName = sessionName || '';
@@ -4922,6 +4989,8 @@ function renderTimeline(data) {
   const finalCwd = metadata.cwd || currentSessionCwd || '-';
   const displayCwd = abbreviateHomePath(finalCwd) || '-';
   const finalModel = metadata.selected_model || currentSessionModel || '-';
+  const finalNickname = metadata.agent_nickname || currentSessionAgentNickname || '';
+  const finalRole = metadata.agent_role || currentSessionAgentRole || '';
 
   // 更新 Metadata 區塊
   document.getElementById('meta-cwd').textContent = displayCwd;
@@ -4934,15 +5003,15 @@ function renderTimeline(data) {
   const nicknameContainer = document.getElementById('drawer-meta-nickname-container');
   const roleContainer = document.getElementById('drawer-meta-role-container');
 
-  if (metadata.agent_nickname) {
-    document.getElementById('meta-nickname').textContent = metadata.agent_nickname;
+  if (finalNickname) {
+    document.getElementById('meta-nickname').textContent = finalNickname;
     if (nicknameContainer) nicknameContainer.style.display = 'flex';
   } else {
     if (nicknameContainer) nicknameContainer.style.display = 'none';
   }
 
-  if (metadata.agent_role) {
-    document.getElementById('meta-role').textContent = metadata.agent_role;
+  if (finalRole) {
+    document.getElementById('meta-role').textContent = finalRole;
     if (roleContainer) roleContainer.style.display = 'flex';
   } else {
     if (roleContainer) roleContainer.style.display = 'none';
@@ -5932,7 +6001,7 @@ function renderYearlyProjectsTable(projects) {
   tbody.innerHTML = '';
 
   if (projects.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" class="placeholder-text">${t('placeholder_no_projects')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="placeholder-text">${t('placeholder_no_projects')}</td></tr>`;
     return;
   }
 
@@ -5951,6 +6020,7 @@ function renderYearlyProjectsTable(projects) {
         ${formatToken(p.total_tokens)}
         ${p.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(p.total_cache_read_tokens)}</div>` : ''}
       </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(p.cost_usd || 0)}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -6682,7 +6752,7 @@ function renderMonthlyProjectsTable(projects) {
   tbody.innerHTML = '';
 
   if (projects.length === 0) {
-    tbody.innerHTML = `<tr><td colspan="4" class="placeholder-text">${t('placeholder_no_projects')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="5" class="placeholder-text">${t('placeholder_no_projects')}</td></tr>`;
     return;
   }
 
@@ -6701,6 +6771,7 @@ function renderMonthlyProjectsTable(projects) {
         ${formatToken(p.total_tokens)}
         ${p.total_cache_read_tokens ? `<div style="font-size: 0.72rem; font-weight: normal; color: #a5b4fc; margin-top: 3px;" title="${t('chart_cache_label')}">${t('cache_prefix')}${formatToken(p.total_cache_read_tokens)}</div>` : ''}
       </td>
+      <td style="font-weight: 700; color: var(--neon-gold);">${formatCost(p.cost_usd || 0)}</td>
     `;
     tbody.appendChild(tr);
   });
@@ -6917,10 +6988,13 @@ function initThemeToggle() {
 function updateThemeButton(theme) {
   const themeBtn = document.getElementById('theme-toggle-btn');
   if (themeBtn) {
-    const title = theme === 'dark' ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
-    themeBtn.innerHTML = iconMarkup('theme');
+    const isDark = theme === 'dark';
+    const title = isDark ? t('theme_toggle_title_dark') : t('theme_toggle_title_light');
+    const modeClass = isDark ? 'icon-theme-sun' : 'icon-theme-moon';
+    themeBtn.innerHTML = iconMarkup('theme', modeClass);
     themeBtn.title = title;
     themeBtn.setAttribute('aria-label', title);
+    themeBtn.setAttribute('aria-pressed', String(!isDark));
   }
 }
 
@@ -7092,14 +7166,17 @@ async function loadSetupInfo(assistant = currentAssistant) {
     if (resolvedAssistant === ALL_ASSISTANTS) {
       latestAllAgentSetupInfo = data;
       renderAllAgentSourceList(data);
-    } else if (resolvedAssistant === 'antigravity' || resolvedAssistant === 'copilot') {
+    } else if (resolvedAssistant === 'antigravity') {
+      const pathLabel = document.getElementById('lbl-detected-home-antigravity');
+      if (pathLabel) pathLabel.textContent = abbreviateHomePath(data.antigravity?.data_path || '');
+    } else if (resolvedAssistant === 'copilot') {
       const assistantSetup = data[resolvedAssistant] || {};
       const targetScriptPath = assistantSetup.script_path || '';
       const sourceScriptPath = assistantSetup.source_script_path || '';
       const settingsPath = assistantSetup.settings_path || '';
-      const targetScriptCommand = isWindows
-        ? `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${targetScriptPath}" -Assistant ${resolvedAssistant}`
-        : targetScriptPath;
+      // 命令字串由後端依平台產生（見 src/statusline_command.rs）：Windows 不可用雙引號包住路徑，
+      // 否則 Antigravity CLI / Copilot CLI 會把引號原樣傳給 powershell.exe -File 而找不到檔案（issue #64）。
+      const targetScriptCommand = assistantSetup.statusline_command || targetScriptPath;
 
       const settingsJson = JSON.stringify({
         "statusLine": {
@@ -7135,33 +7212,18 @@ async function loadSetupInfo(assistant = currentAssistant) {
       const step5H3 = document.getElementById('setup-step-5');
       const step5DescP = document.getElementById('setup-step-5-desc');
 
-      if (resolvedAssistant === 'copilot') {
-        if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
-        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
-        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
-        if (step1H3) step1H3.setAttribute('data-i18n', 'copilot_setup_step_1');
-        if (step1DescP) step1DescP.setAttribute('data-i18n', 'copilot_setup_step_1_desc');
-        if (step2H3) step2H3.setAttribute('data-i18n', 'copilot_setup_step_2');
-        if (step2DescP) step2DescP.setAttribute('data-i18n', 'copilot_setup_step_2_desc');
-        if (step3H3) step3H3.setAttribute('data-i18n', 'copilot_setup_step_3');
-        if (step4H3) step4H3.setAttribute('data-i18n', 'copilot_setup_step_4');
-        if (step4DescP) step4DescP.setAttribute('data-i18n', 'copilot_setup_step_4_desc');
-        if (step5H3) step5H3.setAttribute('data-i18n', 'copilot_setup_step_5');
-        if (step5DescP) step5DescP.setAttribute('data-i18n', 'copilot_setup_step_5_desc');
-      } else {
-        if (introP) introP.setAttribute('data-i18n', 'setup_modal_intro');
-        if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'setup_step_clone');
-        if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'setup_step_clone_desc');
-        if (step1H3) step1H3.setAttribute('data-i18n', 'setup_step_1');
-        if (step1DescP) step1DescP.setAttribute('data-i18n', 'setup_step_1_desc');
-        if (step2H3) step2H3.setAttribute('data-i18n', 'setup_step_2');
-        if (step2DescP) step2DescP.setAttribute('data-i18n', 'setup_step_2_desc');
-        if (step3H3) step3H3.setAttribute('data-i18n', 'setup_step_3');
-        if (step4H3) step4H3.setAttribute('data-i18n', 'setup_step_4');
-        if (step4DescP) step4DescP.setAttribute('data-i18n', 'setup_step_4_desc');
-        if (step5H3) step5H3.setAttribute('data-i18n', 'setup_step_5');
-        if (step5DescP) step5DescP.setAttribute('data-i18n', 'setup_step_5_desc');
-      }
+      if (introP) introP.setAttribute('data-i18n', 'copilot_setup_modal_intro');
+      if (stepCloneH3) stepCloneH3.setAttribute('data-i18n', 'copilot_setup_step_clone');
+      if (stepCloneDescP) stepCloneDescP.setAttribute('data-i18n', 'copilot_setup_step_clone_desc');
+      if (step1H3) step1H3.setAttribute('data-i18n', 'copilot_setup_step_1');
+      if (step1DescP) step1DescP.setAttribute('data-i18n', 'copilot_setup_step_1_desc');
+      if (step2H3) step2H3.setAttribute('data-i18n', 'copilot_setup_step_2');
+      if (step2DescP) step2DescP.setAttribute('data-i18n', 'copilot_setup_step_2_desc');
+      if (step3H3) step3H3.setAttribute('data-i18n', 'copilot_setup_step_3');
+      if (step4H3) step4H3.setAttribute('data-i18n', 'copilot_setup_step_4');
+      if (step4DescP) step4DescP.setAttribute('data-i18n', 'copilot_setup_step_4_desc');
+      if (step5H3) step5H3.setAttribute('data-i18n', 'copilot_setup_step_5');
+      if (step5DescP) step5DescP.setAttribute('data-i18n', 'copilot_setup_step_5_desc');
 
       // Render to DOM
       const jsonCodeEl = document.getElementById('code-setup-json');
@@ -7361,7 +7423,7 @@ function switchToDailyDate(date) {
     loadUsageData(date);
   } else {
     // switchTab('daily') 內部會自動載入 dateSelect.value
-    switchTab('daily');
+    switchTab('daily', { preserveDate: true });
   }
 }
 
@@ -7453,9 +7515,8 @@ function formatCost(cost) {
   if (cost === null || cost === undefined) return '-';
   const c = Number(cost);
   if (isNaN(c)) return '-';
-  if (c < 1000) return '$' + c.toFixed(2);
-  if (c < 10000) return '$' + c.toFixed(1);
-  return '$' + c.toFixed(0);
+  if (Number(c.toFixed(2)) < 1000) return '$' + c.toFixed(2);
+  return '$' + formatNumber(c.toFixed(0));
 }
 
 async function updateCodexRateLimit() {

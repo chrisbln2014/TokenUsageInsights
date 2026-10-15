@@ -743,7 +743,7 @@ fn build_snapshot_router(static_dir: &PathBuf) -> Router {
     };
 
     Router::new()
-        .route("/api/version", get(get_app_version))
+        .route("/api/version", get(get_snapshot_app_version))
         .route("/api/:assistant/dates", get(snapshot::get_available_dates))
         .route("/api/:assistant/setup-info", get(snapshot::get_setup_info))
         .route(
@@ -930,6 +930,9 @@ mod tests {
             .unwrap();
         let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["version"], env!("CARGO_PKG_VERSION"));
+        // snapshot 模式沒有背景同步，必須回報已完成同步，否則前端會每 2 秒永久輪詢
+        assert_eq!(payload["syncing"], false);
+        assert_eq!(payload["initial_sync_completed"], true);
     }
 
     #[tokio::test]

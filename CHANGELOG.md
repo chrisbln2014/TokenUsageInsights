@@ -26,6 +26,8 @@
 
 ### 修正
 
+- 修正 Cloud Run snapshot 模式下前端每 2 秒無限輪詢 `/api/version` 的問題：snapshot 模式沒有背景
+  同步，但共用的版本端點永遠回報「初次同步未完成」；snapshot router 改用專屬端點，固定回報已完成同步。
 - 修正 Codex、Claude、Copilot（App／CLI Agent／VS Code Chat）、Grok、Pi、OMP、Muse 等助理的
   每日統計在本地時間午夜前後（UTC+8 為 00:00~07:59）被歸到前一天的問題：同步邏輯原本直接截取
   UTC timestamp 字串當日期，未轉換成本地時區；CLI／API 匯入路徑亦有同樣問題。Cursor 在對話缺少

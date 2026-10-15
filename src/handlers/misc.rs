@@ -35,6 +35,18 @@ pub async fn get_app_version() -> Json<AppVersionResponse> {
     })
 }
 
+/// Cloud Run snapshot 模式沒有背景同步，資料在載入 snapshot 時即已就緒；
+/// 回報為已完成同步，避免前端每 2 秒無限輪詢 /api/version。
+pub async fn get_snapshot_app_version() -> Json<AppVersionResponse> {
+    Json(AppVersionResponse {
+        version: crate::APP_VERSION,
+        build_date: crate::APP_BUILD_DATE,
+        syncing: false,
+        initial_sync_completed: true,
+        data_revision: 0,
+    })
+}
+
 #[derive(Deserialize)]
 pub struct UsageDayImportRequest {
     #[serde(default)]

@@ -21,6 +21,9 @@
   有 `build.rs` 並設 `APP_BUILD_DATE=2026-10-15` → 編譯成功，snapshot 模式 `/api/version` 回
   `"build_date":"2026-10-15"`；未設 → `"build_date":""`，`/api/claude/dates` 皆 200。真正的
   `docker build`／Cloud Build 尚待實測。
+  2026-10-16 補實測：Cloud Build（`demoproject-dotnet`，build `fb037d19`，只建置不推映像）以
+  `--build-arg APP_BUILD_DATE=2026-10-15` 建置成功（release 4m37s、零 warning），容器以 repo 內測試用
+  snapshot 啟動後 `/api/version` 回 `"build_date":"2026-10-15"`，`/api/claude/dates` 200。
 
 ### 2026-09-23 - 修正 codex/claude/copilot/grok/pi/omp/muse 本地午夜前後被歸錯日期
 

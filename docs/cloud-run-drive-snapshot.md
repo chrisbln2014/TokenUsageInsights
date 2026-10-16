@@ -180,18 +180,42 @@ gcloud iap web add-iam-policy-binding \
 
 ### 重新部署（換版）
 
-repo 沒有 `.gcloudignore`，直接 `--source .` 會把工作區裡未追蹤的檔案一起上傳到 Cloud Build 的原始碼 bucket。改從指定 commit 匯出乾淨資料夾再部署：
+分兩步：先用 Cloud Build 建映像並推到 Artifact Registry，再用 `--image` 部署。不要用 `gcloud run deploy --source`：它無法把 `--build-arg` 傳給 Dockerfile，而映像裡沒有 `.git`（`.dockerignore` 排除），`build.rs` 拿不到日期，看板側邊欄的建置日期會是空的（`/api/version` 的 `build_date` 為 `""`）。
+
+repo 沒有 `.gcloudignore`，直接上傳工作目錄會把未追蹤的檔案一起送到 Cloud Build 的原始碼 bucket，所以一律從指定 commit 匯出乾淨資料夾：
 
 ```bash
 git archive <commit> | tar -x -C <乾淨資料夾>
+git log -1 --format=%cs <commit>   # 建置日期，填入下方 APP_BUILD_DATE
+```
+
+在乾淨資料夾以外的地方建立 `cloudbuild-deploy.yaml`（`<tag>` 例如 `v1.3.2-13b3ee1`）：
+
+```yaml
+steps:
+- name: gcr.io/cloud-builders/docker
+  args: ['build', '--build-arg', 'APP_BUILD_DATE=<YYYY-MM-DD>', '-t', 'asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights:<tag>', '.']
+images: ['asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights:<tag>']
+timeout: 2400s
+```
+
+建置並推送（約 6 分鐘），再用輸出最後的 digest 部署：
+
+```bash
+cd <乾淨資料夾>
+gcloud builds submit --project demoproject-dotnet --region asia-east1 --config <路徑>/cloudbuild-deploy.yaml .
 
 gcloud run deploy token-usage-insights \
-  --source <乾淨資料夾> \
+  --image asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights@sha256:<digest> \
   --project demoproject-dotnet \
   --region asia-east1
 ```
 
 對既有服務重新部署時只會換 image；環境變數、service account、`--max-instances`、IAP 設定都沿用上一個 revision。部署完用 `gcloud run services describe token-usage-insights --project demoproject-dotnet --region asia-east1` 確認新 revision 已承接 100% 流量。
+
+驗證版本要用瀏覽器以有 IAP 權限的帳號開 `https://<服務網址>/api/version`，確認 `version` 與 `build_date`。用 curl 帶 `gcloud auth print-identity-token` 的使用者 token 會回 401（`Invalid JWT audience`），IAP 不接受這種 token。
+
+首次部署的 `--source` 寫法同樣拿不到建置日期；服務建立後，再照本節流程換一次映像即可補上。
 
 ### 回滾
 
@@ -206,7 +230,7 @@ gcloud run services update-traffic token-usage-insights --to-revisions=<舊 revi
 ## 成本控制
 
 - Cloud Run 設定 `min-instances=0`，閒置時縮到 0；`max-instances=1`。
-- Artifact Registry 只保留最近 1 到 2 個 image（線上版加上一版供回滾）。每次 `--source` 部署都會新增一份（約 37 MB），用 `gcloud artifacts docker images list asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights --include-tags` 對照 `gcloud run revisions list` 的 image digest，再以 digest 逐一刪除沒有流量的舊 image。
+- Artifact Registry 只保留最近 1 到 2 個 image（線上版加上一版供回滾）。每次部署都會新增一份（約 40 MB），用 `gcloud artifacts docker images list asia-east1-docker.pkg.dev/demoproject-dotnet/cloud-run-source-deploy/token-usage-insights --include-tags` 對照 `gcloud run revisions list` 的 image digest，再以 digest 逐一刪除沒有流量的舊 image。
 - 不開 Artifact Registry vulnerability scanning，避免掃描費。
 - 設 Billing budget alert，例如 1 USD 與 5 USD。
 - 若只給自己看，`TOKEN_USAGE_INSIGHTS_SNAPSHOT_REFRESH_SECONDS=300` 或更高即可。

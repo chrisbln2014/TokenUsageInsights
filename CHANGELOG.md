@@ -4,6 +4,12 @@
 
 ## [未發行]
 
+### 修正
+
+- 自訂區間 API（`/api/:assistant/range/:start/:end`，一般模式與 Cloud Run snapshot 模式）只接受標準
+  `YYYY-MM-DD` 日期；`+2026-7-01` 這類 chrono 能解析的寬鬆寫法改回 400。原本這類字串在字典序比較下
+  會把開始日推到最早，可繞過 366 天上限。
+
 ### 新增與改善
 
 - Cloud Run snapshot 模式的區間分析（`/api/:assistant/range/:start/:end`）：區間內某天的每日資料

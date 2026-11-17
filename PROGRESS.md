@@ -6,6 +6,19 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-11-18 - 區間 API 日期只接受標準格式
+
+- **問題**：`parse_date_range` 用 chrono 解析後只檢查字串長度 10，`+2026-7-01` 會被接受；下游 SQLite 與
+  snapshot 每日鍵都用字串字典序比較，`'+'` 小於 `'2'`，開始日等於退到最早，繞過 366 天上限（區間 reviewer S4）。
+- **修法**（`src/handlers/monthly.rs`）：新增 `parse_canonical_date`，長度 10 且解析後再格式化回 `YYYY-MM-DD` 必須與
+  原字串完全相同才接受（長度檢查擋 `-0001-12-31`、`+10000-01-01` 這類 chrono 會自帶正負號的年份）。一般模式、snapshot 模式的區間 API 與模型 Session 區間查詢共用此函式。
+- **驗證**：新增別名清單測試、snapshot handler 400 測試（開始日／結束日皆帶 `+`）、一般模式 handler 400 斷言
+  （加在已隔離 INSIGHTS_DIR 的 `all_agents_reports_merge_every_assistant`），先紅後綠；突變 5 個皆紅；`cargo test` 僅 5 個已知環境性
+  失敗；Live（snapshot 模式）`+`／`%2B`／未補零皆 400、標準格式 200。前端 `isValidRange` 本來就送補零日期。
+- **注意**：紅燈階段曾寫過未隔離的一般模式 handler 測試，解析放行時開到本機正式看板 DB 做唯讀查詢 3 次（未寫入）；
+  已刪除，改把斷言加進既有已隔離 INSIGHTS_DIR 的測試。opus reviewer 有條件通過：抓到第一版拿掉長度檢查後
+  帶號年份被接受的退步（F1）與一般模式缺測試（F2）、結束日缺 handler 測試（F3），皆已修正。
+
 ### 2026-11-18 - snapshot 區間分析：損壞處理與回應快取
 
 - **問題**：Cloud Run 區間分析只要區間內有一天的每日 JSON 解析失敗就整段回 500；且每次查詢都重算

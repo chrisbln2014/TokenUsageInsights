@@ -1,52 +1,291 @@
 use rusqlite::{Connection, OpenFlags};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Component, Path};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct SessionMetadata {
     pub models: HashMap<u32, String>,
     pub cwd: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub agent_role: Option<String>,
+    pub initial_prompt: Option<String>,
 }
 
-/// Read original workspace and model identities without using current CLI settings.
+pub(crate) fn is_valid_session_id(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 || trimmed.chars().any(char::is_control) {
+        return false;
+    }
+    let mut components = Path::new(trimmed).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+fn clean_metadata_label(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() || text.len() > 200 || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn clean_metadata_prompt(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+/// Read original workspace, model, and subagent identities without using current CLI settings.
 pub fn read_session_metadata(root: &Path, session_id: &str) -> rusqlite::Result<SessionMetadata> {
-    let mut components = Path::new(session_id).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+    if !is_valid_session_id(session_id) {
         return Ok(SessionMetadata::default());
     }
     let path = root.join("conversations").join(format!("{session_id}.db"));
-    let conn = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
-        Ok(conn) => conn,
-        Err(_) if matches!(path.try_exists(), Ok(false)) => return Ok(SessionMetadata::default()),
+    let mut metadata = match Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => {
+            let mut meta = read_trajectory_metadata(&conn, session_id)?;
+            meta.models = read_response_models(&conn)?;
+            meta
+        }
+        Err(_) if matches!(path.try_exists(), Ok(false)) => {
+            let mut meta = SessionMetadata::default();
+            apply_subagent_descriptor_fallback(root, session_id, &mut meta, true);
+            return Ok(meta);
+        }
         Err(error) => return Err(error),
     };
-    Ok(SessionMetadata {
-        models: read_response_models(&conn)?,
-        cwd: read_workspace(&conn)?,
-    })
+    if metadata.parent_session_id.is_some()
+        && (metadata.agent_type.is_none()
+            || metadata.agent_role.is_none()
+            || metadata.cwd.is_none())
+    {
+        apply_subagent_descriptor_fallback(root, session_id, &mut metadata, false);
+    }
+    Ok(metadata)
 }
 
-fn read_workspace(conn: &Connection) -> rusqlite::Result<Option<String>> {
+/// Populate missing subagent metadata from `brain/<parent_id>/.system_generated/subagents/<session_id>.json`.
+/// When `scan_unknown_parent` is false, only checks the known `metadata.parent_session_id` in O(1).
+pub fn apply_subagent_descriptor_fallback(
+    root: &Path,
+    session_id: &str,
+    metadata: &mut SessionMetadata,
+    scan_unknown_parent: bool,
+) {
+    if !is_valid_session_id(session_id) {
+        return;
+    }
+    if let Some(parent_id) = metadata.parent_session_id.clone() {
+        let descriptor_path = root
+            .join("brain")
+            .join(&parent_id)
+            .join(".system_generated/subagents")
+            .join(format!("{session_id}.json"));
+        read_subagent_descriptor_file(&descriptor_path, &parent_id, session_id, metadata);
+        return;
+    }
+    if !scan_unknown_parent {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root.join("brain")) else {
+        return;
+    };
+    let mut parents: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let parent_id = entry.file_name().to_str()?.to_owned();
+            if parent_id == session_id || !is_valid_session_id(&parent_id) {
+                return None;
+            }
+            Some((parent_id, entry.path()))
+        })
+        .collect();
+    parents.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (parent_id, parent_dir) in parents {
+        let descriptor_path = parent_dir
+            .join(".system_generated/subagents")
+            .join(format!("{session_id}.json"));
+        if descriptor_path.is_file()
+            && read_subagent_descriptor_file(&descriptor_path, &parent_id, session_id, metadata)
+        {
+            break;
+        }
+    }
+}
+
+/// Indexes `brain/<parent_id>/.system_generated/subagents/<child_id>.json` files
+/// across the Antigravity root so `sync_antigravity_usage_logs_with_cancel` can
+/// include fallback descriptor revisions in its synchronization fingerprint.
+pub(crate) fn index_subagent_descriptor_paths(root: &Path) -> HashMap<String, PathBuf> {
+    let mut index = HashMap::new();
+    let Ok(entries) = fs::read_dir(root.join("brain")) else {
+        return index;
+    };
+    let mut parents: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() {
+                return None;
+            }
+            let parent_id = entry.file_name().to_str()?.to_owned();
+            if !is_valid_session_id(&parent_id) {
+                return None;
+            }
+            Some((parent_id, entry.path()))
+        })
+        .collect();
+    parents.sort_by(|a, b| a.0.cmp(&b.0));
+
+    for (parent_id, parent_dir) in parents {
+        let subagents_dir = parent_dir.join(".system_generated/subagents");
+        let Ok(subagents) = fs::read_dir(&subagents_dir) else {
+            continue;
+        };
+        let mut children: Vec<PathBuf> = subagents
+            .flatten()
+            .filter_map(|entry| {
+                let file_type = entry.file_type().ok()?;
+                file_type.is_file().then(|| entry.path())
+            })
+            .collect();
+        children.sort();
+        for descriptor_path in children {
+            if descriptor_path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(child_id) = descriptor_path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if child_id == parent_id || !is_valid_session_id(child_id) {
+                continue;
+            }
+            index.entry(child_id.to_owned()).or_insert(descriptor_path);
+        }
+    }
+    index
+}
+
+fn read_subagent_descriptor_file(
+    descriptor_path: &Path,
+    parent_id: &str,
+    session_id: &str,
+    metadata: &mut SessionMetadata,
+) -> bool {
+    let Ok(raw) = fs::read_to_string(descriptor_path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    if let Some(conv_id) = json.get("conversationId").and_then(Value::as_str) {
+        if conv_id.trim() != session_id {
+            return false;
+        }
+    }
+    if metadata.parent_session_id.is_none() && parent_id != session_id {
+        metadata.parent_session_id = Some(parent_id.to_owned());
+    }
+    if let Some(descriptor) = json.get("subagentDescriptor").and_then(Value::as_object) {
+        if metadata.agent_type.is_none() {
+            metadata.agent_type = descriptor
+                .get("typeName")
+                .and_then(Value::as_str)
+                .and_then(|s| clean_metadata_label(s.as_bytes()));
+        }
+        if metadata.agent_role.is_none() {
+            metadata.agent_role = descriptor
+                .get("role")
+                .and_then(Value::as_str)
+                .and_then(|s| clean_metadata_label(s.as_bytes()));
+        }
+    }
+    if metadata.cwd.is_none() {
+        if let Some(uris) = json.get("workspaceUris").and_then(Value::as_array) {
+            let mut workspace = None;
+            let mut unresolved = false;
+            for uri in uris {
+                let Some(path) = uri.as_str().and_then(file_uri_path) else {
+                    unresolved = true;
+                    continue;
+                };
+                if workspace.as_ref().is_some_and(|prev| prev != &path) {
+                    unresolved = true;
+                } else {
+                    workspace = Some(path);
+                }
+            }
+            if !unresolved {
+                metadata.cwd = workspace;
+            }
+        }
+    }
+    true
+}
+
+fn merge_unique_option<T: PartialEq>(target: &mut Option<T>, unresolved: &mut bool, value: T) {
+    if *unresolved {
+        return;
+    }
+    if target.as_ref().is_some_and(|previous| previous != &value) {
+        *target = None;
+        *unresolved = true;
+    } else {
+        *target = Some(value);
+    }
+}
+
+fn read_trajectory_metadata(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<SessionMetadata> {
     let mut statement = conn.prepare("PRAGMA table_info(trajectory_metadata_blob)")?;
     let columns = statement
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     if !columns.iter().any(|column| column == "data") {
-        return Ok(None);
+        return Ok(SessionMetadata::default());
     }
     let mut statement = conn.prepare("SELECT data FROM trajectory_metadata_blob")?;
     let rows = statement.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
     let mut workspace = None;
-    let mut unresolved = false;
+    let mut workspace_unresolved = false;
+    let mut parent_session_id = None;
+    let mut parent_unresolved = false;
+    let mut agent_type = None;
+    let mut agent_type_unresolved = false;
+    let mut agent_role = None;
+    let mut agent_role_unresolved = false;
+    let mut initial_prompt = None;
+    let mut prompt_unresolved = false;
+
     for row in rows {
         let blob = row?;
         let Some(fields) = protobuf_fields(&blob) else {
-            unresolved = true;
+            workspace_unresolved = true;
+            parent_unresolved = true;
+            agent_type_unresolved = true;
+            agent_role_unresolved = true;
+            prompt_unresolved = true;
             continue;
         };
         // Verified in the CLI's embedded CortexTrajectoryMetadata descriptor:
+        // field 4 = agent_script (AgentScriptItem: field 1 = name);
+        // field 5 = parent_conversation_id (immediate parent session UUID);
+        // field 6 = root_conversation_id (top-level root session UUID);
         // field 7 = repeated workspace_uris; deprecated field 1 = workspaces,
-        // whose field 1 is CortexWorkspaceMetadata.workspace_folder_absolute_uri.
+        // whose field 1 is CortexWorkspaceMetadata.workspace_folder_absolute_uri;
+        // field 8 = subagent_spec (SubagentSpec: field 1 = type_name,
+        // field 2 = role, field 3 = initial_prompt).
         let uris = if fields.iter().any(|(number, _)| *number == 7) {
             fields
                 .iter()
@@ -65,17 +304,116 @@ fn read_workspace(conn: &Connection) -> rusqlite::Result<Option<String>> {
                 .and_then(|value| std::str::from_utf8(value).ok())
                 .and_then(file_uri_path)
             else {
-                unresolved = true;
+                workspace_unresolved = true;
                 continue;
             };
-            if workspace.as_ref().is_some_and(|previous| previous != &path) {
-                unresolved = true;
-            } else {
-                workspace = Some(path);
+            merge_unique_option(&mut workspace, &mut workspace_unresolved, path);
+        }
+
+        for (_, value) in fields.iter().filter(|(number, _)| *number == 5) {
+            let Some(parent_id) = std::str::from_utf8(value)
+                .ok()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            else {
+                parent_unresolved = true;
+                continue;
+            };
+            if !is_valid_session_id(parent_id) {
+                parent_unresolved = true;
+                continue;
+            }
+            if parent_id != session_id {
+                merge_unique_option(
+                    &mut parent_session_id,
+                    &mut parent_unresolved,
+                    parent_id.to_owned(),
+                );
+            }
+        }
+
+        let mut row_has_subagent_type = false;
+        for (_, value) in fields.iter().filter(|(number, _)| *number == 8) {
+            let Some(spec_fields) = protobuf_fields(value) else {
+                agent_type_unresolved = true;
+                agent_role_unresolved = true;
+                prompt_unresolved = true;
+                continue;
+            };
+            if let Some(raw_type) = bytes_field(&spec_fields, 1) {
+                if let Some(label) = clean_metadata_label(raw_type) {
+                    row_has_subagent_type = true;
+                    merge_unique_option(&mut agent_type, &mut agent_type_unresolved, label);
+                } else if !raw_type.is_empty() {
+                    agent_type_unresolved = true;
+                }
+            }
+            if let Some(raw_role) = bytes_field(&spec_fields, 2) {
+                if let Some(label) = clean_metadata_label(raw_role) {
+                    merge_unique_option(&mut agent_role, &mut agent_role_unresolved, label);
+                } else if !raw_role.is_empty() {
+                    agent_role_unresolved = true;
+                }
+            }
+            if let Some(raw_prompt) = bytes_field(&spec_fields, 3) {
+                if let Some(prompt) = clean_metadata_prompt(raw_prompt) {
+                    merge_unique_option(&mut initial_prompt, &mut prompt_unresolved, prompt);
+                }
+            }
+        }
+
+        // Fall back to AgentScriptItem.name (field 4.1) when subagent_spec.type_name is absent
+        // on a subagent trajectory.
+        if !row_has_subagent_type
+            && (fields
+                .iter()
+                .any(|(number, _)| *number == 5 || *number == 8))
+        {
+            for (_, value) in fields.iter().filter(|(number, _)| *number == 4) {
+                if let Some(script_fields) = protobuf_fields(value) {
+                    if let Some(raw_name) = bytes_field(&script_fields, 1) {
+                        if let Some(label) = clean_metadata_label(raw_name) {
+                            merge_unique_option(&mut agent_type, &mut agent_type_unresolved, label);
+                        }
+                    }
+                }
             }
         }
     }
-    Ok(if unresolved { None } else { workspace })
+
+    Ok(SessionMetadata {
+        models: HashMap::new(),
+        cwd: if workspace_unresolved {
+            None
+        } else {
+            workspace
+        },
+        parent_session_id: if parent_unresolved {
+            None
+        } else {
+            parent_session_id
+        },
+        agent_type: if agent_type_unresolved {
+            None
+        } else {
+            agent_type
+        },
+        agent_role: if agent_role_unresolved {
+            None
+        } else {
+            agent_role
+        },
+        initial_prompt: if prompt_unresolved {
+            None
+        } else {
+            initial_prompt
+        },
+    })
+}
+
+#[cfg(test)]
+fn read_workspace(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    Ok(read_trajectory_metadata(conn, "test-session")?.cwd)
 }
 
 fn file_uri_path(value: &str) -> Option<String> {
@@ -153,19 +491,20 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
         let Some(inner) = bytes_field(&fields, 1).and_then(protobuf_fields) else {
             continue;
         };
-        let Some(uid) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok()) else {
+        let Some(model_id) = bytes_field(&inner, 19).and_then(|v| std::str::from_utf8(v).ok())
+        else {
             continue;
         };
         // Preserve unknown identifiers, but never expose arbitrary binary payloads.
-        if uid.is_empty()
-            || uid.len() > 200
-            || !uid
+        if model_id.is_empty()
+            || model_id.len() > 200
+            || !model_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.:/".contains(&b))
         {
             continue;
         }
-        let model = model_label(uid).to_owned();
+        let model = model_label(model_id).to_owned();
         generations
             .entry(id.to_vec())
             .and_modify(|previous| {
@@ -196,19 +535,38 @@ fn read_response_models(conn: &Connection) -> rusqlite::Result<HashMap<u32, Stri
     Ok(result)
 }
 
-fn model_label(uid: &str) -> &str {
+pub(crate) fn model_label(model_id: &str) -> &str {
     // Verified with `agy models`; keep aliases explicit so unknown future models
     // cannot silently inherit an unrelated model's price.
-    match uid {
+    match model_id {
+        "gemini-4-carbon-medium" => "Gemini 4 Carbon (Medium)",
+        "gemini-4-carbon-high" => "Gemini 4 Carbon (High)",
+        "gemini-4-carbon-low" => "Gemini 4 Carbon (Low)",
         "agy-demo-medium" | "gemini-4-argon-medium" => "Gemini 4 Argon (Medium)",
         "agy-demo-high" | "gemini-4-argon-high" => "Gemini 4 Argon (High)",
         "agy-demo-low" | "gemini-4-argon-low" => "Gemini 4 Argon (Low)",
+        "gemini-4-hydrogen-high" => "Gemini 4 Hydrogen (High)",
+        "gemini-4-hydrogen-xhigh" => "Gemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen-medium" => "Gemini 4 Hydrogen (Medium)",
+        "gemini-4-hydrogen-low" => "Gemini 4 Hydrogen (Low)",
+        "gemini-pro-orchestrator" => "Orchestrator (Carbon)",
+        "gemini-pro-orchestrator-argon" => "Orchestrator (Argon)",
+        // Verified from Antigravity Orchestrator session `gen_metadata` and
+        // https://antigravity.google/docs/models#orchestrator (execution runs on Gemini 4 Hydrogen).
+        "gemini-flash-worker-agy" => "Gemini 4 Hydrogen",
         "gemini-3.8-flash-high" => "Gemini 3.8 Flash (High)",
         "gemini-3.8-flash-medium" => "Gemini 3.8 Flash (Medium)",
         "gemini-3.8-flash-low" => "Gemini 3.8 Flash (Low)",
         "gemini-flash-demo" => "Gemini 3.7 Flash",
         "gemini-3.8-flash-demo" => "Gemini 3.8 Flash",
-        _ => uid,
+        "claude-opus-5-5-low" => "Claude Opus 5.5 (Low)",
+        "claude-opus-5-5-medium" => "Claude Opus 5.5 (Medium)",
+        "claude-opus-5-5-high" => "Claude Opus 5.5 (High)",
+        "claude-sonnet-5-5-low" => "Claude Sonnet 5.5 (Low)",
+        "claude-sonnet-5-5-medium" => "Claude Sonnet 5.5 (Medium)",
+        "claude-sonnet-5-5-high" => "Claude Sonnet 5.5 (High)",
+        "gpt-oss-120b-medium" => "GPT-OSS 120B (Medium)",
+        _ => model_id,
     }
 }
 
@@ -295,10 +653,10 @@ mod tests {
     fn joins_generation_uuid_instead_of_unrelated_row_indices() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE gen_metadata(idx INTEGER, data BLOB); CREATE TABLE steps(idx INTEGER, metadata BLOB);").unwrap();
-        for (index, uid) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
+        for (index, model_id) in [(1, "agy-demo-medium"), (2, "new-unknown-model")] {
             let id = format!("generation-{index}");
             let mut blob = field(4, id.as_bytes());
-            blob.extend(field(1, &field(19, uid.as_bytes())));
+            blob.extend(field(1, &field(19, model_id.as_bytes())));
             conn.execute(
                 "INSERT INTO gen_metadata VALUES (?1, ?2)",
                 rusqlite::params![index, blob],
@@ -315,6 +673,43 @@ mod tests {
         assert_eq!(models[&10], "Gemini 4 Argon (Medium)");
         assert_eq!(models[&20], "new-unknown-model");
         assert!(!models.contains_key(&1));
+    }
+
+    #[test]
+    fn gemini_4_carbon_agy_model_ids_map_to_display_names() {
+        // IDs verified with `agy models` on 2026-11-12.
+        assert_eq!(
+            model_label("gemini-4-carbon-medium"),
+            "Gemini 4 Carbon (Medium)"
+        );
+        assert_eq!(
+            model_label("gemini-4-carbon-high"),
+            "Gemini 4 Carbon (High)"
+        );
+        assert_eq!(model_label("gemini-4-carbon-low"), "Gemini 4 Carbon (Low)");
+    }
+
+    #[test]
+    fn antigravity_2026_11_agy_model_ids_map_to_display_names() {
+        // IDs verified with `agy models` on 2026-11-15.
+        for (model_id, expected) in [
+            ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+            ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+            ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+            ("gemini-pro-orchestrator", "Orchestrator (Carbon)"),
+            ("gemini-pro-orchestrator-argon", "Orchestrator (Argon)"),
+            ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
+            ("claude-opus-5-5-low", "Claude Opus 5.5 (Low)"),
+            ("claude-opus-5-5-medium", "Claude Opus 5.5 (Medium)"),
+            ("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            ("claude-sonnet-5-5-low", "Claude Sonnet 5.5 (Low)"),
+            ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5 (Medium)"),
+            ("claude-sonnet-5-5-high", "Claude Sonnet 5.5 (High)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+        ] {
+            assert_eq!(model_label(model_id), expected);
+        }
     }
 
     #[test]
@@ -458,5 +853,81 @@ mod tests {
         conn.execute_batch("CREATE TABLE trajectory_metadata_blob(id TEXT);")
             .unwrap();
         assert!(read_workspace(&conn).unwrap().is_none());
+    }
+
+    #[test]
+    fn reads_subagent_hierarchy_and_spec_from_trajectory_metadata_blob() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE trajectory_metadata_blob(data BLOB);")
+            .unwrap();
+        let mut subagent_spec = field(1, b"research");
+        subagent_spec.extend(field(2, b"Spec Compliance Reviewer"));
+        subagent_spec.extend(field(3, b"Review PR #73 against spec"));
+
+        let mut blob = field(5, b"parent-session-uuid");
+        blob.extend(field(6, b"root-session-uuid"));
+        blob.extend(field(7, b"file:///example/project"));
+        blob.extend(field(8, &subagent_spec));
+        conn.execute("INSERT INTO trajectory_metadata_blob VALUES (?1)", [&blob])
+            .unwrap();
+
+        let metadata = read_trajectory_metadata(&conn, "child-session-uuid").unwrap();
+        assert_eq!(metadata.cwd.as_deref(), Some("/example/project"));
+        assert_eq!(
+            metadata.parent_session_id.as_deref(),
+            Some("parent-session-uuid")
+        );
+        assert_eq!(metadata.agent_type.as_deref(), Some("research"));
+        assert_eq!(
+            metadata.agent_role.as_deref(),
+            Some("Spec Compliance Reviewer")
+        );
+        assert_eq!(
+            metadata.initial_prompt.as_deref(),
+            Some("Review PR #73 against spec")
+        );
+
+        // Self-reference guard: parent_conversation_id == session_id is ignored.
+        let self_ref = read_trajectory_metadata(&conn, "parent-session-uuid").unwrap();
+        assert!(self_ref.parent_session_id.is_none());
+    }
+
+    #[test]
+    fn falls_back_to_parent_subagents_json_when_sqlite_db_is_absent() {
+        let root = std::env::temp_dir().join(format!(
+            "antigravity-subagent-fallback-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let subagents_dir = root
+            .join("brain")
+            .join("parent-uuid")
+            .join(".system_generated/subagents");
+        std::fs::create_dir_all(&subagents_dir).unwrap();
+        std::fs::write(
+            subagents_dir.join("child-uuid.json"),
+            r#"{
+              "conversationId": "child-uuid",
+              "subagentDescriptor": {
+                "typeName": "self",
+                "role": "Audio Builder Agent"
+              },
+              "state": "SUBAGENT_STATE_ALIVE",
+              "spawnStepIndex": 12,
+              "workspaceUris": ["file:///example/demo"]
+            }"#,
+        )
+        .unwrap();
+
+        let metadata = read_session_metadata(&root, "child-uuid").unwrap();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(metadata.parent_session_id.as_deref(), Some("parent-uuid"));
+        assert_eq!(metadata.agent_type.as_deref(), Some("self"));
+        assert_eq!(metadata.agent_role.as_deref(), Some("Audio Builder Agent"));
+        assert_eq!(metadata.cwd.as_deref(), Some("/example/demo"));
     }
 }

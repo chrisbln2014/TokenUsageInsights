@@ -23,9 +23,20 @@
 - 整合 upstream v1.3.2（v1.1.2 ~ v1.3.2：Antigravity 改讀原生會話記錄、`config.yaml` 額外資料來源、
   Claude Code subagent 歸屬、Statusline 改寫 UTC 時間戳等上游變更）至本 fork 的合併分支；保留 Cloud
   Run snapshot「全部 Agent」支援與 all-scope 月／年 `agents` 累加修正，細節詳見下方新併入的版本區塊。
+- 整合 upstream v1.7.0（v1.3.3 ~ v1.7.0：週／自訂區間分析分頁、每日模型佔比、Copilot 改為逐次呼叫
+  記帳、父層 session 身分正規化、Antigravity 模型標籤與新模型定價等上游變更）至本 fork 的合併分支；
+  細節詳見下方新併入的版本區塊。fork 自有的 Cloud Run snapshot 模式與本地時區歸日保留。
+- Cloud Run snapshot 模式支援區間分析：`/api/:assistant/range/:start/:end` 從 snapshot 各日
+  `raw_entries` 以與本機相同的報表邏輯即時重建（含 `all`）；snapshot 日報的 `all` 合併補上每日模型佔比。
+  區間成本以 Cloud Run 映像內的 `pricing.csv` 重算，升版時匯出端與 Cloud Run 須部署同一版本。
 
 ### 修正
 
+- upstream v1.7.0 新的 Copilot 逐次呼叫寫入改以本地時區歸日，與 fork 其他助理一致；Copilot Status
+  Line Hook 用量也改依每列時間戳的本地日期歸日（時間戳無法解析時沿用檔名日期，Antigravity 不變）。
+- 修正 Copilot App 接管舊回合用量時的覆蓋檢查拿本地日期比對 UTC 來源證據，導致本地凌晨有用量的
+  session 永遠卡在「來源未涵蓋既有回合用量」而無法改為逐次呼叫記帳；改以已存時間戳換算的 UTC 日比對。
+- Cloud Run snapshot 模式可讀取舊版匯出、缺少每日模型佔比欄位的 snapshot。
 - 修正 Cloud Run snapshot 模式下前端每 2 秒無限輪詢 `/api/version` 的問題：snapshot 模式沒有背景
   同步，但共用的版本端點永遠回報「初次同步未完成」；snapshot router 改用專屬端點，固定回報已完成同步。
 - 修正 Cloud Run 映像建置失敗：upstream v1.3.2 新增的 `build.rs` 會產生編譯期環境變數
@@ -51,6 +62,251 @@
 - 前端（`static/app.js`、`static/chart-utils.js`）目前仍以 UTC 切分「日」的邊界，與本次後端寫入
   點改為本地時區的修復不完全一致；此問題刻意排除在本次範圍外，留待後續任務處理。
 
+## [1.7.0] - 2026-11-15
+
+### 新增與改善
+
+- **補齊 Antigravity 與新模型官方定價規則**（#85）：
+  - 補上 `Claude Fable 5.2` 與 `Claude Mythos 5.2`（含 `Cursor` 部署條目）的官方標準定價規則（輸入 `8.00`、快取輸入 `0.20`、輸出 `40.00` 美元／每百萬 Token）。
+  - 補上 `Orchestrator (Carbon)` 與 `Orchestrator (Argon)` 的 `Google AI` 官方標準定價規則（依各自規劃模型標準價設定為輸入 `4.00`、快取輸入 `0.20`、輸出 `20.00` 美元／每百萬 Token）。
+- **Antigravity CLI 模型別名正規化與統一映射**（#85）：
+  - 補齊透過 `agy models` 與會話實測查證的模型顯示名稱對應，包含 `Gemini 4 Hydrogen (Low/Medium/High/XHigh)`、`Orchestrator (Carbon)`、`Orchestrator (Argon)`、`gemini-flash-worker-agy`（對應 `Gemini 4 Hydrogen`）、`Claude Opus 5.5 (Low/Medium/High)`、`Claude Sonnet 5.5 (Low/Medium/High)` 與 `GPT-OSS 120B (Medium)`。
+  - 對 JSONL 明確 `model_id`/`model`、hook 紀錄與匯入紀錄（`insert_imported_entries`）統一套用別名映射。
+- **Copilot App 事件檔補匯與逐次呼叫對帳**（#74）：
+  - 新增 Copilot App `events.jsonl`（`session.usage_record`）來源限定同步，與 `session-store.db` 及 `data.db.sessions` 進行保守的逐次呼叫對帳與合併，補齊僅寫入事件檔的新 session 與游標超前時遺漏的歷史用量，並保留主從 Agent 歸屬與原生推理強度。
+- **匯入衝突三向裁決與前端可見性、搜尋與渲染效能強化**（#74）：
+  - 資料匯入改為依回合覆蓋範圍進行三向裁決去重，支援家族代表權判定，避免跨回合歷史被誤判重複，並於匯入批次中記錄跳過衝突筆數（於五語系前端介面顯示）。
+  - 前端 Session 表改用預建父層索引消除二次方掃描，並強化 Prompt 搜尋於即時資料刷新／背景重排期間的穩定性與成長指紋追蹤。
+
+### 變更
+
+- **每日定價檢查腳本聚焦 Antigravity 支援模型**（#83、#85）：
+  - 將原本泛稱的 `Google Gemini` 來源項目改為針對 `Antigravity`：結合 Antigravity 官方模型文件（`antigravity.google/docs/models.md`）與 Google AI Studio 官方定價頁（`aistudio.google.com/docs/pricing.md`），僅對 Antigravity 官方支援模型檢查收錄完整性、逐一驗證每個 Orchestrator 的 Planner 對應與一般 Google AI 模型（除明確標記於 `unpricedModels` 的 `Gemini 3.7 Flash` 與非 Google 模型外）的官方標準價格解析是否成功，同時核對所有 `Google AI` 部署列的標準牌價。
+
+### 修正
+
+- **每日定價檢查與 Markdoc／括號解析修正**（#83、#85）：
+  - 修正 Google AI Studio 官方定價頁新版 Markdoc 格式（`{% tab title="Standard" %}` / `{% table %}`）與跨行促銷價解析，並修正 Anthropic retired 模型巢狀括號備註的 `officialKey` 正規化處理，消除誤報。
+- **Copilot App／CLI 總量計算、會話身分隔離與時間軸回合歸屬修正**（#74）：
+  - 修正 Copilot App 用量總量將 `cache_write` 與 `reasoning` 額外重加導致偏高的問題，統一為來源 raw `input + output`（保留 `cache` 與 `reasoning` 明細）；並改採依涵蓋範圍聚合耗時。
+  - 徹底分離獨立 session 與合成子 Agent 身分，將正規化後的 `parent_session_id` 納入 `usage_entries` 唯一索引與搜尋指紋，並修正 Codex `parent_thread_id` 正規化與匯入批次回合細節 API 查詢。
+  - 修正時間軸回覆訊息累計用量計算（含同時間戳呼叫順序、無專屬事件子 Agent 的共享提示邊界推算、缺欄衝突一秒配對窗及撤銷匯入批次後本機事件未重建問題）。
+
+### 資料影響
+
+- SQLite `import_batches` 新增 `skipped_conflicts INTEGER NOT NULL DEFAULT 0` 欄位，記錄匯入時略過的衝突筆數。
+- `usage_entries` 唯一索引納入正規化 `parent_session_id`，並透過一次性資料庫遷移完成既有 Copilot 父層碰撞與 ID／父層空白正規化（v1–v3）、Codex `parent_thread_id` 重解析（`v10`），以及 Antigravity 模型別名正規化（`migration:antigravity_model_labels_v1`）。
+- Copilot App 與 Antigravity（`PARSER_VERSION` 升至 5）會在啟動同步時自動對既有資料執行冪等對帳與重歸屬修正，不遺失歷史紀錄。
+
+### 相容性
+
+- **向後相容**：所有資料表結構變更、索引更新與一次性遷移皆於既有 SQLite 資料庫就地自動完成，無破壞性 API、CLI 參數或環境變數異動；匯入／匯出 JSON 與既有多助理儀表板介面完全相容。
+
+## [1.6.7] - 2026-11-13
+
+本次 patch release 新增 Gemini 4 Hydrogen 的費用估算規則，並升級自我更新功能使用的 ZIP 解壓縮套件。
+
+### 新增與改善
+
+- 新增 Gemini 4 Hydrogen 及 Low、Medium、High、Extra 思考層級的 Google AI 定價規則；使用 Gemini 4 Hydrogen 的會話可估算成本，不再出現找不到價格規則的提示。Antigravity 的 `gemini-4-hydrogen-*` 模型代號（例如 `gemini-4-hydrogen-xhigh`）也會套用同一組價格，但儀表板暫時顯示原始代號。
+
+### 變更
+
+- 將 `zip` 套件從 2.4.2 升級至 9.0.5；自我更新在 Windows 解開 ZIP 發行封裝時改用新版套件，行為不變。
+
+### 資料影響
+
+- Gemini 4 Hydrogen 標準價為每百萬 Token 輸入 1.50、快取輸入 0.075、輸出 7.50 美元（批次 API 為 0.75／0.0375／3.75）。官方未公告優惠價或日後調價，也沒有長上下文分層，既有 Hydrogen 用量現在可計算費用估算。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、公開 API、CLI 參數、環境變數或安裝流程。
+
+## [1.6.6] - 2026-11-12
+
+本次 patch release 補上 Gemini 4 Carbon 的費用估算規則與 Antigravity 模型名稱對應。
+
+### 新增與改善
+
+- 新增 Gemini 4 Carbon 及 Medium、High、Low 思考層級的 Google AI 定價規則，並將 Antigravity 模型代號 `gemini-4-carbon-medium`、`gemini-4-carbon-high`、`gemini-4-carbon-low` 對應為顯示名稱；使用這些模型的會話可估算成本，不再出現找不到價格規則的提示。
+
+### 資料影響
+
+- Gemini 4 Carbon 標準價為每百萬 Token 輸入 4.00、快取輸入 0.20、輸出 20.00 美元；官方優惠價將持續至 2026-11-30，標準價自 2026-12-01 生效。`pricing.csv` 採用標準價，因此 2026-11-30 以前的用量估算約為優惠價的 2 倍。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、公開 API、CLI 參數、環境變數或安裝流程。
+
+## [1.6.5] - 2026-11-06
+
+本次 patch release 擴充缺少價格規則時的靜默清單，減少內部工具模型與無法識別模型造成的日誌雜訊。
+
+### 修正
+
+- 擴充缺少價格規則時的靜默清單：內部工具模型 `copilot-search-a` 與無法識別的 `Unknown Model` 會保留 Token 用量統計，並略過「計算成本失敗」的重複提示，與既有的 `copilot-search-b` 行為一致；其他缺少價格規則的模型仍會提示。
+
+### 資料影響
+
+- 僅調整日誌提示行為：Token 用量統計與成本計算結果不變。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、API、環境變數或安裝流程。
+
+## [1.6.4] - 2026-11-05
+
+本次 patch release 補上 Kimi K3.1 Pro 定價規則，修正其使用量被套用 Kimi K3 費率而高估約五成的問題。
+
+### 修正
+
+- 補上 Kimi K3.1 Pro（`kimi-k3.1-pro`）的定價規則：先前該模型的使用量會被包含比對套用 Kimi K3 費率（輸入 3.00、快取輸入 0.30、輸出 15.00 美元），高估約五成。依 Ollama 與 Kimi 官方公布費率新增 `Kimi K3.1 Pro` 與 `kimi-k3.1-pro` 雙格式規則（輸入 2.00、快取輸入 0.20、輸出 10.00 美元／每百萬 tokens），`kimi-k3.1-pro:cloud` 等名稱亦可正確計價。
+
+### 資料影響
+
+- 僅新增費率規則：`kimi-k3.1-pro` 相關 session 的費用估算會改用新費率計算，其他模型的估算結果不變。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、API 或執行期環境變數。
+
+## [1.6.3] - 2026-11-03
+
+本次 patch release 新增小米 MiMo-V2.6 系列模型定價規則，補齊對應 session 的費用估算。
+
+### 新增與改善
+
+- `pricing.csv` 新增小米 MiMo-V2.6 系列 `mimo-v2.6-pro` 與 `mimo-v2.6-flash` 的標準費率規則，讓對應 session 的成本估算不再擲回「找不到可用的模型價格規則」。定價採小米 MiMo 官方牌價（Pro：輸入 0.435、快取輸入 0.0036、輸出 0.87；Flash：輸入 0.14、快取輸入 0.0028、輸出 0.28 美元／每百萬 tokens），並新增單元測試驗證小寫 API 型號（`mimo-v2.6-pro`）、大小寫變體（`MiMo-V2.6-Pro`）與前綴變體（`xiaomi/mimo-v2.6-pro`）等名稱格式皆能正確套用定價。
+
+### 變更
+
+- `.gitignore` 排除本地 JSON 設定檔，僅影響開發端儲存庫整潔，不影響執行期行為。
+
+### 資料影響
+
+- 僅新增費率規則：使用 MiMo-V2.6 系列的 session 會開始產生費用估算，其他模型的估算結果不變。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構、API 或執行期環境變數。
+
+## [1.6.2] - 2026-10-29
+
+本次 patch release 新增週／自訂區間分析與 Antigravity 子代理資訊，並更新官方模型定價及看板修正。
+
+### 新增與改善
+
+- 新增「週／區間」用量分析分頁，提供 ISO 週、本週、上週、最近 2／4 週、自訂日期範圍與前後區間切換；顯示區間總量、費用、每日趨勢與彙總，並支援網址還原期間。新增 `GET /api/:assistant/range/:start/:end`，最長 366 天；模型 Session 期間查詢新增 `start~end` 格式。
+- Antigravity 原生會話新增子代理階層、名稱與角色標籤，並在時間軸呈現父子代理傳遞的提示詞及系統生命週期訊息；支援巢狀子代理與提示詞搜尋。
+- 新增每日模型定價檢查 workflow，解析 Anthropic、OpenAI、Google Gemini 與 xAI 的官方定價文件，回報 `pricing.csv` 價格差異、促銷價期限、尚未收錄的模型及抓取／解析錯誤；發現異動時建立或更新 `pricing-drift` issue。此檢查只產生報告，不會自動改寫定價檔。
+
+### 修正
+
+- 依官方定價文件校正 `pricing.csv`：`gpt-5.6-sol`（含 `gpt-daybreak-blue`、`gpt-daybreak-blue-latest`）調整為輸入／快取輸入／輸出 4.00／0.40／20.00 美元，`gpt-5.6-terra` 為 2.00／0.20／12.00，`gpt-5.6-luna`（含 `gpt-reserve`）為 0.20／0.02／1.20；`GPT-5.4-mini` 快取輸入調整為 0.075，`gemini-3-flash-preview` 快取輸入調整為 0.05。上述價格會改變相關用量的費用估算。
+- 修正日、年報與區間看板的遲到回應互相覆蓋、區間匯入後未重新載入，以及只有在資料確實更新時才顯示重新整理成功通知的問題；調整日／月／年與區間分頁的選擇器及分頁控制版面。
+- 修正區間標題與無資料畫面的 HTML 插入處理，避免文字被當成標記解析，並解除 CodeQL 高風險警示。
+
+### 資料影響
+
+- Antigravity 解析器版本升級後，既有原生會話會在後續同步時重新解析並補上子代理階層與角色資料；無須清除資料庫或執行破壞性遷移。
+
+### 相容性
+
+- 未變更 SQLite 資料表結構或執行期環境變數。新增區間查詢 API 與模型 Session 區間參數；既有日、月、年查詢行為維持不變。
+
+### 變更
+
+- 將 `rustls` 更新至 0.23.46，並更新 GitHub Actions runner 與 workflow action 版本，以維持 CI 建置環境。
+
+## [1.6.1] - 2026-10-29
+
+本次 patch release 新增 Docker 隔離式用量看板與管理腳本，並修正 Windows 透過 `npx` 安裝時 GNU tar 顯示誤導錯誤訊息的問題。
+
+### 新增與改善
+
+- 新增 `docker/` 資料夾，提供最小化容器映像檔與管理腳本 `docker/tui-docker.sh`，用來分開檢視不同人的用量資料。`Dockerfile` 以 `rust:1-alpine` 編譯 musl 靜態執行檔、執行階段僅使用 `alpine:3.22`，以非 root 使用者執行並停用自我更新；資料庫固定在 `/data` 具名磁碟區，容器內不讀取任何本機 AI 工具日誌。
+- `tui-docker.sh up <名稱> [檔案|SAS URL...]` 一行命令完成建置映像檔、建立 `tui-<名稱>` 容器與 `tui-<名稱>-data` 磁碟區、自動挑選僅綁定 `127.0.0.1` 的本機埠號、匯入資料並開啟瀏覽器；另提供 `import`、`open`、`url`、`export`、`logs`、`stop`、`rm [--purge]`、`ls`、`build` 子命令。匯入以 `docker exec` 執行，SAS URL 不會寫入容器設定，終端機也只顯示不含 query string 的網址。
+
+### 修正
+
+- 修正 Windows 透過 `npx` 安裝時，若 PATH 上 Git for Windows / MSYS2 的 GNU tar 排在系統 `tar.exe` 之前，下載後會出現 `tar: Cannot connect to C: resolve failed` 錯誤訊息的問題。安裝程式改以 `%SystemRoot%\System32\tar.exe`（Windows 內建 bsdtar）的絕對路徑解壓 zip，找不到時直接改用 PowerShell 的 .NET ZipFile 解壓；先前雖會自動退回 PowerShell 而完成安裝，但會顯示誤導性的錯誤訊息。
+
+### 相容性
+
+- 未變更既有本機資料庫結構、公開 API、執行期環境變數或原生安裝流程；Docker 容器是新增的隔離式使用方式。
+
+## [1.6.0] - 2026-10-28
+
+本次 minor release 新增 Azure Blob Storage SAS 匯出與 HTTPS 網址匯入，讓多台電腦可透過完整用量匯出檔交換資料。
+
+### 新增與改善
+
+- `export-all --out` 支援 Azure Blob Storage SAS URL：`--out` 為 `https://` 開頭時改以 `PUT`（BlockBlob）上傳，不寫入本機檔案。容器 SAS 不需指定檔名，預設為 `yyyy-MM-dd_HH-mm-ss_<電腦名稱>.json`（本機時間）；Blob SAS（`sr=b`）則寫入 URL 指定的 Blob。SAS URL 的 query string 原樣保留，錯誤訊息不輸出 SAS 簽章，`http://`、缺少 `sig` 或缺少容器名稱的 URL 會在讀取資料庫前以參數錯誤（結束碼 2）拒絕；上傳失敗時顯示 HTTP 狀態與 Azure 錯誤代碼。
+- 上傳成功後印出不含 SAS 的 Blob 位址與可直接在另一台電腦執行的 `token-usage-insights import --url '<含 SAS 的完整網址>'` 命令；SAS 不含讀取權限（`sp` 無 `r`）時額外警告。該命令含 SAS 簽章，請妥善保管。
+- `import` 新增 `--url <URL>`，與 `--file` 擇一：以 HTTPS `GET` 下載（上限 200 MB、不跟隨重新導向）後沿用既有匯入與去重流程，匯入批次的來源檔名記錄 Blob 檔名；`http://`、容器網址（無檔名）、`--file` 與 `--url` 同時指定會在讀取資料庫前以參數錯誤（結束碼 2）拒絕，下載失敗時顯示 HTTP 狀態與 Azure 錯誤代碼。
+
+### 變更
+
+- 新增維護者用的 `fix-pr` 技能，驗證 PR 有效性、安全性及描述與差異的一致性；通過後留下分析、請求 Copilot Code Review，並核准對應提交的待核准 workflows。
+
+### 相容性
+
+- 本機檔案與 stdout 輸出行為、匯出 JSON 格式、資料庫結構與環境變數均未變更；`export`（單一 Agent）暫不支援 SAS URL。
+
+## [1.5.1] - 2026-10-27
+
+本次 patch release 補上 OpenAI GPT-6.1 Terra 的官方定價資料。
+
+### 新增與改善
+
+- `pricing.csv` 新增 GPT-6.1 Terra 的 Global 定價，涵蓋 272K 上下文門檻：短上下文每百萬 Token 輸入 1.00 美元、快取輸入 0.05 美元、輸出 5.00 美元，長上下文分別為 2.00、0.10 與 7.50 美元；批次 API 短上下文為 0.50、0.025、2.50 美元，長上下文為 1.00、0.05、3.75 美元。
+- 新增 GPT-6.1 Terra 的 Cursor 定價條目，沿用 OpenAI 官方定價；費用估算與「AI 模型費用標準表」可直接顯示並計算此模型的成本，不再因缺少價格規則而無法估算。
+
+### 相容性
+
+- 本次僅新增定價資料，未變更資料庫結構、公開 API、CLI 參數或環境變數。
+
+## [1.5.0] - 2026-10-23
+
+本次 minor release 新增每日報表模型佔比，並強化發佈前的跨平台驗證流程。
+
+### 新增與改善
+
+- 每日報表新增「使用的模型佔比」區塊，沿用月度與年度報表的模型彙總、費用估算與 Session 明細展開；`/api/:assistant/usage/:date` 新增 `models` 欄位，模型 Session 明細 API 支援 `YYYY-MM-DD` 期間。
+
+### 變更
+
+- 將四平台 Rust 測試、零警告 release 建置與安裝驗證提前至 PR 與 `main` 推送時執行；建立正式標籤前須先確認同一 commit 驗證成功，避免首次發佈才發現跨平台問題而消耗原定版本號。正式 Release workflow 亦會核對此驗證結果，一般 CI 不建立公開 Release 或發布 npm。
+
+### 相容性
+
+- `/api/:assistant/usage/:date` 新增 `models` 欄位，模型 Session 明細 API 新增 `YYYY-MM-DD` 期間支援，兩者皆為向後相容的擴充；未變更資料庫結構、環境變數或安裝流程。
+
+## [1.4.1] - 2026-10-21
+
+承接未完成發佈的 `v1.4.0`，修正 Windows 測試清理問題。以下列出相較上一個正式版本 `v1.3.2` 的完整變更。
+
+### 修正
+
+- 修正 4 項 Copilot CLI 回歸測試在 Windows 清理暫存目錄前未關閉 SQLite 連線的問題，避免檔案仍被占用而阻擋發佈。
+- 補上 Ollama `muse-spark-open` 模型價格，支援 `:cloud` 名稱，修正成本計算找不到價格規則的問題；每百萬 Token 的輸入、快取輸入與輸出費率分別為 1.25、0.15 與 4.25 美元。
+- 修正 Copilot CLI 跨日接續同一個 session 時，後續用量被歸入該模型首次使用日期，導致當日看不到 session 的問題；現在依實際 UTC 日期、代理與模型分別統計，支援切換模型及子代理跨日續用。
+- 修正 Copilot CLI 當日 K 線將晚間用量集中到較早時段、看似晚間沒有使用紀錄的問題；現在逐筆保留 API 呼叫的實際時間與用量，讓小時及分鐘級圖表呈現正確分布，兩筆時間與數值相同的不同呼叫也分別保留。
+- 補讀 Copilot CLI 原生事件檔的逐筆使用量，與 `session-store.db` 以一對一方式去重，補齊 SQLite 未完整記錄的續用用量；累計快照不重複加入統計。
+
+### 資料影響
+
+- 更新後首次同步會自動重新核對既有 Copilot CLI 歷史資料，不受舊同步游標限制，無須清除資料庫或手動匯入。每日修補結果也會反映於月度及年度報表。
+- 已套用舊版每日彙總修補的資料庫也會自動重建為逐筆紀錄，不需要來源檔案再有新增內容；以穩定呼叫識別碼避免重複同步累加，並維持每日、月度與年度用量總計。
+- 修補依來源目錄隔離並逐 session 交易寫入；事件檔尚未寫完、資料無法唯一配對或來源用量尚未補齊時，保留既有資料並自動重試。保留手動匯入與其他 Copilot 來源資料，原始 Copilot 檔案維持唯讀。
+
+### 相容性
+
+- 沿用目前的 UTC 日期與 Token 計算規則，保留舊版 SQLite／Status Line Hook 收集相容性；未新增公開 API、資料表或環境變數。
+
+## [1.4.0] - 2026-10-21
+
+此標籤的 Windows CI 有 4 項 Copilot CLI 測試在清理暫存目錄時因 SQLite 連線未關閉而失敗，發佈未完成；未建立正式 GitHub Release 或 npm 版本，標籤維持原狀。相關修正合併記錄於 `1.4.1`。
 
 ## [1.3.2] - 2026-10-15
 
@@ -1009,7 +1265,14 @@
 - 修正行動版側邊欄遮擋、黑畫面、標題擠壓、圖表導覽索引與年度版面問題。
 - 修正並補齊多個 Gemini、Claude、GPT 與 GPT-OSS 模型的定價規則。
 
-[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.2...HEAD
+[未發行]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.7...v1.7.0
+[1.6.7]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.6...v1.6.7
+[1.6.6]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.5...v1.6.6
+[1.6.5]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.4...v1.6.5
+[1.6.4]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.3...v1.6.4
+[1.6.3]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.2...v1.6.3
+[1.6.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.6.1...v1.6.2
 [1.3.2]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.1...v1.3.2
 [1.3.1]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.3.0...v1.3.1
 [1.3.0]: https://github.com/doggy8088/TokenUsageInsights/compare/v1.2.2...v1.3.0

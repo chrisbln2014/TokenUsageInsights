@@ -817,6 +817,7 @@ fn merge_usage_details(
     let mut summary = DaySummary::default();
     let mut sessions = Vec::new();
     let mut raw_entries = Vec::new();
+    let mut models: HashMap<(String, Option<String>), MonthlyModelSummary> = HashMap::new();
     // 沿用被合併的來源清單裡第一筆的真實 home_dir，而不是編一個佔位字串——
     // static/app.js 的 abbreviateHomePath／resolveSessionCwdMatchKeyFromUrl 依賴這個欄位
     // 把路徑縮寫成 `~/...`；同一台機器匯出的各 assistant home_dir 理應相同，任一筆皆可。
@@ -829,6 +830,7 @@ fn merge_usage_details(
         merge_day_summary(&mut summary, &item.summary);
         sessions.extend(item.sessions);
         raw_entries.extend(item.raw_entries);
+        merge_models(&mut models, item.models);
     }
 
     sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -839,6 +841,7 @@ fn merge_usage_details(
         summary,
         sessions,
         raw_entries,
+        models: sorted_models_by_tokens_desc(models),
     }
 }
 
@@ -1107,6 +1110,82 @@ pub async fn get_monthly_details(
                 raw_json_response(value)
             } else {
                 not_found_response("找不到該月份的使用量資料。")
+            }
+        }
+        Err(err) => snapshot_error_response(err),
+    }
+}
+
+/// 從 snapshot 的每日 `raw_entries` 重建自訂區間報表（含頭尾），回應形狀與一般模式的
+/// `/api/:assistant/range/:start/:end` 相同。成本以本程式內建的 `pricing.csv` 重算，
+/// 因此匯出端與 Cloud Run 必須同版本，區間成本才會與日報一致。
+fn snapshot_range_report(
+    snapshot: &DashboardSnapshot,
+    assistant: &str,
+    start: &str,
+    end: &str,
+    pricing_rules: &crate::pricing::PreparedPricingRules,
+) -> Result<Option<MonthlyDetailsResponse>, String> {
+    let candidates: Vec<&str> = if assistant == ALL_ASSISTANTS_SCOPE {
+        ASSISTANTS.to_vec()
+    } else {
+        vec![assistant]
+    };
+    let mut entries = Vec::new();
+    for candidate in candidates {
+        let Some(assistant_snapshot) = snapshot.lookup_assistant(candidate) else {
+            continue;
+        };
+        // 日期鍵是 YYYY-MM-DD，字典序即時間順序。
+        for (date, raw) in &assistant_snapshot.daily {
+            if date.as_str() < start || date.as_str() > end {
+                continue;
+            }
+            let details = serde_json::from_str::<UsageDetailsResponse>(raw.get())
+                .map_err(|e| format!("解析 {candidate}/{date} 的快取資料失敗: {e}"))?;
+            entries.extend(details.raw_entries.into_iter().map(|raw_entry| {
+                crate::db::DatedUsageEntry {
+                    entry: raw_entry.entry,
+                    assistant_type: raw_entry.assistant_type,
+                    date: date.clone(),
+                    import_source_id: None,
+                }
+            }));
+        }
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let report = crate::reporting::build_period_report(&entries, str::to_string, pricing_rules);
+    Ok(Some(handlers::monthly::period_report_response(
+        format!("{start}~{end}"),
+        report,
+    )))
+}
+
+pub async fn get_range_details(
+    AxumPath((assistant, start, end)): AxumPath<(String, String, String)>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant_scope(&assistant) {
+        return unsupported_assistant_response();
+    }
+    let Some((start, end)) = handlers::monthly::parse_date_range(&start, &end) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "日期區間必須是 YYYY-MM-DD，開始日不得晚於結束日，且最長 366 天"
+            })),
+        )
+            .into_response();
+    };
+    match get_cached_snapshot().await {
+        Ok(snapshot) => {
+            let pricing_rules = crate::pricing::load_prepared_pricing_rules();
+            match snapshot_range_report(&snapshot, &assistant, &start, &end, &pricing_rules) {
+                Ok(Some(report)) => Json(report).into_response(),
+                Ok(None) => not_found_response("找不到該日期區間的使用量資料。"),
+                Err(err) => snapshot_error_response(err),
             }
         }
         Err(err) => snapshot_error_response(err),
@@ -2105,6 +2184,28 @@ mod tests {
                 assistant_type: "claude".to_string(),
                 entry: sample_usage_entry("claude-1", "2026-07-01T09:00:00Z"),
             }],
+            models: vec![
+                MonthlyModelSummary {
+                    model: "claude-opus".to_string(),
+                    mode: None,
+                    sessions_count: 1,
+                    total_tokens: 60,
+                    total_input_tokens: 30,
+                    total_output_tokens: 30,
+                    total_cache_read_tokens: 6,
+                    cost_usd: 0.25,
+                },
+                MonthlyModelSummary {
+                    model: "gpt-5".to_string(),
+                    mode: None,
+                    sessions_count: 1,
+                    total_tokens: 40,
+                    total_input_tokens: 20,
+                    total_output_tokens: 20,
+                    total_cache_read_tokens: 4,
+                    cost_usd: 0.25,
+                },
+            ],
         };
         let codex_item = UsageDetailsResponse {
             date: "2026-07-01".to_string(),
@@ -2114,6 +2215,16 @@ mod tests {
             raw_entries: vec![handlers::RawUsageEntry {
                 assistant_type: "codex".to_string(),
                 entry: sample_usage_entry("codex-1", "2026-07-01T10:00:00Z"),
+            }],
+            models: vec![MonthlyModelSummary {
+                model: "gpt-5".to_string(),
+                mode: None,
+                sessions_count: 1,
+                total_tokens: 200,
+                total_input_tokens: 100,
+                total_output_tokens: 100,
+                total_cache_read_tokens: 20,
+                cost_usd: 1.5,
             }],
         };
 
@@ -2154,6 +2265,37 @@ mod tests {
             .collect();
         raw_entry_assistant_types.sort_unstable();
         assert_eq!(raw_entry_assistant_types, vec!["claude", "codex"]);
+
+        // 每日模型佔比（upstream v1.7.0 新增的 `models`）必須跨 assistant 依 (model, mode)
+        // 累加，並依 tokens 由大到小排序：gpt-5 = 40 + 200 = 240，claude-opus = 60。
+        assert_eq!(merged.models.len(), 2);
+        assert_eq!(merged.models[0].model, "gpt-5");
+        assert_eq!(merged.models[0].total_tokens, 240);
+        assert_eq!(merged.models[0].sessions_count, 2);
+        assert_eq!(merged.models[0].total_cache_read_tokens, 24);
+        assert!((merged.models[0].cost_usd - 1.75).abs() < 1e-9);
+        assert_eq!(merged.models[1].model, "claude-opus");
+        assert_eq!(merged.models[1].total_tokens, 60);
+    }
+
+    #[test]
+    fn usage_details_without_models_field_still_deserializes() {
+        // 舊版匯出端產生的 snapshot 日報沒有 `models` 欄位；新版 Cloud Run 必須仍能讀取。
+        let json = r#"{
+            "date": "2026-07-01",
+            "home_dir": "/home/someone",
+            "summary": {
+                "total_sessions": 0, "total_tokens": 0, "total_input_tokens": 0,
+                "total_output_tokens": 0, "total_cache_read_tokens": 0,
+                "total_cache_write_tokens": 0, "total_reasoning_tokens": 0,
+                "total_duration_ms": 0, "total_requests": 0, "total_cost_usd": 0.0
+            },
+            "sessions": [],
+            "raw_entries": []
+        }"#;
+        let parsed: UsageDetailsResponse =
+            serde_json::from_str(json).expect("缺 models 的舊版日報必須能反序列化");
+        assert!(parsed.models.is_empty());
     }
 
     #[test]
@@ -2504,5 +2646,186 @@ mod tests {
         .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].0, "claude");
+    }
+
+    fn range_entry(
+        assistant: &str,
+        session_id: &str,
+        timestamp: &str,
+        input: u64,
+        output: u64,
+    ) -> handlers::RawUsageEntry {
+        let mut entry = sample_usage_entry(session_id, timestamp);
+        let stats = crate::db::TokenStats {
+            input,
+            output,
+            cache_read: Some(0),
+            cache_write: Some(0),
+            cache_write_5m: None,
+            cache_write_1h: None,
+            reasoning: Some(0),
+            total: input + output,
+        };
+        entry.tokens = Some(stats.clone());
+        entry.delta_tokens = Some(stats);
+        handlers::RawUsageEntry {
+            assistant_type: assistant.to_string(),
+            entry,
+        }
+    }
+
+    fn daily_raw(date: &str, raw_entries: Vec<handlers::RawUsageEntry>) -> Box<RawValue> {
+        let details = UsageDetailsResponse {
+            date: date.to_string(),
+            home_dir: "/home/someone".to_string(),
+            summary: DaySummary::default(),
+            sessions: Vec::new(),
+            raw_entries,
+            models: Vec::new(),
+        };
+        RawValue::from_string(serde_json::to_string(&details).unwrap()).unwrap()
+    }
+
+    fn range_snapshot() -> DashboardSnapshot {
+        let mut claude = AssistantSnapshot::default();
+        claude.daily.insert(
+            "2026-07-01".to_string(),
+            daily_raw(
+                "2026-07-01",
+                vec![range_entry(
+                    "claude",
+                    "s1",
+                    "2026-07-01T09:00:00Z",
+                    1000,
+                    500,
+                )],
+            ),
+        );
+        claude.daily.insert(
+            "2026-07-02".to_string(),
+            daily_raw(
+                "2026-07-02",
+                vec![range_entry("claude", "s2", "2026-07-02T09:00:00Z", 2000, 0)],
+            ),
+        );
+        let mut codex = AssistantSnapshot::default();
+        codex.daily.insert(
+            "2026-07-02".to_string(),
+            daily_raw(
+                "2026-07-02",
+                vec![range_entry("codex", "c1", "2026-07-02T10:00:00Z", 400, 100)],
+            ),
+        );
+        codex.daily.insert(
+            "2026-07-05".to_string(),
+            daily_raw(
+                "2026-07-05",
+                vec![range_entry("codex", "c2", "2026-07-05T10:00:00Z", 9000, 0)],
+            ),
+        );
+        let mut assistants = HashMap::new();
+        assistants.insert("claude".to_string(), claude);
+        assistants.insert("codex".to_string(), codex);
+        DashboardSnapshot {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            generated_at: "2026-07-06T00:00:00Z".to_string(),
+            source: "test".to_string(),
+            assistants,
+        }
+    }
+
+    fn range_pricing() -> crate::pricing::PreparedPricingRules {
+        // 每百萬 tokens：輸入 1 美元、輸出 2 美元。
+        crate::pricing::PreparedPricingRules::from_rules(vec![crate::pricing::PricingRule {
+            model_name: "test-model".to_string(),
+            input_price: 1.0,
+            cache_input_price: 0.0,
+            output_price: 2.0,
+        }])
+    }
+
+    #[test]
+    fn snapshot_range_report_rebuilds_single_assistant_from_daily_raw_entries() {
+        let report = snapshot_range_report(
+            &range_snapshot(),
+            "claude",
+            "2026-07-01",
+            "2026-07-02",
+            &range_pricing(),
+        )
+        .unwrap()
+        .expect("區間內有資料");
+
+        assert_eq!(report.year_month, "2026-07-01~2026-07-02");
+        // s1 = 1000 + 500，s2 = 2000。
+        assert_eq!(report.summary.total_tokens, 3500);
+        assert_eq!(report.summary.total_sessions, 2);
+        // s1 = (1000×1 + 500×2)/1e6 = 0.002；s2 = 2000×1/1e6 = 0.002。
+        assert!((report.summary.total_cost_usd - 0.004).abs() < 1e-12);
+        let days: Vec<(&str, u64)> = report
+            .daily_breakdown
+            .iter()
+            .map(|day| (day.date.as_str(), day.total_tokens))
+            .collect();
+        assert_eq!(days, vec![("2026-07-01", 1500), ("2026-07-02", 2000)]);
+    }
+
+    #[test]
+    fn snapshot_range_report_merges_all_assistants_and_excludes_out_of_range_days() {
+        let report = snapshot_range_report(
+            &range_snapshot(),
+            ALL_ASSISTANTS_SCOPE,
+            "2026-07-01",
+            "2026-07-02",
+            &range_pricing(),
+        )
+        .unwrap()
+        .expect("區間內有資料");
+
+        // 3500（claude）+ 500（codex c1）；07-05 的 c2 在區間外。
+        assert_eq!(report.summary.total_tokens, 4000);
+        assert_eq!(report.summary.total_sessions, 3);
+        // 0.004 + (400×1 + 100×2)/1e6 = 0.0046。
+        assert!((report.summary.total_cost_usd - 0.0046).abs() < 1e-12);
+        let days: Vec<(&str, u64)> = report
+            .daily_breakdown
+            .iter()
+            .map(|day| (day.date.as_str(), day.total_tokens))
+            .collect();
+        assert_eq!(days, vec![("2026-07-01", 1500), ("2026-07-02", 2500)]);
+        let mut agents: Vec<&str> = report.agent_breakdown.keys().map(String::as_str).collect();
+        agents.sort_unstable();
+        assert_eq!(agents, vec!["claude", "codex"]);
+    }
+
+    #[test]
+    fn snapshot_range_report_returns_none_when_range_has_no_data() {
+        let report = snapshot_range_report(
+            &range_snapshot(),
+            "claude",
+            "2026-08-01",
+            "2026-08-31",
+            &range_pricing(),
+        )
+        .unwrap();
+        assert!(report.is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshot_range_handler_rejects_invalid_ranges_with_bad_request() {
+        for (start, end) in [
+            ("2026-07-02", "2026-07-01"),
+            ("2026-7-1", "2026-07-02"),
+            ("2025-01-01", "2026-01-02"),
+        ] {
+            let response = get_range_details(AxumPath((
+                "claude".to_string(),
+                start.to_string(),
+                end.to_string(),
+            )))
+            .await
+            .into_response();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{start}~{end}");
+        }
     }
 }

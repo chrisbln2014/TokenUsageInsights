@@ -6,6 +6,30 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-11-17 - 整合 upstream v1.7.0
+
+- **範圍**：`upstream/main`（v1.7.0，自 v1.3.2 起 55 commits）併入 fork；計畫與完整驗證紀錄見
+  `docs/plans/2026-11-17-upstream-v1.7.0-integration.md`。合併前備份標籤 `backup/upgradeVersion-pre-v1.7.0`。
+- **衝突**：`.gitignore`、`CHANGELOG.md`、`src/db.rs`（fork 時區回填 v1/v2 與 upstream 父層／Antigravity
+  migration 並存，Copilot CLI 同步段採 upstream 逐次呼叫版本）。
+- **fork 調整**：
+  - Copilot 逐次呼叫列與 hook 列改用本地日。
+  - Copilot App 覆蓋檢查改用 timestamp 的 UTC 日比對，修正本地凌晨 session 永久 pending。
+  - snapshot 日報 `all` 合併 `models`，並讓 `models` 欄位可缺省。
+  - snapshot 模式新增區間分析。
+- **驗證**：
+  - `cargo test`：除 4 個本機環境性 updater 測試外全過（合併前基準同樣失敗）。
+  - clippy、release、只用 Dockerfile COPY 清單的建置：均 0 警告。
+  - `npm test`：55 過。
+  - 突變：7 個，皆紅在預期斷言。
+  - Live：正式 DB 複本的逐 session Copilot 總量與純 upstream v1.7.0 完全一致；snapshot 與一般模式的區間 tokens、成本一致；瀏覽器實看區間分頁正常。
+  - opus reviewer 有條件通過，已補 Antigravity 測試與註解。
+- **待辦（另開任務）**：
+  - Cloud Run 與本機看板換版（兩端須同版）。
+  - Drive 事件依父層身分區分。
+  - 舊 Copilot hook 凌晨列回填（v3）：正式 DB 複本實測只有 1 列。
+  - snapshot 區間的解析快取，以及單日損壞時的處理方式。
+
 ### 2026-10-15 - 修正整合 upstream v1.3.2 後 Cloud Run 映像無法建置
 
 - **問題**：整合 upstream v1.3.2 後，用 `Dockerfile` 建 Cloud Run 映像會在 `cargo build` 失敗。

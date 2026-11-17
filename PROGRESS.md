@@ -6,6 +6,26 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-11-18 - snapshot 區間分析：損壞處理與回應快取
+
+- **問題**：Cloud Run 區間分析只要區間內有一天的每日 JSON 解析失敗就整段回 500；且每次查詢都重算
+  （all 366 天約 3.3 秒，主要耗時在 `build_period_report`，所以快取整份回應而非只快取解析結果）。
+- **修法**（`src/snapshot.rs`）：
+  - `snapshot_range_report` 壞日跳過並 `eprintln!` 警告；命中的日期全部壞掉時回 Err，不回 404。
+  - 新增 `RangeResponseCache`：鍵為（助理, 開始, 結束），存序列化後 JSON；以 `Weak` 比對 snapshot，
+    換新即清空且不留住舊 snapshot；上限 64 筆 FIFO；Err 不快取、沒有資料（404）會快取；計算時不持鎖。
+  - 晚到的舊 snapshot 寫入直接丟棄，不清掉新 snapshot 的快取；handler 主體抽成 `range_details_response` 以便測試。
+  - 語意註記：區間內「有效但空的一天＋壞日」也回 500（命中日期沒有任何有效資料列即視為失敗）。
+- **驗證**：
+  - `cargo test`：新增 10 個測試先紅後綠；clippy 0 警告。全套另有 5 個本機環境性失敗：4 個 updater，以及
+    `tests/snapshot_mode.rs` 的 `export_snapshot_flag_writes_snapshot_for_every_assistant`（`config.rs` 會 fallback 讀
+    `%LOCALAPPDATA%\TokenUsageInsights\config.yaml`，該檔 11/17 加了 Orca Codex 目錄，測試隔離不到）。
+  - 突變 8 個皆紅在預期斷言（主控 M1–M4、reviewer 指定 R2／R4／R5、晚到寫入 S1）。
+  - Live（正式 snapshot 128 MB 複本）：all 366 天首查 2.9 秒、再查 0.019 秒，回應 784 KB；壞掉 claude 11/10 後
+    11 月仍回 200 並記警告，只查壞日回 500；claude 11/1–11/16 tokens 與成本與本機正式看板一致。
+  - opus reviewer 有條件通過，三項缺測試的條件已補測試。
+- **另開任務**：`parse_date_range` 接受 `+2026-7-01` 這類格式，字典序過濾會繞過 366 天上限（既有問題，非本次引入）。
+
 ### 2026-11-17 - 整合 upstream v1.7.0
 
 - **範圍**：`upstream/main`（v1.7.0，自 v1.3.2 起 55 commits）併入 fork；計畫與完整驗證紀錄見

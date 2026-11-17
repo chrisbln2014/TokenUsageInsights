@@ -31,16 +31,29 @@ enum ModelSessionPeriod {
 }
 
 /// 解析 `YYYY-MM-DD` 區間，開始日不得晚於結束日，且最長 366 天。
+///
+/// 下游（SQLite 查詢、snapshot 每日鍵過濾）都用字串字典序比較日期，所以只接受標準格式：
+/// chrono 能解析的寬鬆寫法（例如 `+2026-7-01`）字典序會落在範圍外，可繞過 366 天上限。
 pub(crate) fn parse_date_range(start: &str, end: &str) -> Option<(String, String)> {
-    let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
-    let end_date = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").ok()?;
-    if start.len() != 10 || end.len() != 10 || start_date > end_date {
+    let start_date = parse_canonical_date(start)?;
+    let end_date = parse_canonical_date(end)?;
+    if start_date > end_date {
         return None;
     }
     if (end_date - start_date).num_days() >= 366 {
         return None;
     }
     Some((start.to_string(), end.to_string()))
+}
+
+/// 只有「長度 10，且解析後再格式化回 `YYYY-MM-DD` 與原字串完全相同」才算合法日期。
+/// 長度檢查擋掉年份超出 0000–9999 的寫法：chrono 格式化這類年份會自帶 `+`／`-`，單靠比對擋不住。
+fn parse_canonical_date(value: &str) -> Option<chrono::NaiveDate> {
+    if value.len() != 10 {
+        return None;
+    }
+    let date = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    (date.format("%Y-%m-%d").to_string() == value).then_some(date)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,6 +519,57 @@ pub async fn get_range_details(
         )
             .into_response(),
     }
+}
+
+#[cfg(test)]
+mod date_range_tests {
+    use super::*;
+
+    #[test]
+    fn parse_date_range_accepts_canonical_dates_unchanged() {
+        assert_eq!(
+            parse_date_range("2026-07-01", "2026-07-31"),
+            Some(("2026-07-01".to_string(), "2026-07-31".to_string()))
+        );
+        // 最長 366 天（含頭尾）：2024 閏年整年。
+        assert!(parse_date_range("2024-01-01", "2024-12-31").is_some());
+        assert!(parse_date_range("2024-01-01", "2025-01-01").is_none());
+    }
+
+    #[test]
+    fn parse_date_range_rejects_non_canonical_aliases() {
+        // 這些字串長度都是 10，chrono 能解析成合法日期，但字典序比較時會跑到範圍外
+        //（例如 '+' 小於 '2'），可繞過 366 天上限。
+        for alias in [
+            "+2026-7-01",
+            "+2026-07-1",
+            "+026-07-01",
+            "2026-7-01 ",
+            " 2026-7-01",
+            "2026-007-1",
+            "2026/07/01",
+            // 年份超出 0000–9999 時 chrono 格式化會自帶正負號，比對後仍相同，必須另外擋。
+            "-0001-12-31",
+            "+10000-01-01",
+        ] {
+            assert!(
+                parse_date_range(alias, "2026-07-31").is_none(),
+                "開始日 {alias:?} 應被拒絕"
+            );
+            assert!(
+                parse_date_range("2026-07-01", alias).is_none(),
+                "結束日 {alias:?} 應被拒絕"
+            );
+        }
+        // 實際的繞過案例：開始日退到字典序最前，區間跨度遠超 366 天。
+        assert!(parse_date_range("+2026-7-01", "2026-07-31").is_none());
+        // 帶正負號的年份：跨度在 366 天內，所以只靠上限擋不住，要靠格式檢查。
+        assert!(parse_date_range("-0001-12-31", "0000-01-01").is_none());
+        assert!(parse_date_range("+10000-01-01", "+10000-12-31").is_none());
+        assert!(parse_date_range("9999-12-31", "+10000-01-01").is_none());
+    }
+    // 不寫一般模式 handler 測試：解析一旦退化，handler 會往下開 `get_insights_dir()` 的真實資料庫
+    //（本機即正式看板 DB）。handler 層的接線由 snapshot 的 400 測試涵蓋（不碰資料庫）。
 }
 
 #[cfg(test)]

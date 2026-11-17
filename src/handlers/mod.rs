@@ -491,6 +491,15 @@ mod tests {
         let (status, _) =
             response_json(range("2026-01-01", "2027-12-31").await.into_response()).await;
         assert_eq!(status, 400);
+        // 非標準寫法（字典序會繞過 366 天上限）在開始日或結束日都要回 400。
+        for (start, end) in [
+            ("+2026-7-01", "2026-07-31"),
+            ("2026-07-01", "+2026-7-31"),
+            ("-0001-12-31", "0000-01-01"),
+        ] {
+            let (status, _) = response_json(range(start, end).await.into_response()).await;
+            assert_eq!(status, 400, "{start}~{end}");
+        }
         let (status, _) =
             response_json(range("2030-01-01", "2030-01-07").await.into_response()).await;
         assert_eq!(status, 404);

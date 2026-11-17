@@ -11,6 +11,7 @@ use crate::db;
 use crate::pricing::{load_prepared_pricing_rules, PreparedPricingRules};
 use crate::reporting::{
     build_period_report, cursor_session_mode, group_sessions, latest_usage_entry,
+    session_durations_by_identity,
 };
 use crate::session_identity::SessionIdentity;
 
@@ -21,10 +22,25 @@ pub struct ModelSessionsQuery {
     mode: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ModelSessionPeriod {
+    Day,
     Month,
     Year,
+    Range(String, String),
+}
+
+/// 解析 `YYYY-MM-DD` 區間，開始日不得晚於結束日，且最長 366 天。
+pub(crate) fn parse_date_range(start: &str, end: &str) -> Option<(String, String)> {
+    let start_date = chrono::NaiveDate::parse_from_str(start, "%Y-%m-%d").ok()?;
+    let end_date = chrono::NaiveDate::parse_from_str(end, "%Y-%m-%d").ok()?;
+    if start.len() != 10 || end.len() != 10 || start_date > end_date {
+        return None;
+    }
+    if (end_date - start_date).num_days() >= 366 {
+        return None;
+    }
+    Some((start.to_string(), end.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +78,9 @@ impl ModelSessionMode {
 }
 
 fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
+    if let Some((start, end)) = value.split_once('~') {
+        return parse_date_range(start, end).map(|(s, e)| ModelSessionPeriod::Range(s, e));
+    }
     match value.len() {
         4 => chrono::NaiveDate::parse_from_str(&format!("{value}-01-01"), "%Y-%m-%d")
             .ok()
@@ -69,6 +88,9 @@ fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
         7 => chrono::NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
             .ok()
             .map(|_| ModelSessionPeriod::Month),
+        10 => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .map(|_| ModelSessionPeriod::Day),
         _ => None,
     }
 }
@@ -93,6 +115,15 @@ fn collect_model_session_details(
     requested_mode: Option<ModelSessionMode>,
     pricing_rules: &PreparedPricingRules,
 ) -> Vec<ModelSessionDetail> {
+    // 判別逐次呼叫列所需的 import_source_id 不在 UsageEntry 上，先依分組
+    // 身分預彙總顯示耗時（`:call:` 列逐次加總、其餘維持累積值語意）。
+    let session_durations = session_durations_by_identity(entries_with_type.iter().map(|record| {
+        (
+            &record.entry,
+            record.assistant_type.as_str(),
+            record.import_source_id.as_deref(),
+        )
+    }));
     let sessions_map = group_sessions(
         entries_with_type
             .iter()
@@ -138,11 +169,17 @@ fn collect_model_session_details(
             continue;
         };
         let last_entry = latest_usage_entry(&entries).unwrap_or(&first.entry);
-        let duration_ms = last_entry
-            .cost
-            .as_ref()
-            .and_then(|cost| cost.total_api_duration_ms)
-            .unwrap_or(0.0) as u64;
+        let duration_ms = session_durations
+            .get(&identity)
+            .copied()
+            .unwrap_or_else(|| {
+                // 對照保守：分組鍵查無預彙總時維持舊的「最新一筆累積耗時」語意。
+                last_entry
+                    .cost
+                    .as_ref()
+                    .and_then(|cost| cost.total_api_duration_ms)
+                    .unwrap_or(0.0) as u64
+            });
         let total_requests = last_entry
             .cost
             .as_ref()
@@ -180,7 +217,9 @@ fn collect_model_session_details(
             session_total_cache_write_tokens: session_usage.usage.cache_write_tokens,
             session_total_reasoning_tokens: session_usage.usage.reasoning_tokens,
             session_cost_usd: session_usage.usage.cost_usd,
-            parent_session_id: last_entry.parent_session_id.clone(),
+            // 以分組身分（含 parent_session_id）為準，讓前端能以完整身分
+            // 單獨選取子 Agent，不會與同名獨立 session 混淆。
+            parent_session_id: identity.parent_session_id.clone(),
             agent_nickname: last_entry.agent_nickname.clone(),
             agent_role: last_entry.agent_role.clone(),
             reasoning_effort: last_entry.reasoning_effort.clone(),
@@ -229,7 +268,7 @@ pub async fn get_model_sessions(
     let Some(period_kind) = parse_model_session_period(&period) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "期間必須是 YYYY 或 YYYY-MM" })),
+            Json(serde_json::json!({ "error": "期間必須是 YYYY、YYYY-MM、YYYY-MM-DD 或 YYYY-MM-DD~YYYY-MM-DD" })),
         )
             .into_response();
     };
@@ -248,11 +287,25 @@ pub async fn get_model_sessions(
     let result = tokio::task::spawn_blocking(move || {
         let conn = db::get_db_conn()?;
         let entries = match period_kind {
+            ModelSessionPeriod::Day => {
+                db::get_usage_entries_by_date(&conn, &period_for_query, &assistant_for_query)?
+                    .into_iter()
+                    .map(|row| db::DatedUsageEntry {
+                        entry: row.record.entry,
+                        assistant_type: row.assistant_type,
+                        date: row.date,
+                        import_source_id: row.record.import_source_id,
+                    })
+                    .collect()
+            }
             ModelSessionPeriod::Month => {
                 db::get_usage_entries_by_month(&conn, &period_for_query, &assistant_for_query)?
             }
             ModelSessionPeriod::Year => {
                 db::get_usage_entries_by_year(&conn, &period_for_query, &assistant_for_query)?
+            }
+            ModelSessionPeriod::Range(start, end) => {
+                db::get_usage_entries_by_range(&conn, &start, &end, &assistant_for_query)?
             }
         };
         Ok::<_, String>(collect_model_session_details(
@@ -374,11 +427,94 @@ pub async fn get_monthly_details(
     }
 }
 
+/// 把區間報表轉成與月報同形狀的回應；一般模式與 Cloud Run snapshot 模式共用。
+pub(crate) fn period_report_response(
+    period: String,
+    report: crate::reporting::PeriodReport,
+) -> MonthlyDetailsResponse {
+    MonthlyDetailsResponse {
+        year_month: period,
+        summary: report.summary,
+        daily_breakdown: report
+            .breakdown
+            .into_iter()
+            .map(|item| MonthlyDailyBreakdown {
+                date: item.label,
+                total_tokens: item.usage.total_tokens,
+                total_input_tokens: item.usage.input_tokens,
+                total_output_tokens: item.usage.output_tokens,
+                total_cache_read_tokens: item.usage.cache_read_tokens,
+                total_reasoning_tokens: item.usage.reasoning_tokens,
+                sessions_count: item.sessions_count,
+                cost_usd: item.usage.cost_usd,
+                agents: item.agents,
+            })
+            .collect(),
+        projects: report.projects,
+        models: report.models,
+        agent_breakdown: report.agent_breakdown,
+    }
+}
+
+/// API 6b: 獲取自訂日期區間（含頭尾）的統計摘要數據，回應格式與月報相同
+pub async fn get_range_details(
+    Path((assistant, start, end)): Path<(String, String, String)>,
+) -> impl IntoResponse {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant_scope(&assistant) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "不支援的助理類型" })),
+        )
+            .into_response();
+    }
+    let Some((start, end)) = parse_date_range(&start, &end) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "日期區間必須是 YYYY-MM-DD，開始日不得晚於結束日，且最長 366 天"
+            })),
+        )
+            .into_response();
+    };
+
+    let report = tokio::task::spawn_blocking(move || {
+        let conn = db::get_db_conn()?;
+        let entries = db::get_usage_entries_by_range(&conn, &start, &end, &assistant)?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let pricing_rules = load_prepared_pricing_rules();
+        Ok::<_, String>(Some((
+            format!("{start}~{end}"),
+            build_period_report(&entries, str::to_string, &pricing_rules),
+        )))
+    })
+    .await
+    .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
+
+    match report {
+        Ok(Some((period, report))) => Json(period_report_response(period, report)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "找不到該日期區間的使用量資料。" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::TokenStats;
     use crate::pricing::PricingRule;
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn model_entry(
         session_id: &str,
@@ -427,11 +563,12 @@ mod tests {
             entry,
             assistant_type: assistant_type.to_string(),
             date: date.to_string(),
+            import_source_id: None,
         }
     }
 
     #[test]
-    fn model_session_period_accepts_only_valid_months_and_years() {
+    fn model_session_period_accepts_valid_days_months_and_years() {
         assert!(matches!(
             parse_model_session_period("2026"),
             Some(ModelSessionPeriod::Year)
@@ -440,9 +577,22 @@ mod tests {
             parse_model_session_period("2026-07"),
             Some(ModelSessionPeriod::Month)
         ));
+        assert!(matches!(
+            parse_model_session_period("2026-07-10"),
+            Some(ModelSessionPeriod::Day)
+        ));
+        assert_eq!(
+            parse_model_session_period("2026-07-06~2026-07-19"),
+            Some(ModelSessionPeriod::Range(
+                "2026-07-06".to_string(),
+                "2026-07-19".to_string()
+            ))
+        );
+        assert!(parse_model_session_period("2026-07-19~2026-07-06").is_none());
+        assert!(parse_model_session_period("2026-07-01~2027-07-02").is_none());
         assert!(parse_model_session_period("2026-13").is_none());
         assert!(parse_model_session_period("20x6").is_none());
-        assert!(parse_model_session_period("2026-07-10").is_none());
+        assert!(parse_model_session_period("2026-02-30").is_none());
     }
 
     #[test]
@@ -710,5 +860,137 @@ mod tests {
                 .sum::<u64>(),
             330
         );
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// 回歸測試（code review comment 4436837582 / thread PRRT_kwDOTOgsec6yTxjO）：
+    /// 模型明細的逐次呼叫列（`import_source_id` 含 `:call:`）每列只有單次
+    /// 呼叫耗時，同回合兩筆 100ms 必須顯示 200ms；Codex 類累積列每列都帶
+    /// 整個 session 的 3500ms，維持取最新一筆 3500ms（不可加總）。
+    ///
+    /// fixture 沿用 yearly handler 測試的暫存 `INSIGHTS_DIR` 模式並走真實
+    /// handler，但於乾淨子行程執行（見
+    /// `reporting::spawn_isolated_insights_test` 說明）。
+    #[test]
+    fn monthly_model_sessions_sum_per_call_rows_and_keep_cumulative_latest() {
+        if crate::reporting::is_isolated_insights_test_child() {
+            crate::reporting::handler_test_runtime()
+                .block_on(monthly_model_sessions_per_call_duration_body());
+            return;
+        }
+        let temp_dir = std::env::temp_dir().join(format!(
+            "tui-monthly-per-call-duration-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let output = crate::reporting::spawn_isolated_insights_test(
+            "handlers::monthly::tests::monthly_model_sessions_sum_per_call_rows_and_keep_cumulative_latest",
+            &temp_dir,
+        );
+        assert!(
+            output.status.success(),
+            "子行程 handler 測試失敗:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    async fn monthly_model_sessions_per_call_duration_body() {
+        // 先建立資料庫檔案，避免 get_db_conn 將舊位置的資料庫搬進測試目錄。
+        let conn = Connection::open(crate::db::get_insights_dir().join("token_usage_insights.db"))
+            .unwrap();
+        crate::db::init_db(&conn).unwrap();
+        for (timestamp, call_identity) in
+            [("2026-07-10 10:00:00", "h1"), ("2026-07-10 10:01:00", "h2")]
+        {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, source_kind, source_dir_key, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms, import_source_id, usage_identity
+                ) VALUES (
+                    'copilot', 'copilot-app', 'aa', ?1, '2026-07-10',
+                    'per-call-m1', 1, 'App Session', 'gpt-5',
+                    10, 5, 15,
+                    10, 5, 15,
+                    100, ?2, ?3
+                )",
+                rusqlite::params![
+                    timestamp,
+                    format!("copilot-app:aa:per-call-m1:call:{call_identity}"),
+                    format!("source=aa;call={call_identity}")
+                ],
+            )
+            .unwrap();
+        }
+        for turn_no in 1..=2u32 {
+            conn.execute(
+                "INSERT INTO usage_entries (
+                    assistant_type, timestamp, date,
+                    session_id, turn_no, session_name, model,
+                    tokens_input, tokens_output, tokens_total,
+                    delta_input, delta_output, delta_total,
+                    duration_ms
+                ) VALUES (
+                    'codex', ?1, '2026-07-10',
+                    'cumulative-m2', ?2, 'Codex Session', 'gpt-5',
+                    20, 10, 30,
+                    20, 10, 30,
+                    3500
+                )",
+                rusqlite::params![format!("2026-07-10 11:0{turn_no}:00"), turn_no],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let mut bodies = Vec::new();
+        for period in ["2026-07-10", "2026-07"] {
+            let response = super::get_model_sessions(
+                Path("all".to_string()),
+                Query(ModelSessionsQuery {
+                    period: period.to_string(),
+                    model: "gpt-5".to_string(),
+                    mode: None,
+                }),
+            )
+            .await
+            .into_response();
+            assert_eq!(response.status().as_u16(), 200, "period={period}");
+            bodies.push((period, response_json(response).await));
+        }
+
+        for (period, body) in bodies {
+            let sessions = body["sessions"].as_array().unwrap();
+            let per_call = sessions
+                .iter()
+                .find(|session| session["session_id"] == "per-call-m1")
+                .unwrap_or_else(|| panic!("period={period} 缺少 per-call-m1"));
+            assert_eq!(
+                per_call["duration_ms"].as_u64(),
+                Some(200),
+                "period={period}"
+            );
+            let cumulative = sessions
+                .iter()
+                .find(|session| session["session_id"] == "cumulative-m2")
+                .unwrap_or_else(|| panic!("period={period} 缺少 cumulative-m2"));
+            assert_eq!(
+                cumulative["duration_ms"].as_u64(),
+                Some(3500),
+                "period={period}"
+            );
+        }
     }
 }

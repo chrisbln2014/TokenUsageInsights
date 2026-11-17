@@ -14,9 +14,11 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 mod antigravity;
 mod antigravity_metadata;
+mod blob_export;
 mod browser;
 mod cli;
 mod config;
+mod copilot;
 mod db;
 mod grok;
 mod handlers;
@@ -375,6 +377,7 @@ async fn main() {
             "/api/:assistant/monthly/:year_month",
             get(get_monthly_details),
         )
+        .route("/api/:assistant/range/:start/:end", get(get_range_details))
         .route("/api/:assistant/model-sessions", get(get_model_sessions))
         .route("/api/:assistant/years", get(get_available_years))
         .route("/api/:assistant/yearly/:year", get(get_yearly_details))
@@ -783,6 +786,10 @@ fn build_snapshot_router(static_dir: &PathBuf) -> Router {
             get(snapshot::get_monthly_details),
         )
         .route(
+            "/api/:assistant/range/:start/:end",
+            get(snapshot::get_range_details),
+        )
+        .route(
             "/api/:assistant/model-sessions",
             get(snapshot::unsupported_in_snapshot_mode),
         )
@@ -852,6 +859,10 @@ mod tests {
             (Method::GET, "/api/x/usage/x", false),
             (Method::GET, "/api/x/monthly/x", false),
             (Method::GET, "/api/x/yearly/x", false),
+            (Method::GET, "/api/x/range/x/x", false),
+            // app.js 註解（區間分析段落）裡的路由字面值也會被解析器抓到；
+            // `:assistant` 不是支援的助理，應同樣回 400 JSON。
+            (Method::GET, "/api/:assistant/range/:start/:end", false),
             (Method::GET, "/api/x/setup-info", false),
             (Method::GET, "/api/x/pricing", false),
             (Method::GET, "/api/x/sync", false),

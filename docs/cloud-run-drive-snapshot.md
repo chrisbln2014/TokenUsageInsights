@@ -28,6 +28,8 @@ Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.tran
 
 `--export-snapshot <path>` 必須是第一個參數（不可與 `export`／`import`／`update` 等子命令混用）；`TOKEN_USAGE_INSIGHTS_EXPORT_SNAPSHOT` 環境變數只在不帶任何參數執行時生效。匯出會先增量同步本機日誌，但不做舊版資料庫遷移（由看板啟動時處理）。每日回應包含 `home_dir` 與各 session 的 `cwd`、`session_name`（前端用來分組與縮寫路徑），只有 `transcript_path` 會被清空。
 
+自訂區間分析（`/api/:assistant/range/:start/:end`，週報與自訂區間分頁）不另外存進 snapshot：Cloud Run 讀取區間內各日 `usage/:date` 的 `raw_entries`，即時用與本機相同的 `build_period_report` 重建，`all` 會合併所有助理。區間成本用 **Cloud Run 映像內的 `pricing.csv`** 重算，而每日／每月／每年報表的成本是匯出端在匯出當下算好的。所以**升版時匯出端（本機看板）與 Cloud Run 必須部署同一版本**，否則區間成本可能和日報對不起來。
+
 Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、模型 Session 明細、單日匯出／匯入、匯入批次查詢與回滾。
 
 ## 自動更新：本 fork 已永久停用

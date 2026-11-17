@@ -755,6 +755,58 @@ mod tests {
     }
 
     #[test]
+    fn mimo_v2_6_pro_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["mimo-v2.6-pro", "MiMo-V2.6-Pro", "xiaomi/mimo-v2.6-pro"] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // Input 0.435 + cache read 0.0036 + output 0.87 = 1.3086.
+            assert!(
+                (cost - 1.3086).abs() < 1e-12,
+                "unexpected MiMo-V2.6-Pro cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
+    fn mimo_v2_6_flash_uses_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "mimo-v2.6-flash",
+            "MiMo-V2.6-Flash",
+            "xiaomi/mimo-v2.6-flash",
+        ] {
+            let cost = calculate_usage_cost(
+                &rules,
+                Some(model_name),
+                1_000_000,
+                1_000_000,
+                1_000_000,
+                0,
+                0,
+            )
+            .unwrap_or_else(|error| panic!("{model_name} should have a pricing rule: {error}"));
+
+            // Input 0.14 + cache read 0.0028 + output 0.28 = 0.4228.
+            assert!(
+                (cost - 0.4228).abs() < 1e-12,
+                "unexpected MiMo-V2.6-Flash cost for {model_name}: {cost}"
+            );
+        }
+    }
+
+    #[test]
     fn gpt_6_astra_context_tiers_use_packaged_pricing() {
         let rules = load_pricing_rules();
 
@@ -865,7 +917,7 @@ mod tests {
     fn gpt_daybreak_blue_uses_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        // Identical to gpt-5.6-sol: input 5.00, cache_read 0.50, output 30.00
+        // Identical to gpt-5.6-sol: input 4.00, cache_read 0.40, output 20.00
         for model_name in [
             "gpt-daybreak-blue-latest",
             "gpt-daybreak-blue",
@@ -883,9 +935,9 @@ mod tests {
             )
             .unwrap();
 
-            // 5.00 + 0.50 + 30.00 = 35.50
+            // 4.00 + 0.40 + 20.00 = 24.40
             assert!(
-                (cost - 35.5).abs() < 1e-9,
+                (cost - 24.4).abs() < 1e-9,
                 "unexpected cost for {model_name}: {cost}"
             );
         }
@@ -902,9 +954,9 @@ mod tests {
             0,
         )
         .expect("gpt-daybreak-blue-latest turn 6 cost should calculate successfully");
-        let expected_turn_6 = (227.0 / 1_000_000.0) * 5.00
-            + (42_886.0 / 1_000_000.0) * 0.50
-            + (180.0 / 1_000_000.0) * 30.00;
+        let expected_turn_6 = (227.0 / 1_000_000.0) * 4.00
+            + (42_886.0 / 1_000_000.0) * 0.40
+            + (180.0 / 1_000_000.0) * 20.00;
         assert!((turn_6_cost - expected_turn_6).abs() < 1e-9);
     }
 
@@ -912,7 +964,7 @@ mod tests {
     fn gpt_reserve_matches_gpt_5_6_luna_packaged_pricing() {
         let rules = load_pricing_rules();
 
-        // gpt-reserve is an alias of gpt-5.6-luna: input 1.00, cache read 0.10, output 6.00
+        // gpt-reserve is an alias of gpt-5.6-luna: input 0.20, cache read 0.02, output 1.20
         let luna = calculate_usage_cost(
             &rules,
             Some("gpt-5.6-luna"),
@@ -946,9 +998,9 @@ mod tests {
         let turn_951_cost =
             calculate_usage_cost(&rules, Some("gpt-reserve"), 1_021, 1_388, 197_760, 0, 0)
                 .expect("gpt-reserve turn 951 cost should calculate successfully");
-        let expected_turn_951 = (1_021.0 / 1_000_000.0) * 1.00
-            + (197_760.0 / 1_000_000.0) * 0.10
-            + (1_388.0 / 1_000_000.0) * 6.00;
+        let expected_turn_951 = (1_021.0 / 1_000_000.0) * 0.20
+            + (197_760.0 / 1_000_000.0) * 0.02
+            + (1_388.0 / 1_000_000.0) * 1.20;
         assert!((turn_951_cost - expected_turn_951).abs() < 1e-9);
     }
 
@@ -983,6 +1035,96 @@ mod tests {
         let flash_1 =
             calculate_usage_cost(&rules, Some("mai-code-1-flash"), 1_000_000, 0, 0, 0, 0).unwrap();
         assert!((flash_1 - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn claude_fable_and_mythos_5_2_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        assert_packaged_cost_per_million(
+            &rules,
+            &[
+                "Claude Fable 5.2",
+                "Claude Mythos 5.2",
+                "claude-fable-5-2",
+                "claude-mythos-5-2",
+            ],
+            8.00 + 40.00 + 0.20,
+            "Claude Fable/Mythos 5.2",
+        );
+    }
+
+    #[test]
+    fn gemini_4_hydrogen_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Hydrogen",
+            "Gemini 4 Hydrogen (Low)",
+            "Gemini 4 Hydrogen (Medium)",
+            "Gemini 4 Hydrogen (High)",
+            "Gemini 4 Hydrogen (Extra)",
+            "Gemini 4 Hydrogen (XHigh)",
+            "gemini-4-hydrogen",
+            // Antigravity CLI model ID documented at antigravity.google/docs/models;
+            // unmapped IDs fall back to the contains match on the base rule.
+            "gemini-4-hydrogen-xhigh",
+        ] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard paid tier: input 1.50, cached input 0.075, output 7.50.
+            assert!(
+                (input - 1.50).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen input cost for {model_name}: {input}"
+            );
+            assert!(
+                (output - 7.50).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen output cost for {model_name}: {output}"
+            );
+            assert!(
+                (cached - 0.075).abs() < 1e-9,
+                "unexpected Gemini 4 Hydrogen cached input cost for {model_name}: {cached}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_4_carbon_thinking_levels_use_packaged_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in [
+            "Gemini 4 Carbon",
+            "Gemini 4 Carbon (Medium)",
+            "Gemini 4 Carbon (High)",
+            "Gemini 4 Carbon (Low)",
+            "gemini-4-carbon",
+        ] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard (post-introductory) rates: input 4.00, cached input 0.20, output 20.00.
+            assert!(
+                (input - 4.00).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon input cost for {model_name}: {input}"
+            );
+            assert!(
+                (output - 20.00).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon output cost for {model_name}: {output}"
+            );
+            assert!(
+                (cached - 0.20).abs() < 1e-9,
+                "unexpected Gemini 4 Carbon cached input cost for {model_name}: {cached}"
+            );
+        }
     }
 
     #[test]
@@ -1428,6 +1570,28 @@ mod tests {
     }
 
     #[test]
+    fn kimi_k3_1_pro_resolves_pricing_from_csv() {
+        let rules = load_prepared_pricing_rules();
+
+        for model_name in ["kimi-k3.1-pro", "kimi-k3.1-pro:cloud", "Kimi K3.1 Pro"] {
+            for (input, output, cache_read, expected) in [
+                (1_000_000, 0, 0, 2.00),
+                (0, 0, 1_000_000, 0.20),
+                (0, 1_000_000, 0, 10.00),
+                (1_000_000, 1_000_000, 1_000_000, 12.20),
+            ] {
+                let cost = rules
+                    .calculate_cost(model_name, input, output, cache_read, 0, 0)
+                    .expect("kimi-k3.1-pro should have a pricing rule");
+                assert!(
+                    (cost - expected).abs() < 1e-12,
+                    "unexpected cost for {model_name}: {cost}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn composer_2_5_speed_tiers_resolve_distinct_pricing_from_csv() {
         let rules = load_pricing_rules();
 
@@ -1456,6 +1620,28 @@ mod tests {
         .expect("composer-2.5-fast should have a pricing rule");
         // input 3.00 + cache read 0.50 + output 15.00 = 18.50
         assert!((fast - 18.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn muse_spark_open_resolves_ollama_pricing_from_csv() {
+        let rules = load_prepared_pricing_rules();
+
+        for model_name in ["muse-spark-open", "muse-spark-open:cloud"] {
+            for (input, output, cache_read, expected) in [
+                (1_000_000, 0, 0, 1.25),
+                (0, 0, 1_000_000, 0.15),
+                (0, 1_000_000, 0, 4.25),
+                (1_000_000, 1_000_000, 1_000_000, 5.65),
+            ] {
+                let cost = rules
+                    .calculate_cost(model_name, input, output, cache_read, 0, 0)
+                    .expect("Muse Spark Open should have an Ollama pricing rule");
+                assert!(
+                    (cost - expected).abs() < 1e-12,
+                    "unexpected cost for {model_name}: {cost}, expected {expected}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1511,5 +1697,33 @@ mod tests {
         )
         .expect("muse-spark-1.2-contributor should have a pricing rule");
         assert!((contributor_12 - 0.302).abs() < 1e-12);
+    }
+
+    #[test]
+    fn antigravity_orchestrator_models_use_planner_standard_pricing() {
+        let rules = load_pricing_rules();
+
+        for model_name in ["Orchestrator (Carbon)", "Orchestrator (Argon)"] {
+            let input =
+                calculate_usage_cost(&rules, Some(model_name), 1_000_000, 0, 0, 0, 0).unwrap();
+            let output =
+                calculate_usage_cost(&rules, Some(model_name), 0, 1_000_000, 0, 0, 0).unwrap();
+            let cached =
+                calculate_usage_cost(&rules, Some(model_name), 0, 0, 1_000_000, 0, 0).unwrap();
+
+            // Standard (post-introductory) planner rates: input 4.00, cached input 0.20, output 20.00.
+            assert!(
+                (input - 4.00).abs() < 1e-9,
+                "unexpected {model_name} input cost: {input}"
+            );
+            assert!(
+                (output - 20.00).abs() < 1e-9,
+                "unexpected {model_name} output cost: {output}"
+            );
+            assert!(
+                (cached - 0.20).abs() < 1e-9,
+                "unexpected {model_name} cached input cost: {cached}"
+            );
+        }
     }
 }

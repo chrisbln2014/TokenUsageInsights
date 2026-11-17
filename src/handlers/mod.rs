@@ -139,6 +139,9 @@ pub struct UsageDetailsResponse {
     pub summary: DaySummary,
     pub sessions: Vec<SessionSummary>,
     pub raw_entries: Vec<RawUsageEntry>,
+    // 舊版匯出端產生的 Cloud Run snapshot 日報沒有這個欄位，缺欄位時視為空清單。
+    #[serde(default)]
+    pub models: Vec<MonthlyModelSummary>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -466,6 +469,32 @@ mod tests {
             2
         );
 
+        let range = |start: &str, end: &str| {
+            super::get_range_details(Path((
+                "all".to_string(),
+                start.to_string(),
+                end.to_string(),
+            )))
+        };
+        let (status, ranged) =
+            response_json(range("2026-07-01", "2026-07-31").await.into_response()).await;
+        assert_eq!(status, 200);
+        assert_eq!(ranged["year_month"], "2026-07-01~2026-07-31");
+        assert_eq!(
+            ranged["summary"]["total_tokens"],
+            monthly["summary"]["total_tokens"]
+        );
+        assert_eq!(ranged["daily_breakdown"], monthly["daily_breakdown"]);
+        let (status, _) =
+            response_json(range("2026-07-31", "2026-07-01").await.into_response()).await;
+        assert_eq!(status, 400);
+        let (status, _) =
+            response_json(range("2026-01-01", "2027-12-31").await.into_response()).await;
+        assert_eq!(status, 400);
+        let (status, _) =
+            response_json(range("2030-01-01", "2030-01-07").await.into_response()).await;
+        assert_eq!(status, 404);
+
         let (status, dates) = response_json(
             super::get_available_dates(Path("all".to_string()))
                 .await
@@ -493,6 +522,12 @@ mod tests {
             .collect::<Vec<_>>();
         daily_agents.sort();
         assert_eq!(daily_agents, vec!["claude", "codex"]);
+
+        let daily_models = daily["models"].as_array().unwrap();
+        assert_eq!(daily_models.len(), 1);
+        assert_eq!(daily_models[0]["model"], "gpt-5.5");
+        assert_eq!(daily_models[0]["sessions_count"], 2);
+        assert_eq!(daily_models[0]["total_tokens"], 3_850);
 
         // 需要明確單一來源的 API 仍拒絕合併範圍。
         let export = super::export_usage_day(Path(("all".to_string(), "2026-07-01".to_string())))

@@ -30,6 +30,8 @@ Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.tran
 
 自訂區間分析（`/api/:assistant/range/:start/:end`，週報與自訂區間分頁）不另外存進 snapshot：Cloud Run 讀取區間內各日 `usage/:date` 的 `raw_entries`，即時用與本機相同的 `build_period_report` 重建，`all` 會合併所有助理。區間成本用 **Cloud Run 映像內的 `pricing.csv`** 重算，而每日／每月／每年報表的成本是匯出端在匯出當下算好的。所以**升版時匯出端（本機看板）與 Cloud Run 必須部署同一版本**，否則區間成本可能和日報對不起來。
 
+區間內某天的每日資料若解析失敗，該日會被跳過並在 Cloud Run 記錄寫一行 `⚠️ 區間分析跳過 <助理>/<日期>` 警告，其他天照常計算；只有區間內命中的每一天都壞掉時才回 500。同一份 snapshot 下，同一個（助理, 開始日, 結束日）的結果會快取在記憶體（上限 64 筆），重複查詢直接回傳；Drive 上傳新檔、snapshot 重新載入後快取自動作廢。
+
 Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、模型 Session 明細、單日匯出／匯入、匯入批次查詢與回滾。
 
 ## 自動更新：本 fork 已永久停用

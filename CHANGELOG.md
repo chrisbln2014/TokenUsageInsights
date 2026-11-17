@@ -6,6 +6,10 @@
 
 ### 新增與改善
 
+- Cloud Run snapshot 模式的區間分析（`/api/:assistant/range/:start/:end`）：區間內某天的每日資料
+  解析失敗時改為跳過該日並記錄警告，其他天照常計算，不再整段回 500；區間內每一天都壞掉時仍回錯誤，
+  不會誤報成「沒有資料」。同一份 snapshot、同一個區間的結果改為快取（上限 64 筆，超過移除最舊），
+  重複查詢不必重算；snapshot 換新後快取自動作廢。
 - Cloud Run 唯讀 snapshot 模式路由補齊 `/api/version`（回傳與正式模式一致的 `CARGO_PKG_VERSION`）
   與 mcode 助理，避免這次整合 upstream 後 snapshot 部署落後正式模式。
 - Cloud Run 唯讀 snapshot 模式新增支援 `assistant=all`（「全部 Agent」合併檢視）：`dates`／

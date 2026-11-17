@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fs,
     future::Future,
     path::{Path, PathBuf},
@@ -127,6 +127,98 @@ struct CachedSnapshot {
 }
 
 static SNAPSHOT_CACHE: OnceLock<Mutex<Option<CachedSnapshot>>> = OnceLock::new();
+
+/// 區間分析回應快取的上限筆數；每筆是一份算好的區間報表 JSON。實測（2026-11-18 正式 snapshot）
+/// 單一助理一個月約 15 KB、all 366 天約 800 KB，最糟約 50 MB，Cloud Run 記憶體上限 1 GiB 內可承受。
+const RANGE_RESPONSE_CACHE_CAPACITY: usize = 64;
+
+/// （助理, 開始日, 結束日）
+type RangeKey = (String, String, String);
+
+/// 區間分析的回應快取：區間報表要把每日資料重算一遍（366 天約 3 秒），同一份 snapshot、
+/// 同一個區間的結果不會變，所以把算好的 JSON 存起來。snapshot 換新時整批作廢。
+#[derive(Default)]
+struct RangeResponseCache {
+    /// 用 `Weak` 記住快取對應的 snapshot：不會讓已被換掉的舊 snapshot 資料留在記憶體，
+    /// 而 `Weak` 存在期間配置區塊不會被回收重用，所以位址比對不會誤判成同一份。
+    snapshot: Option<std::sync::Weak<DashboardSnapshot>>,
+    /// `None` 代表該區間沒有資料（404），一樣快取。
+    entries: HashMap<RangeKey, Option<Arc<str>>>,
+    /// 插入順序，超過上限時從最舊的開始移除。
+    order: VecDeque<RangeKey>,
+}
+
+impl RangeResponseCache {
+    fn get(
+        &mut self,
+        snapshot: &Arc<DashboardSnapshot>,
+        key: &RangeKey,
+    ) -> Option<Option<Arc<str>>> {
+        self.reset_if_snapshot_changed(snapshot);
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        snapshot: &Arc<DashboardSnapshot>,
+        key: RangeKey,
+        value: Option<Arc<str>>,
+    ) {
+        // `get` 已把快取切到請求當下的 snapshot；若期間又換檔，這是舊 snapshot 算出的結果，
+        // 直接丟掉，不能為了它把新 snapshot 的快取整批清掉。
+        if !self.is_current(snapshot) {
+            return;
+        }
+        if self.entries.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > RANGE_RESPONSE_CACHE_CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn is_current(&self, snapshot: &Arc<DashboardSnapshot>) -> bool {
+        self.snapshot
+            .as_ref()
+            .is_some_and(|cached| std::sync::Weak::ptr_eq(cached, &Arc::downgrade(snapshot)))
+    }
+
+    fn reset_if_snapshot_changed(&mut self, snapshot: &Arc<DashboardSnapshot>) {
+        if !self.is_current(snapshot) {
+            self.entries.clear();
+            self.order.clear();
+            self.snapshot = Some(Arc::downgrade(snapshot));
+        }
+    }
+}
+
+static RANGE_RESPONSE_CACHE: OnceLock<std::sync::Mutex<RangeResponseCache>> = OnceLock::new();
+
+/// 先查快取；沒命中才呼叫 `compute`（放開鎖之後才算，避免 3 秒計算期間擋住其他請求），
+/// 成功才寫入快取，失敗（Err）不快取，下次會重算。
+fn cached_range_response<F>(
+    cache: &std::sync::Mutex<RangeResponseCache>,
+    snapshot: &Arc<DashboardSnapshot>,
+    key: RangeKey,
+    compute: F,
+) -> Result<Option<Arc<str>>, String>
+where
+    F: FnOnce() -> Result<Option<String>, String>,
+{
+    let lock = || {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
+    if let Some(hit) = lock().get(snapshot, &key) {
+        return Ok(hit);
+    }
+    let value = compute()?.map(Arc::<str>::from);
+    lock().insert(snapshot, key, value.clone());
+    Ok(value)
+}
 
 pub fn snapshot_mode_enabled() -> bool {
     std::env::var("TOKEN_USAGE_INSIGHTS_DATA_SOURCE")
@@ -1132,6 +1224,7 @@ fn snapshot_range_report(
         vec![assistant]
     };
     let mut entries = Vec::new();
+    let mut skipped_days = 0usize;
     for candidate in candidates {
         let Some(assistant_snapshot) = snapshot.lookup_assistant(candidate) else {
             continue;
@@ -1141,8 +1234,15 @@ fn snapshot_range_report(
             if date.as_str() < start || date.as_str() > end {
                 continue;
             }
-            let details = serde_json::from_str::<UsageDetailsResponse>(raw.get())
-                .map_err(|e| format!("解析 {candidate}/{date} 的快取資料失敗: {e}"))?;
+            // 某天資料壞掉只跳過那天並記警告，不讓整段區間失敗。
+            let details = match serde_json::from_str::<UsageDetailsResponse>(raw.get()) {
+                Ok(details) => details,
+                Err(e) => {
+                    eprintln!("⚠️ 區間分析跳過 {candidate}/{date}：每日資料解析失敗: {e}");
+                    skipped_days += 1;
+                    continue;
+                }
+            };
             entries.extend(details.raw_entries.into_iter().map(|raw_entry| {
                 crate::db::DatedUsageEntry {
                     entry: raw_entry.entry,
@@ -1154,6 +1254,12 @@ fn snapshot_range_report(
         }
     }
     if entries.is_empty() {
+        if skipped_days > 0 {
+            // 區間內有資料但全部壞掉：不能回「沒有資料」誤導使用者。
+            return Err(format!(
+                "{assistant} {start}~{end} 區間內的 {skipped_days} 天資料全部解析失敗"
+            ));
+        }
         return Ok(None);
     }
     let report = crate::reporting::build_period_report(&entries, str::to_string, pricing_rules);
@@ -1179,15 +1285,47 @@ pub async fn get_range_details(
         )
             .into_response();
     };
-    match get_cached_snapshot().await {
-        Ok(snapshot) => {
-            let pricing_rules = crate::pricing::load_prepared_pricing_rules();
-            match snapshot_range_report(&snapshot, &assistant, &start, &end, &pricing_rules) {
-                Ok(Some(report)) => Json(report).into_response(),
-                Ok(None) => not_found_response("找不到該日期區間的使用量資料。"),
-                Err(err) => snapshot_error_response(err),
-            }
+    let snapshot = match get_cached_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return snapshot_error_response(err),
+    };
+    range_details_response(
+        RANGE_RESPONSE_CACHE.get_or_init(Default::default),
+        &snapshot,
+        &assistant,
+        &start,
+        &end,
+        crate::pricing::load_prepared_pricing_rules,
+    )
+}
+
+/// 區間分析回應：先查快取，沒命中才重建報表（只有沒命中時才載入計價規則）。
+fn range_details_response(
+    cache: &std::sync::Mutex<RangeResponseCache>,
+    snapshot: &Arc<DashboardSnapshot>,
+    assistant: &str,
+    start: &str,
+    end: &str,
+    load_pricing: fn() -> crate::pricing::PreparedPricingRules,
+) -> axum::response::Response {
+    let key = (assistant.to_string(), start.to_string(), end.to_string());
+    let result = cached_range_response(cache, snapshot, key, || {
+        let pricing_rules = load_pricing();
+        match snapshot_range_report(snapshot, assistant, start, end, &pricing_rules)? {
+            Some(report) => serde_json::to_string(&report)
+                .map(Some)
+                .map_err(|e| format!("序列化區間報表失敗: {e}")),
+            None => Ok(None),
         }
+    });
+    match result {
+        Ok(Some(body)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response(),
+        Ok(None) => not_found_response("找不到該日期區間的使用量資料。"),
         Err(err) => snapshot_error_response(err),
     }
 }
@@ -2809,6 +2947,319 @@ mod tests {
         )
         .unwrap();
         assert!(report.is_none());
+    }
+
+    fn broken_daily_raw() -> Box<RawValue> {
+        // 合法 JSON，但缺 UsageDetailsResponse 必要欄位，模擬某天的資料壞掉。
+        RawValue::from_string(r#"{"broken":true}"#.to_string()).unwrap()
+    }
+
+    fn range_snapshot_with_broken_day() -> DashboardSnapshot {
+        let mut snapshot = range_snapshot();
+        snapshot
+            .assistants
+            .get_mut("claude")
+            .unwrap()
+            .daily
+            .insert("2026-07-03".to_string(), broken_daily_raw());
+        snapshot
+    }
+
+    #[test]
+    fn snapshot_range_report_skips_broken_day_and_keeps_other_days() {
+        let report = snapshot_range_report(
+            &range_snapshot_with_broken_day(),
+            "claude",
+            "2026-07-01",
+            "2026-07-03",
+            &range_pricing(),
+        )
+        .expect("壞一天不應讓整段失敗")
+        .expect("其他天有資料");
+
+        // 07-03 壞掉被跳過，只剩 07-01（1500）＋ 07-02（2000）。
+        assert_eq!(report.summary.total_tokens, 3500);
+        let days: Vec<&str> = report
+            .daily_breakdown
+            .iter()
+            .map(|day| day.date.as_str())
+            .collect();
+        assert_eq!(days, vec!["2026-07-01", "2026-07-02"]);
+    }
+
+    #[test]
+    fn snapshot_range_report_errors_when_every_day_in_range_is_broken() {
+        let result = snapshot_range_report(
+            &range_snapshot_with_broken_day(),
+            "claude",
+            "2026-07-03",
+            "2026-07-03",
+            &range_pricing(),
+        );
+        assert!(result.is_err(), "全部壞掉不能被當成「沒有資料」");
+    }
+
+    fn range_key(assistant: &str, start: &str, end: &str) -> RangeKey {
+        (assistant.to_string(), start.to_string(), end.to_string())
+    }
+
+    #[test]
+    fn range_cache_reuses_result_for_same_snapshot_and_range() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(test_snapshot("a"));
+        let calls = std::cell::Cell::new(0);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(Some("{\"n\":1}".to_string()))
+        };
+
+        let first = cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-02"),
+            compute,
+        )
+        .unwrap();
+        let second = cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-02"),
+            compute,
+        )
+        .unwrap();
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(first.as_deref(), Some("{\"n\":1}"));
+        assert_eq!(second.as_deref(), Some("{\"n\":1}"));
+    }
+
+    #[test]
+    fn range_cache_recomputes_after_snapshot_is_replaced() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let old = Arc::new(test_snapshot("old"));
+        let new = Arc::new(test_snapshot("new"));
+        let calls = std::cell::Cell::new(0);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(Some("{}".to_string()))
+        };
+        let key = || range_key("all", "2026-07-01", "2026-07-31");
+
+        cached_range_response(&cache, &old, key(), compute).unwrap();
+        cached_range_response(&cache, &old, key(), compute).unwrap();
+        assert_eq!(calls.get(), 1);
+        cached_range_response(&cache, &new, key(), compute).unwrap();
+        assert_eq!(calls.get(), 2, "換新 snapshot 後必須重算");
+    }
+
+    #[test]
+    fn range_cache_evicts_oldest_entry_beyond_capacity() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(test_snapshot("a"));
+        let calls = std::cell::Cell::new(0);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(Some("{}".to_string()))
+        };
+        // 65 個不同區間（上限 64）。
+        for day in 1..=65 {
+            let end = format!("2026-{:02}-{:02}", 1 + (day - 1) / 28, 1 + (day - 1) % 28);
+            cached_range_response(
+                &cache,
+                &snapshot,
+                range_key("claude", "2026-01-01", &end),
+                compute,
+            )
+            .unwrap();
+        }
+        assert_eq!(calls.get(), 65);
+
+        // 最新的一筆還在，不重算。
+        cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-01-01", "2026-03-09"),
+            compute,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 65);
+        // 最舊的一筆已被移除，要重算。
+        cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-01-01", "2026-01-01"),
+            compute,
+        )
+        .unwrap();
+        assert_eq!(calls.get(), 66);
+        assert!(cache.lock().unwrap().entries.len() <= 64);
+    }
+
+    #[test]
+    fn range_cache_does_not_store_errors_but_stores_no_data() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(test_snapshot("a"));
+        let calls = std::cell::Cell::new(0);
+
+        let failing = || {
+            calls.set(calls.get() + 1);
+            Err::<Option<String>, String>("boom".to_string())
+        };
+        assert!(cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-01"),
+            failing
+        )
+        .is_err());
+        assert!(cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-01"),
+            failing
+        )
+        .is_err());
+        assert_eq!(calls.get(), 2, "失敗結果不能被快取");
+
+        let no_data = || {
+            calls.set(calls.get() + 1);
+            Ok(None)
+        };
+        let first = cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-08-01", "2026-08-31"),
+            no_data,
+        )
+        .unwrap();
+        let second = cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-08-01", "2026-08-31"),
+            no_data,
+        )
+        .unwrap();
+        assert!(first.is_none() && second.is_none());
+        assert_eq!(calls.get(), 3, "沒有資料（404）的結果可以快取");
+    }
+
+    #[test]
+    fn range_cache_does_not_keep_replaced_snapshot_alive() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(test_snapshot("old"));
+        let weak = Arc::downgrade(&snapshot);
+        cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-02"),
+            || Ok(Some("{}".to_string())),
+        )
+        .unwrap();
+        drop(snapshot);
+        assert_eq!(weak.strong_count(), 0, "快取不能留住舊 snapshot 的資料");
+    }
+
+    #[test]
+    fn range_cache_does_not_hold_lock_while_computing() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(test_snapshot("a"));
+        let lock_was_held = std::cell::Cell::new(None);
+        cached_range_response(
+            &cache,
+            &snapshot,
+            range_key("claude", "2026-07-01", "2026-07-02"),
+            || {
+                lock_was_held.set(Some(cache.try_lock().is_err()));
+                Ok(Some("{}".to_string()))
+            },
+        )
+        .unwrap();
+        assert_eq!(lock_was_held.get(), Some(false), "計算期間不能持有快取鎖");
+    }
+
+    #[test]
+    fn range_cache_ignores_late_insert_from_replaced_snapshot() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let old = Arc::new(test_snapshot("old"));
+        let new = Arc::new(test_snapshot("new"));
+        let calls = std::cell::Cell::new(0);
+        let compute = || {
+            calls.set(calls.get() + 1);
+            Ok(Some("{}".to_string()))
+        };
+        let key = || range_key("claude", "2026-07-01", "2026-07-02");
+
+        cached_range_response(&cache, &new, key(), compute).unwrap();
+        // 換檔前就開始算的舊請求晚一步寫入，不能把新 snapshot 的快取清掉。
+        cache.lock().unwrap().insert(
+            &old,
+            range_key("claude", "2026-01-01", "2026-01-31"),
+            Some(Arc::from("{}")),
+        );
+        cached_range_response(&cache, &new, key(), compute).unwrap();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn range_details_response_keeps_status_content_type_and_json_shape() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(range_snapshot_with_broken_day());
+
+        let ok = range_details_response(
+            &cache,
+            &snapshot,
+            "claude",
+            "2026-07-01",
+            "2026-07-03",
+            range_pricing,
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = axum::body::to_bytes(ok.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "agent_breakdown",
+                "daily_breakdown",
+                "models",
+                "projects",
+                "summary",
+                "year_month"
+            ]
+        );
+        assert_eq!(json["summary"]["total_tokens"], 3500);
+
+        let none = range_details_response(
+            &cache,
+            &snapshot,
+            "claude",
+            "2026-08-01",
+            "2026-08-31",
+            range_pricing,
+        );
+        assert_eq!(none.status(), StatusCode::NOT_FOUND);
+        let broken = range_details_response(
+            &cache,
+            &snapshot,
+            "claude",
+            "2026-07-03",
+            "2026-07-03",
+            range_pricing,
+        );
+        assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]

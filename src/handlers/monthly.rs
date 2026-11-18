@@ -17,13 +17,13 @@ use crate::session_identity::SessionIdentity;
 
 #[derive(serde::Deserialize)]
 pub struct ModelSessionsQuery {
-    period: String,
-    model: String,
-    mode: Option<String>,
+    pub(crate) period: String,
+    pub(crate) model: String,
+    pub(crate) mode: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ModelSessionPeriod {
+pub(crate) enum ModelSessionPeriod {
     Day,
     Month,
     Year,
@@ -57,7 +57,7 @@ fn parse_canonical_date(value: &str) -> Option<chrono::NaiveDate> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ModelSessionMode {
+pub(crate) enum ModelSessionMode {
     Agent,
     Ide,
     Unclassified,
@@ -90,20 +90,15 @@ impl ModelSessionMode {
     }
 }
 
-fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
+pub(crate) fn parse_model_session_period(value: &str) -> Option<ModelSessionPeriod> {
     if let Some((start, end)) = value.split_once('~') {
         return parse_date_range(start, end).map(|(s, e)| ModelSessionPeriod::Range(s, e));
     }
+    // 與區間相同，只收標準寫法：`+202`、`+2026-7` 這類 chrono 能解析的寬鬆寫法一律拒絕。
     match value.len() {
-        4 => chrono::NaiveDate::parse_from_str(&format!("{value}-01-01"), "%Y-%m-%d")
-            .ok()
-            .map(|_| ModelSessionPeriod::Year),
-        7 => chrono::NaiveDate::parse_from_str(&format!("{value}-01"), "%Y-%m-%d")
-            .ok()
-            .map(|_| ModelSessionPeriod::Month),
-        10 => chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .ok()
-            .map(|_| ModelSessionPeriod::Day),
+        4 => parse_canonical_date(&format!("{value}-01-01")).map(|_| ModelSessionPeriod::Year),
+        7 => parse_canonical_date(&format!("{value}-01")).map(|_| ModelSessionPeriod::Month),
+        10 => parse_canonical_date(value).map(|_| ModelSessionPeriod::Day),
         _ => None,
     }
 }
@@ -122,7 +117,7 @@ struct FirstDatedEntry {
     date: String,
 }
 
-fn collect_model_session_details(
+pub(crate) fn collect_model_session_details(
     entries_with_type: &[db::DatedUsageEntry],
     requested_model: &str,
     requested_mode: Option<ModelSessionMode>,
@@ -251,6 +246,55 @@ fn collect_model_session_details(
     details
 }
 
+/// 模型 Session 明細的 query 驗證結果；本機與 snapshot 模式共用，避免兩份驗證規則漂移。
+pub(crate) struct ValidatedModelSessionsQuery {
+    pub(crate) period: String,
+    pub(crate) period_kind: ModelSessionPeriod,
+    pub(crate) model: String,
+    pub(crate) mode: Option<ModelSessionMode>,
+}
+
+/// 驗證失敗回傳要放進 400 JSON `error` 欄位的訊息。
+pub(crate) fn validate_model_sessions_query(
+    query: &ModelSessionsQuery,
+) -> Result<ValidatedModelSessionsQuery, &'static str> {
+    let period = query.period.trim().to_string();
+    let model = query.model.trim().to_string();
+    let mode = match query.mode.as_deref().map(str::trim) {
+        Some(value) => match ModelSessionMode::parse(value) {
+            Some(mode) => Some(mode),
+            None => return Err("Mode 必須是 agent、ide 或 unclassified"),
+        },
+        None => None,
+    };
+    let Some(period_kind) = parse_model_session_period(&period) else {
+        return Err("期間必須是 YYYY、YYYY-MM、YYYY-MM-DD 或 YYYY-MM-DD~YYYY-MM-DD");
+    };
+    if model.is_empty() || model.len() > 200 {
+        return Err("模型名稱無效");
+    }
+    Ok(ValidatedModelSessionsQuery {
+        period,
+        period_kind,
+        model,
+        mode,
+    })
+}
+
+pub(crate) fn model_sessions_response_body(
+    period: String,
+    model: String,
+    mode: Option<ModelSessionMode>,
+    sessions: Vec<ModelSessionDetail>,
+) -> ModelSessionsResponse {
+    ModelSessionsResponse {
+        period,
+        model,
+        mode: mode.and_then(ModelSessionMode::label).map(str::to_string),
+        sessions,
+    }
+}
+
 pub async fn get_model_sessions(
     Path(assistant): Path<String>,
     Query(query): Query<ModelSessionsQuery>,
@@ -264,34 +308,21 @@ pub async fn get_model_sessions(
             .into_response();
     }
 
-    let period = query.period.trim().to_string();
-    let model = query.model.trim().to_string();
-    let mode =
-        match query.mode.as_deref().map(str::trim) {
-            Some(value) => match ModelSessionMode::parse(value) {
-                Some(mode) => Some(mode),
-                None => return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": "Mode 必須是 agent、ide 或 unclassified" })),
-                )
-                    .into_response(),
-            },
-            None => None,
-        };
-    let Some(period_kind) = parse_model_session_period(&period) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "期間必須是 YYYY、YYYY-MM、YYYY-MM-DD 或 YYYY-MM-DD~YYYY-MM-DD" })),
-        )
-            .into_response();
+    let ValidatedModelSessionsQuery {
+        period,
+        period_kind,
+        model,
+        mode,
+    } = match validate_model_sessions_query(&query) {
+        Ok(validated) => validated,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
     };
-    if model.is_empty() || model.len() > 200 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "模型名稱無效" })),
-        )
-            .into_response();
-    }
 
     let assistant_for_query = assistant.clone();
     let period_for_query = period.clone();
@@ -332,13 +363,9 @@ pub async fn get_model_sessions(
     .unwrap_or_else(|_| Err("執行緒執行失敗".to_string()));
 
     match result {
-        Ok(sessions) => Json(ModelSessionsResponse {
-            period,
-            model,
-            mode: mode.and_then(ModelSessionMode::label).map(str::to_string),
-            sessions,
-        })
-        .into_response(),
+        Ok(sessions) => {
+            Json(model_sessions_response_body(period, model, mode, sessions)).into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": error })),
@@ -657,6 +684,44 @@ mod tests {
         assert!(parse_model_session_period("2026-13").is_none());
         assert!(parse_model_session_period("20x6").is_none());
         assert!(parse_model_session_period("2026-02-30").is_none());
+    }
+
+    #[test]
+    fn model_session_period_rejects_non_canonical_single_periods() {
+        // 與區間同理：chrono 能解析的寬鬆寫法一律拒絕（審查 F1）。
+        for value in [
+            "+202",
+            "-202",
+            "+2026-7",
+            "-2026-7",
+            "2026-7",
+            "+2026-7-01",
+            "+026-07-01",
+            "2026-07-1",
+            "2026-7-01",
+        ] {
+            assert!(
+                parse_model_session_period(value).is_none(),
+                "{value} 應被拒絕"
+            );
+        }
+    }
+
+    fn model_query(model: &str) -> ModelSessionsQuery {
+        ModelSessionsQuery {
+            period: "2026-07".to_string(),
+            model: model.to_string(),
+            mode: None,
+        }
+    }
+
+    #[test]
+    fn model_sessions_query_limits_model_name_to_200_bytes() {
+        assert!(validate_model_sessions_query(&model_query(&"m".repeat(200))).is_ok());
+        assert!(validate_model_sessions_query(&model_query(&"m".repeat(201))).is_err());
+        // 上限以 UTF-8 bytes 計：66 個中文字 198 bytes 通過，67 個 201 bytes 拒絕。
+        assert!(validate_model_sessions_query(&model_query(&"模".repeat(66))).is_ok());
+        assert!(validate_model_sessions_query(&model_query(&"模".repeat(67))).is_err());
     }
 
     #[test]

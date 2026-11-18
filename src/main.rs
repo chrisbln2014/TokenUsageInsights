@@ -791,7 +791,7 @@ fn build_snapshot_router(static_dir: &PathBuf) -> Router {
         )
         .route(
             "/api/:assistant/model-sessions",
-            get(snapshot::unsupported_in_snapshot_mode),
+            get(snapshot::get_model_sessions),
         )
         .route("/api/:assistant/years", get(snapshot::get_available_years))
         .route(
@@ -867,7 +867,7 @@ mod tests {
             (Method::GET, "/api/x/pricing", false),
             (Method::GET, "/api/x/sync", false),
             (Method::GET, "/api/x/session/xx", false),
-            (Method::GET, "/api/x/model-sessions", true),
+            (Method::GET, "/api/x/model-sessions", false),
             (Method::GET, "/api/x/usage/x/session-search", true),
             (Method::GET, "/api/x/usage/x/export", true),
             (Method::POST, "/api/x/usage/all/import", true),

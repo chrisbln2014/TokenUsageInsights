@@ -9,9 +9,14 @@
 - 自訂區間 API（`/api/:assistant/range/:start/:end`，一般模式與 Cloud Run snapshot 模式）只接受標準
   `YYYY-MM-DD` 日期；`+2026-7-01` 這類 chrono 能解析的寬鬆寫法改回 400。原本這類字串在字典序比較下
   會把開始日推到最早，可繞過 366 天上限。
+- 模型 Session 明細 API（`/api/:assistant/model-sessions`）的單日／單月／單年期間也只接受標準寫法，
+  `+2026-7`、`+202` 這類寬鬆寫法改回 400（原本回 200 空清單）。
 
 ### 新增與改善
 
+- Cloud Run snapshot 模式支援模型 Session 明細（`/api/:assistant/model-sessions`），不再回 501「無法載入
+  Session 明細」：由 snapshot 既有的每日 `raw_entries` 即時重算（snapshot 檔大小不變），結果與本機看板一致，
+  相同查詢會快取。Copilot 逐次呼叫的 session 耗時可能與本機不同（snapshot 不含 `import_source_id`）。
 - Cloud Run snapshot 模式的區間分析（`/api/:assistant/range/:start/:end`）：區間內某天的每日資料
   解析失敗時改為跳過該日並記錄警告，其他天照常計算，不再整段回 500；區間內每一天都壞掉時仍回錯誤，
   不會誤報成「沒有資料」。同一份 snapshot、同一個區間的結果改為快取（上限 64 筆，超過移除最舊），

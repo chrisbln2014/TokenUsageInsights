@@ -1208,16 +1208,16 @@ pub async fn get_monthly_details(
     }
 }
 
-/// 從 snapshot 的每日 `raw_entries` 重建自訂區間報表（含頭尾），回應形狀與一般模式的
-/// `/api/:assistant/range/:start/:end` 相同。成本以本程式內建的 `pricing.csv` 重算，
-/// 因此匯出端與 Cloud Run 必須同版本，區間成本才會與日報一致。
-fn snapshot_range_report(
+/// 從 snapshot 每日資料還原 `include(日期)` 成立那些天的 raw_entries（`all` 合併每個助理）。
+/// 某天資料壞掉只跳過那天並記警告；期間內有資料但全部壞掉時回 Err，
+/// 不能被當成「沒有資料」誤導使用者。snapshot 沒有 `import_source_id`，一律為 None。
+fn snapshot_dated_entries(
     snapshot: &DashboardSnapshot,
     assistant: &str,
-    start: &str,
-    end: &str,
-    pricing_rules: &crate::pricing::PreparedPricingRules,
-) -> Result<Option<MonthlyDetailsResponse>, String> {
+    period_label: &str,
+    purpose: &str,
+    include: impl Fn(&str) -> bool,
+) -> Result<Vec<crate::db::DatedUsageEntry>, String> {
     let candidates: Vec<&str> = if assistant == ALL_ASSISTANTS_SCOPE {
         ASSISTANTS.to_vec()
     } else {
@@ -1229,16 +1229,14 @@ fn snapshot_range_report(
         let Some(assistant_snapshot) = snapshot.lookup_assistant(candidate) else {
             continue;
         };
-        // 日期鍵是 YYYY-MM-DD，字典序即時間順序。
         for (date, raw) in &assistant_snapshot.daily {
-            if date.as_str() < start || date.as_str() > end {
+            if !include(date.as_str()) {
                 continue;
             }
-            // 某天資料壞掉只跳過那天並記警告，不讓整段區間失敗。
             let details = match serde_json::from_str::<UsageDetailsResponse>(raw.get()) {
                 Ok(details) => details,
                 Err(e) => {
-                    eprintln!("⚠️ 區間分析跳過 {candidate}/{date}：每日資料解析失敗: {e}");
+                    eprintln!("⚠️ {purpose}跳過 {candidate}/{date}：每日資料解析失敗: {e}");
                     skipped_days += 1;
                     continue;
                 }
@@ -1253,13 +1251,33 @@ fn snapshot_range_report(
             }));
         }
     }
+    if entries.is_empty() && skipped_days > 0 {
+        return Err(format!(
+            "{assistant} {period_label} 區間內的 {skipped_days} 天資料全部解析失敗"
+        ));
+    }
+    Ok(entries)
+}
+
+/// 從 snapshot 的每日 `raw_entries` 重建自訂區間報表（含頭尾），回應形狀與一般模式的
+/// `/api/:assistant/range/:start/:end` 相同。成本以本程式內建的 `pricing.csv` 重算，
+/// 因此匯出端與 Cloud Run 必須同版本，區間成本才會與日報一致。
+fn snapshot_range_report(
+    snapshot: &DashboardSnapshot,
+    assistant: &str,
+    start: &str,
+    end: &str,
+    pricing_rules: &crate::pricing::PreparedPricingRules,
+) -> Result<Option<MonthlyDetailsResponse>, String> {
+    // 日期鍵是 YYYY-MM-DD，字典序即時間順序。
+    let entries = snapshot_dated_entries(
+        snapshot,
+        assistant,
+        &format!("{start}~{end}"),
+        "區間分析",
+        |date| date >= start && date <= end,
+    )?;
     if entries.is_empty() {
-        if skipped_days > 0 {
-            // 區間內有資料但全部壞掉：不能回「沒有資料」誤導使用者。
-            return Err(format!(
-                "{assistant} {start}~{end} 區間內的 {skipped_days} 天資料全部解析失敗"
-            ));
-        }
         return Ok(None);
     }
     let report = crate::reporting::build_period_report(&entries, str::to_string, pricing_rules);
@@ -1449,11 +1467,155 @@ pub async fn get_session_details(
     }
 }
 
+static MODEL_SESSIONS_RESPONSE_CACHE: OnceLock<std::sync::Mutex<RangeResponseCache>> =
+    OnceLock::new();
+
+/// 模型 Session 明細（snapshot 模式）：由每日 raw_entries 重算，與本機 API 同形狀。
+/// 參數驗證與本機 handler 共用（`validate_model_sessions_query`）；缺少參數也回 JSON 400。
+pub async fn get_model_sessions(
+    AxumPath(assistant): AxumPath<String>,
+    query: Result<
+        axum::extract::Query<handlers::monthly::ModelSessionsQuery>,
+        axum::extract::rejection::QueryRejection,
+    >,
+) -> axum::response::Response {
+    let assistant = normalize_assistant_name(&assistant);
+    if !is_supported_assistant_scope(&assistant) {
+        return unsupported_assistant_response();
+    }
+    let Ok(axum::extract::Query(query)) = query else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "缺少 period／model 參數或參數格式錯誤" })),
+        )
+            .into_response();
+    };
+    let validated = match handlers::monthly::validate_model_sessions_query(&query) {
+        Ok(validated) => validated,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": message })),
+            )
+                .into_response()
+        }
+    };
+    let snapshot = match get_cached_snapshot().await {
+        Ok(snapshot) => snapshot,
+        Err(err) => return snapshot_error_response(err),
+    };
+    // 沒命中快取時要解析整段期間的每日資料（年度 all 約 1 秒），放到 blocking 執行緒。
+    tokio::task::spawn_blocking(move || {
+        model_sessions_response(
+            MODEL_SESSIONS_RESPONSE_CACHE.get_or_init(Default::default),
+            &snapshot,
+            &assistant,
+            validated,
+            crate::pricing::load_prepared_pricing_rules,
+        )
+    })
+    .await
+    .unwrap_or_else(|_| snapshot_error_response("執行緒執行失敗".to_string()))
+}
+
+/// 依期間種類決定要納入哪些每日鍵（`YYYY-MM-DD`）。
+fn model_session_period_includes(
+    period: &str,
+    period_kind: &handlers::monthly::ModelSessionPeriod,
+    date: &str,
+) -> bool {
+    use handlers::monthly::ModelSessionPeriod;
+    match period_kind {
+        ModelSessionPeriod::Day => date == period,
+        ModelSessionPeriod::Month | ModelSessionPeriod::Year => date
+            .strip_prefix(period)
+            .is_some_and(|rest| rest.starts_with('-')),
+        ModelSessionPeriod::Range(start, end) => date >= start.as_str() && date <= end.as_str(),
+    }
+}
+
+fn snapshot_model_sessions(
+    snapshot: &DashboardSnapshot,
+    assistant: &str,
+    period: &str,
+    period_kind: &handlers::monthly::ModelSessionPeriod,
+    model: &str,
+    mode: Option<handlers::monthly::ModelSessionMode>,
+    pricing_rules: &crate::pricing::PreparedPricingRules,
+) -> Result<Vec<handlers::ModelSessionDetail>, String> {
+    let entries = snapshot_dated_entries(
+        snapshot,
+        assistant,
+        period,
+        "模型 Session 明細",
+        |date| model_session_period_includes(period, period_kind, date),
+    )?;
+    Ok(handlers::monthly::collect_model_session_details(
+        &entries,
+        model,
+        mode,
+        pricing_rules,
+    ))
+}
+
+/// 模型 Session 明細回應：先查快取，沒命中才重算（只有沒命中時才載入計價規則）。
+/// 沒資料與本機一致回 200 空清單；期間內全部壞掉回 500。
+fn model_sessions_response(
+    cache: &std::sync::Mutex<RangeResponseCache>,
+    snapshot: &Arc<DashboardSnapshot>,
+    assistant: &str,
+    query: handlers::monthly::ValidatedModelSessionsQuery,
+    load_pricing: fn() -> crate::pricing::PreparedPricingRules,
+) -> axum::response::Response {
+    let handlers::monthly::ValidatedModelSessionsQuery {
+        period,
+        period_kind,
+        model,
+        mode,
+    } = query;
+    let key = (
+        assistant.to_string(),
+        period.clone(),
+        format!("{model}\u{0}{mode:?}"),
+    );
+    let result = cached_range_response(cache, snapshot, key, || {
+        let pricing_rules = load_pricing();
+        let sessions = snapshot_model_sessions(
+            snapshot,
+            assistant,
+            &period,
+            &period_kind,
+            &model,
+            mode,
+            &pricing_rules,
+        )?;
+        let body = handlers::monthly::model_sessions_response_body(
+            period.clone(),
+            model.clone(),
+            mode,
+            sessions,
+        );
+        serde_json::to_string(&body)
+            .map(Some)
+            .map_err(|e| format!("序列化模型 Session 明細失敗: {e}"))
+    });
+    match result {
+        Ok(Some(body)) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response(),
+        Ok(None) => snapshot_error_response("模型 Session 明細快取內容遺失".to_string()),
+        Err(err) => snapshot_error_response(err),
+    }
+}
+
 pub async fn unsupported_in_snapshot_mode() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,
         Json(serde_json::json!({
-            "error": "Cloud Run snapshot 模式為唯讀，不支援此功能（Session 搜尋、模型 Session 明細、匯出／匯入）。請在本機看板使用。"
+            "error": "Cloud Run snapshot 模式為唯讀，不支援此功能（Session 搜尋、匯出／匯入）。請在本機看板使用。"
         })),
     )
         .into_response()
@@ -2997,6 +3159,408 @@ mod tests {
             &range_pricing(),
         );
         assert!(result.is_err(), "全部壞掉不能被當成「沒有資料」");
+    }
+
+    // ---- 模型 Session 明細（snapshot 模式） ----
+
+    fn model_sessions_snapshot() -> DashboardSnapshot {
+        let mut snapshot = range_snapshot();
+        let claude = snapshot.assistants.get_mut("claude").unwrap();
+        // 相鄰月份、相鄰年份的資料，用來證明期間篩選不會誤算進來。
+        for (date, session, input) in [
+            ("2025-12-31", "sY", 7000),
+            ("2026-06-30", "s0", 300),
+            ("2026-08-01", "s9", 800),
+        ] {
+            claude.daily.insert(
+                date.to_string(),
+                daily_raw(
+                    date,
+                    vec![range_entry(
+                        "claude",
+                        session,
+                        &format!("{date}T09:00:00Z"),
+                        input,
+                        0,
+                    )],
+                ),
+            );
+        }
+        // 07-01 另有一個用其他模型的 session，用來驗證模型篩選。
+        let mut other = range_entry("claude", "o1", "2026-07-01T11:00:00Z", 50, 0);
+        other.entry.model = Some("other-model".to_string());
+        other.entry.model_id = Some("other-model".to_string());
+        claude.daily.insert(
+            "2026-07-01".to_string(),
+            daily_raw(
+                "2026-07-01",
+                vec![
+                    range_entry("claude", "s1", "2026-07-01T09:00:00Z", 1000, 500),
+                    other,
+                ],
+            ),
+        );
+        snapshot
+    }
+
+    fn model_session_ids(
+        snapshot: &DashboardSnapshot,
+        assistant: &str,
+        period: &str,
+        model: &str,
+        mode: Option<handlers::monthly::ModelSessionMode>,
+    ) -> Vec<String> {
+        let kind = handlers::monthly::parse_model_session_period(period).expect("期間合法");
+        snapshot_model_sessions(
+            snapshot,
+            assistant,
+            period,
+            &kind,
+            model,
+            mode,
+            &range_pricing(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|detail| detail.session_id)
+        .collect()
+    }
+
+    #[test]
+    fn snapshot_model_sessions_day_period_takes_only_that_day() {
+        let snapshot = model_sessions_snapshot();
+        let kind = handlers::monthly::parse_model_session_period("2026-07-01").unwrap();
+        let sessions = snapshot_model_sessions(
+            &snapshot,
+            "claude",
+            "2026-07-01",
+            &kind,
+            "test-model",
+            None,
+            &range_pricing(),
+        )
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        let s1 = &sessions[0];
+        assert_eq!(s1.session_id, "s1");
+        assert_eq!(s1.assistant_type, "claude");
+        assert_eq!(s1.date.as_deref(), Some("2026-07-01"));
+        assert_eq!(s1.cwd, "/repo");
+        // s1 = 1000 輸入 + 500 輸出；成本 (1000×1 + 500×2)/1e6 = 0.002。
+        assert_eq!(s1.total_tokens, 1500);
+        assert_eq!(s1.total_input_tokens, 1000);
+        assert_eq!(s1.total_output_tokens, 500);
+        assert!((s1.cost_usd - 0.002).abs() < 1e-12);
+    }
+
+    #[test]
+    fn snapshot_model_sessions_month_excludes_adjacent_months() {
+        // 06-30 的 s0、08-01 的 s9 都不在 2026-07；依時間新到舊排序。
+        assert_eq!(
+            model_session_ids(
+                &model_sessions_snapshot(),
+                "claude",
+                "2026-07",
+                "test-model",
+                None
+            ),
+            vec!["s2", "s1"]
+        );
+    }
+
+    #[test]
+    fn snapshot_model_sessions_year_excludes_adjacent_year() {
+        // 2025-12-31 的 sY 不在 2026。
+        assert_eq!(
+            model_session_ids(
+                &model_sessions_snapshot(),
+                "claude",
+                "2026",
+                "test-model",
+                None
+            ),
+            vec!["s9", "s2", "s1", "s0"]
+        );
+    }
+
+    #[test]
+    fn snapshot_model_sessions_range_includes_both_ends() {
+        assert_eq!(
+            model_session_ids(
+                &model_sessions_snapshot(),
+                "claude",
+                "2026-06-30~2026-07-01",
+                "test-model",
+                None
+            ),
+            vec!["s1", "s0"]
+        );
+    }
+
+    #[test]
+    fn snapshot_model_sessions_all_merges_assistants_single_takes_own() {
+        let snapshot = model_sessions_snapshot();
+        assert_eq!(
+            model_session_ids(
+                &snapshot,
+                ALL_ASSISTANTS_SCOPE,
+                "2026-07",
+                "test-model",
+                None
+            ),
+            vec!["c2", "c1", "s2", "s1"]
+        );
+        assert_eq!(
+            model_session_ids(&snapshot, "codex", "2026-07", "test-model", None),
+            vec!["c2", "c1"]
+        );
+    }
+
+    #[test]
+    fn snapshot_model_sessions_filters_by_model_and_mode() {
+        use handlers::monthly::ModelSessionMode;
+        let snapshot = model_sessions_snapshot();
+        assert_eq!(
+            model_session_ids(&snapshot, "claude", "2026-07-01", "other-model", None),
+            vec!["o1"]
+        );
+        // 非 Cursor 的 session 沒有 mode，只屬於 unclassified。
+        assert!(model_session_ids(
+            &snapshot,
+            "claude",
+            "2026-07-01",
+            "test-model",
+            Some(ModelSessionMode::Agent)
+        )
+        .is_empty());
+        assert_eq!(
+            model_session_ids(
+                &snapshot,
+                "claude",
+                "2026-07-01",
+                "test-model",
+                Some(ModelSessionMode::Unclassified)
+            ),
+            vec!["s1"]
+        );
+    }
+
+    #[test]
+    fn snapshot_model_sessions_filters_cursor_agent_and_ide_modes() {
+        use handlers::monthly::ModelSessionMode;
+        let cursor_entry = |session: &str, kind: &str| {
+            let mut entry = range_entry("cursor", session, "2026-07-01T08:00:00Z", 100, 0);
+            entry.entry.source_kind = Some(kind.to_string());
+            entry
+        };
+        let mut snapshot = model_sessions_snapshot();
+        let mut cursor = AssistantSnapshot::default();
+        cursor.daily.insert(
+            "2026-07-01".to_string(),
+            daily_raw(
+                "2026-07-01",
+                vec![
+                    cursor_entry("cA", "cursor-agent"),
+                    cursor_entry("cI", "cursor-ide"),
+                ],
+            ),
+        );
+        snapshot.assistants.insert("cursor".to_string(), cursor);
+        let ids = |mode| model_session_ids(&snapshot, "cursor", "2026-07", "test-model", mode);
+        assert_eq!(ids(Some(ModelSessionMode::Agent)), vec!["cA"]);
+        assert_eq!(ids(Some(ModelSessionMode::Ide)), vec!["cI"]);
+        assert!(ids(Some(ModelSessionMode::Unclassified)).is_empty());
+    }
+
+    #[test]
+    fn snapshot_model_sessions_without_data_is_empty_not_error() {
+        assert!(model_session_ids(
+            &model_sessions_snapshot(),
+            "claude",
+            "2026-09",
+            "test-model",
+            None
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn snapshot_model_sessions_skips_broken_day_but_errors_when_all_broken() {
+        let snapshot = range_snapshot_with_broken_day();
+        assert_eq!(
+            model_session_ids(&snapshot, "claude", "2026-07", "test-model", None),
+            vec!["s2", "s1"]
+        );
+        let kind = handlers::monthly::parse_model_session_period("2026-07-03").unwrap();
+        let result = snapshot_model_sessions(
+            &snapshot,
+            "claude",
+            "2026-07-03",
+            &kind,
+            "test-model",
+            None,
+            &range_pricing(),
+        );
+        assert!(result.is_err(), "全部壞掉不能被當成「沒有資料」");
+    }
+
+    fn validated_query(
+        period: &str,
+        model: &str,
+        mode: Option<&str>,
+    ) -> handlers::monthly::ValidatedModelSessionsQuery {
+        let query = handlers::monthly::ModelSessionsQuery {
+            period: period.to_string(),
+            model: model.to_string(),
+            mode: mode.map(str::to_string),
+        };
+        match handlers::monthly::validate_model_sessions_query(&query) {
+            Ok(validated) => validated,
+            Err(_) => panic!("query 應該合法"),
+        }
+    }
+
+    async fn response_json(response: axum::response::Response) -> Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn model_sessions_response_matches_local_shape_and_statuses() {
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(range_snapshot_with_broken_day());
+
+        let ok = model_sessions_response(
+            &cache,
+            &snapshot,
+            "claude",
+            validated_query("2026-07", "test-model", Some("unclassified")),
+            range_pricing,
+        );
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(
+            ok.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let json = response_json(ok).await;
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["mode", "model", "period", "sessions"]);
+        assert_eq!(json["period"], "2026-07");
+        assert_eq!(json["model"], "test-model");
+        assert_eq!(json["mode"], Value::Null);
+        assert_eq!(json["sessions"][0]["session_id"], "s2");
+        assert_eq!(json["sessions"][1]["total_tokens"], 1500);
+
+        // 沒資料：和本機一樣回 200 空清單，不回 404。
+        let empty = model_sessions_response(
+            &cache,
+            &snapshot,
+            "claude",
+            validated_query("2026-09", "test-model", None),
+            range_pricing,
+        );
+        assert_eq!(empty.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(empty).await["sessions"],
+            serde_json::json!([])
+        );
+
+        // 期間內全部壞掉：500。
+        let broken = model_sessions_response(
+            &cache,
+            &snapshot,
+            "claude",
+            validated_query("2026-07-03", "test-model", None),
+            range_pricing,
+        );
+        assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    static MODEL_SESSIONS_PRICING_LOADS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn counting_model_sessions_pricing() -> crate::pricing::PreparedPricingRules {
+        MODEL_SESSIONS_PRICING_LOADS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        range_pricing()
+    }
+
+    #[test]
+    fn model_sessions_response_uses_cache_keyed_by_query_and_snapshot() {
+        use std::sync::atomic::Ordering;
+        let loads = || MODEL_SESSIONS_PRICING_LOADS.load(Ordering::SeqCst);
+        let cache = std::sync::Mutex::new(RangeResponseCache::default());
+        let snapshot = Arc::new(model_sessions_snapshot());
+        let call = |snapshot: &Arc<DashboardSnapshot>, mode: Option<&str>| {
+            model_sessions_response(
+                &cache,
+                snapshot,
+                "claude",
+                validated_query("2026-07", "test-model", mode),
+                counting_model_sessions_pricing,
+            )
+            .status()
+        };
+
+        assert_eq!(call(&snapshot, None), StatusCode::OK);
+        assert_eq!(loads(), 1);
+        assert_eq!(call(&snapshot, None), StatusCode::OK);
+        assert_eq!(loads(), 1, "相同查詢應走快取");
+        assert_eq!(call(&snapshot, Some("agent")), StatusCode::OK);
+        assert_eq!(loads(), 2, "mode 不同要重算");
+        let replaced = Arc::new(model_sessions_snapshot());
+        assert_eq!(call(&replaced, None), StatusCode::OK);
+        assert_eq!(loads(), 3, "snapshot 換新要重算");
+    }
+
+    #[tokio::test]
+    async fn get_model_sessions_rejects_invalid_params_with_json_400() {
+        use axum::extract::Query;
+        let query = |period: &str, model: &str, mode: Option<&str>| {
+            Ok(Query(handlers::monthly::ModelSessionsQuery {
+                period: period.to_string(),
+                model: model.to_string(),
+                mode: mode.map(str::to_string),
+            }))
+        };
+        let long_model = "m".repeat(201);
+        let cases = vec![
+            ("不支援的助理", "nope", query("2026-07", "test-model", None)),
+            ("月份 13", "claude", query("2026-13", "test-model", None)),
+            (
+                "區間帶 +",
+                "claude",
+                query("+2026-7-01~2026-07-31", "test-model", None),
+            ),
+            ("月份帶 +", "claude", query("+2026-7", "test-model", None)),
+            ("年份帶 +", "claude", query("+202", "test-model", None)),
+            (
+                "錯誤 mode",
+                "claude",
+                query("2026-07", "test-model", Some("bogus")),
+            ),
+            ("空白模型", "claude", query("2026-07", "   ", None)),
+            (
+                "模型 201 bytes",
+                "claude",
+                query("2026-07", &long_model, None),
+            ),
+        ];
+        for (label, assistant, query) in cases {
+            let response = get_model_sessions(AxumPath(assistant.to_string()), query).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            assert!(
+                response_json(response).await["error"].is_string(),
+                "{label}"
+            );
+        }
     }
 
     fn range_key(assistant: &str, start: &str, end: &str) -> RangeKey {

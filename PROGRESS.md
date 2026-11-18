@@ -6,6 +6,35 @@
 
 ## 🚀 開發里程碑與更新歷史
 
+### 2026-11-18 - Cloud Run snapshot 模式支援模型 Session 明細
+
+- **問題**：Cloud Run 展開模型佔比列顯示「無法載入 Session 明細」，因為 snapshot router 把
+  `/api/:assistant/model-sessions` 掛在 `unsupported_in_snapshot_mode`（501）。
+- **評估**：snapshot.json 共 129 MB，其中每日 `raw_entries` 佔 124.6 MB（133,533 筆），已含明細所需全部欄位
+  （只缺 `import_source_id`），所以改為即時重算，snapshot 檔增加 0 bytes。
+- **修法**：
+  - `src/handlers/monthly.rs`：query 驗證抽成 `validate_model_sessions_query`、回應組裝抽成
+    `model_sessions_response_body`，本機與 snapshot handler 共用；相關型別與 `collect_model_session_details` 改 `pub(crate)`。
+  - `src/snapshot.rs`：「依日期篩選並解析每日 raw_entries、壞日跳過、全壞回 Err」抽成 `snapshot_dated_entries`，
+    區間分析改用它（行為不變）；新增 `get_model_sessions`（缺參數也回 JSON 400）、`snapshot_model_sessions`
+    （日用等於、月／年用 `<期間>-` 前綴、區間用字典序含兩端）與 `model_sessions_response`（另一個
+    `RangeResponseCache` 實例，鍵含 mode）。
+  - `src/main.rs`：snapshot router 改指向新 handler；`tests/snapshot_mode.rs` 的 `all` 拒絕測試改為新規格
+    （缺參數 400、合法參數 200）。
+- **驗證**：新增 12 個單元測試先紅後綠（另 1 個「沒資料回空清單」空實作即滿足）；`cargo test` 僅 5 個已知環境性
+  失敗、fmt／clippy 零警告；突變 6 個（區間結束日不含、月誤用年前綴、all 不合併、沒資料回 404、快取鍵拿掉 mode、
+  全壞不回 Err）皆紅在預期測試。Live：真實 snapshot 複本（snapshot 模式 18431 埠）與本機看板 3003 比對 18 組
+  （codex／claude／copilot／all × 月／日／區間），session 清單、排序、tokens、成本差異 0；只有 copilot 一組區間
+  12 個 session 的 `duration_ms` 不同（已知差異）。年度 all 首查 1.23 秒、再查 0.001 秒。
+- **審查**：opus reviewer 有條件通過，已修：
+  - F1：`parse_model_session_period` 的年／月／日也改用 `parse_canonical_date`，`+202`、`+2026-7` 這類寬鬆寫法改回 400
+    （本機與 snapshot 共用，原本是既有漏洞，未造成繞過）；突變（月份改回寬鬆解析）紅在兩個新測試。
+  - F2：snapshot 明細重算改用 `spawn_blocking`，不卡 async worker（區間分析有同樣問題，未在本次處理）。
+  - F3：參數解析失敗訊息改為「缺少 period／model 參數或參數格式錯誤」。
+  - F4：補 cursor agent/ide 篩選、模型名稱 200 bytes 邊界、400 案例標籤、整合測試經真正路由回非空明細。
+  - F5：`snapshot_range_report` 的說明註解歸位。F6（`HashMap` 走訪順序造成成本約 1 ulp 差異）只記錄。
+  - 修正後 Live 重跑：18 組差異 0、`+2026-7`／`+202` 回 400、年度 all 首查 1.38 秒、再查 0.002 秒。
+
 ### 2026-11-18 - 區間 API 日期只接受標準格式
 
 - **問題**：`parse_date_range` 用 chrono 解析後只檢查字串長度 10，`+2026-7-01` 會被接受；下游 SQLite 與

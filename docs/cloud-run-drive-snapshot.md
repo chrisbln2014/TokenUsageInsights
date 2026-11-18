@@ -32,7 +32,9 @@ Cloud Run snapshot 模式不包含本機 transcript timeline。`raw_entries.tran
 
 區間內某天的每日資料若解析失敗，該日會被跳過並在 Cloud Run 記錄寫一行 `⚠️ 區間分析跳過 <助理>/<日期>` 警告，其他天照常計算；只有區間內命中的每一天都壞掉時才回 500。同一份 snapshot 下，同一個（助理, 開始日, 結束日）的結果會快取在記憶體（上限 64 筆），重複查詢直接回傳；Drive 上傳新檔、snapshot 重新載入後快取自動作廢。
 
-Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、模型 Session 明細、單日匯出／匯入、匯入批次查詢與回滾。
+模型 Session 明細（`/api/:assistant/model-sessions`，展開模型佔比列時載入）同樣不另外存進 snapshot，snapshot 檔大小不變：Cloud Run 依期間（日、月、年或 `YYYY-MM-DD~YYYY-MM-DD` 區間）讀取命中各日的 `raw_entries`，用與本機相同的 `collect_model_session_details` 即時重算，參數驗證也與本機共用（期間只收標準寫法，模型名稱上限 200 bytes）。壞日處理與區間分析相同（跳過並記警告，全部壞掉才回 500），沒有資料時與本機一樣回 200 空清單；同一份 snapshot 下相同的（助理, 期間, 模型, mode）結果會快取（上限 64 筆，snapshot 換新後作廢）。已知差異：snapshot 不含 `import_source_id`，Copilot 逐次呼叫（`:call:`）的 session 耗時改用「最新一筆累積值」計算，`duration_ms` 可能與本機不同；tokens、成本與 session 清單一致。
+
+Snapshot 模式唯讀，以下功能回 `501` JSON 錯誤：Session 提示詞搜尋、單日匯出／匯入、匯入批次查詢與回滾。
 
 ## 自動更新：本 fork 已永久停用
 

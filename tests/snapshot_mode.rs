@@ -1094,10 +1094,11 @@ fn all_scope_usage_monthly_yearly_merge_totals_match_real_per_assistant_data() {
     assert_eq!(yearly_missing["error"], "找不到該年份的使用量資料。");
 }
 
-// PLAN.md 驗收條件 #7：session / rate-limit / model-sessions 三個需要明確單一來源的端點，
+// PLAN.md 驗收條件 #7：session / rate-limit 兩個需要明確單一來源的端點，
 // 帶 assistant=all 時仍須維持既有拒絕行為，不因這次放寬 dates/usage/monthly/yearly 而被誤放寬。
+// model-sessions 自 2026-11-18 起在 snapshot 模式支援，`all` 與本機看板一致可查（合併每個助理）。
 #[test]
-fn all_scope_session_rate_limit_and_model_sessions_stay_rejected() {
+fn all_scope_session_and_rate_limit_stay_rejected_model_sessions_supported() {
     let root = unique_temp_dir("all-scope-rejected");
     let insights_dir = root.join("insights");
     std::fs::create_dir_all(&root).unwrap();
@@ -1116,6 +1117,11 @@ fn all_scope_session_rate_limit_and_model_sessions_stay_rejected() {
             http_get(port, "/api/all/session/some-session"),
             http_get(port, "/api/all/rate-limit"),
             http_get(port, "/api/all/model-sessions"),
+            http_get(port, "/api/all/model-sessions?period=2026&model=any-model"),
+            http_get(
+                port,
+                "/api/all/model-sessions?period=2026-08-06&model=gpt-5.6-sol",
+            ),
         ))
     } else {
         Err(format!("snapshot 模式未啟動: {lines:?}"))
@@ -1126,7 +1132,13 @@ fn all_scope_session_rate_limit_and_model_sessions_stay_rejected() {
     let _ = std::fs::remove_dir_all(&root);
 
     assert!(started, "snapshot 模式未啟動: {lines:?}");
-    let (session_response, rate_limit_response, model_sessions_response) = result.unwrap();
+    let (
+        session_response,
+        rate_limit_response,
+        model_sessions_response,
+        model_sessions_ok_response,
+        model_sessions_codex_response,
+    ) = result.unwrap();
 
     let session_response = session_response.unwrap();
     assert_eq!(
@@ -1142,12 +1154,44 @@ fn all_scope_session_rate_limit_and_model_sessions_stay_rejected() {
         rate_limit_response.body
     );
 
-    // model-sessions 路由固定指向 unsupported_in_snapshot_mode（501），跟 assistant 參數無關。
+    // 缺少 period/model：與參數錯誤一樣回 400 JSON，不再是 501。
     let model_sessions_response = model_sessions_response.unwrap();
     assert_eq!(
-        model_sessions_response.status, 501,
+        model_sessions_response.status, 400,
         "body={}",
         model_sessions_response.body
+    );
+    assert!(
+        model_sessions_response.body.contains("\"error\""),
+        "body={}",
+        model_sessions_response.body
+    );
+
+    let model_sessions_ok_response = model_sessions_ok_response.unwrap();
+    assert_eq!(
+        model_sessions_ok_response.status, 200,
+        "body={}",
+        model_sessions_ok_response.body
+    );
+    assert!(
+        model_sessions_ok_response.body.contains("\"sessions\""),
+        "body={}",
+        model_sessions_ok_response.body
+    );
+
+    // fixture 的 codex 2026-08-06 有 gpt-5.6-sol session：all 經真正路由要回非空明細。
+    let model_sessions_codex_response = model_sessions_codex_response.unwrap();
+    assert_eq!(
+        model_sessions_codex_response.status, 200,
+        "body={}",
+        model_sessions_codex_response.body
+    );
+    assert!(
+        model_sessions_codex_response
+            .body
+            .contains("019fd482-8350-7dc3-a5d6-13c09baaf98c"),
+        "body={}",
+        model_sessions_codex_response.body
     );
 }
 
